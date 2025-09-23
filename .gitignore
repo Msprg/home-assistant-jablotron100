@@ -1,2 +1,7 @@
 /doc
+/venv
 .idea
+**/__pycache__/
+test_config.py
+/tmp/ha_test_config/
+DEVELOPMENT_SETUP.md

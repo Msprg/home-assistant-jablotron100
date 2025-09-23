@@ -1,0 +1,22 @@
+# Jablotron Integration Test Configuration Example
+# Copy this file to test_config.py and fill in your actual values
+# test_config.py should be added to .gitignore to keep credentials secure
+
+# Your Jablotron device configuration
+CONFIG_DATA = {
+    "serial_port": "/dev/hidraw1",  # The device path (usually /dev/hidraw0, /dev/hidraw1, etc.)
+    "password": "YOUR_PASSWORD_HERE",  # Your actual Jablotron password
+    "number_of_devices": 0,  # Number of devices configured in your system
+    "number_of_pg_outputs": 0,  # Number of PG outputs configured in your system
+    "unique_id": "test_jablotron"
+}
+
+# Test options
+OPTIONS = {
+    "enable_debugging": False,  # Set to True for detailed debug output
+    "log_all_incoming_packets": False,  # Set to True to log all incoming packets
+    "log_all_outcoming_packets": False,  # Set to True to log all outgoing packets
+    "require_code_to_arm": False,  # Whether code is required to arm
+    "require_code_to_disarm": False,  # Whether code is required to disarm
+    "partially_arming_mode": "night_mode"  # "night_mode" or "home_mode"
+}
