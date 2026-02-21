@@ -59,4 +59,4 @@ class JablotronEventEntity(JablotronEntity, EventEntity):
 
 	def trigger_event(self, event: EventLoginType) -> None:
 		self._trigger_event(event.value)
-		self.async_write_ha_state()
+		self.schedule_update_ha_state()
