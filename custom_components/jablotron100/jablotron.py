@@ -349,7 +349,12 @@ class Jablotron:
 
 				self._send_packets(logout_packets)
 
-			async_call_later(self._hass, 1.0, after_modify_callback)
+			self._hass.loop.call_soon_threadsafe(
+				async_call_later,
+				self._hass,
+				1.0,
+				after_modify_callback,
+			)
 
 		if code != self._config[CONF_PASSWORD]:
 			login_packets = [
@@ -359,7 +364,12 @@ class Jablotron:
 
 			self._send_packets(login_packets)
 
-			async_call_later(self._hass, 1.0, after_login_callback)
+			self._hass.loop.call_soon_threadsafe(
+				async_call_later,
+				self._hass,
+				1.0,
+				after_login_callback,
+			)
 		else:
 			after_login_callback(None)
 
