@@ -142,7 +142,7 @@ class PartiallyArmingMode(StrEnum):
 
 
 CODE_MIN_LENGTH: Final = 4
-CODE_MAX_LENGTH: Final = 8
+CODE_MAX_LENGTH: Final = 10
 
 STREAM_MAX_WORKERS: Final = 5
 STREAM_TIMEOUT: Final = 10
