@@ -10,9 +10,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
+import os
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
+
+from jablotron_usb_debug import JablotronUSBClient, ensure_serial_port, perform_flink_export_session, perform_login
+
+SECTOR_SIZE = 512
+EXPORT_START_LBA = 35
+EXPORT_SECTORS = 2048
 
 
 @dataclass(frozen=True)
@@ -116,6 +126,44 @@ def extract_users(path: Path) -> List[UserRecord]:
     return users
 
 
+def read_export_direct(
+    *,
+    device: str,
+    output: Path,
+    start_lba: int = EXPORT_START_LBA,
+    sectors: int = EXPORT_SECTORS,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "dd",
+        f"if={device}",
+        f"of={output}",
+        f"bs={SECTOR_SIZE}",
+        f"skip={start_lba}",
+        f"count={sectors}",
+        "iflag=direct",
+        "status=none",
+    ]
+    if os.geteuid() != 0:
+        command = ["sudo", "-n"] + command
+    subprocess.run(command, check=True)
+
+
+def trigger_live_export(*, port: str, code: str, reset: bool) -> None:
+    serial_port = ensure_serial_port(port)
+    client = JablotronUSBClient(serial_port)
+    try:
+        perform_login(client, code, reset=reset)
+        time.sleep(0.5)
+        perform_flink_export_session(client)
+        end = time.time() + 4.0
+        while time.time() < end:
+            for _packet in client.read_packets(timeout=0.2):
+                pass
+    finally:
+        client.close()
+
+
 def print_table(records: Iterable[UserRecord]) -> None:
     rows = [("ID", "RawID", "Name", "Code", "Phone", "Card", "Comment")]
     for record in records:
@@ -164,9 +212,40 @@ def cmd_extract_users(args: argparse.Namespace) -> None:
     print_table(records)
 
 
+def cmd_pull_live(args: argparse.Namespace) -> None:
+    output = Path(args.output)
+    if not args.no_trigger:
+        trigger_live_export(port=args.port, code=args.code, reset=not args.no_reset)
+    read_export_direct(device=args.device, output=output, start_lba=args.start_lba, sectors=args.sectors)
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    print(f"wrote {output}")
+    print(f"sha256 {digest}")
+    if args.extract_users:
+        print_tsv(extract_users(output))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    pull_parser = subparsers.add_parser(
+        "pull-live",
+        help="Trigger a live export session and read EXPORT.CFG directly from the block device with O_DIRECT dd.",
+    )
+    pull_parser.add_argument("output", help="Output file to write the pulled export blob to.")
+    pull_parser.add_argument("--device", default="/dev/sdb1", help="Block device for FLEXI_CFG (default: /dev/sdb1).")
+    pull_parser.add_argument("--port", default="auto", help="HID port to use for the trigger session (default: auto).")
+    pull_parser.add_argument(
+        "--code",
+        default="1812",
+        help="Authorisation code for the trigger session (default: captured service code 1812).",
+    )
+    pull_parser.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
+    pull_parser.add_argument("--no-trigger", action="store_true", help="Only perform the direct block read.")
+    pull_parser.add_argument("--start-lba", type=int, default=EXPORT_START_LBA, help="Starting LBA to read.")
+    pull_parser.add_argument("--sectors", type=int, default=EXPORT_SECTORS, help="Number of sectors to read.")
+    pull_parser.add_argument("--extract-users", action="store_true", help="Also print parsed users as TSV after pulling.")
+    pull_parser.set_defaults(func=cmd_pull_live)
 
     extract_parser = subparsers.add_parser("extract-users", help="Extract user records from an EXPORT.CFG blob.")
     extract_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
