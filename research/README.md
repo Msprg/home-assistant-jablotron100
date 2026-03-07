@@ -49,6 +49,9 @@ Useful offline analysis commands:
 - `python3 f_link_user_tool.py diff-users research/traces/process_memory/f-link-delete-user-USER91TEST.dmp research/traces/process_memory/f-link-edit-user-USER91TEST.dmp`
 - `python3 export_cfg_tool.py extract-users research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format tsv`
 - `python3 export_cfg_tool.py pull-live research/exports/live_EXPORT.CFG.bin --extract-users`
+- `python3 import_cfg_tool.py decode-frame research/captures/usb/f_link/f-link-edit-user-USER91TEST.pcapng 1787 --format json`
+- `python3 import_cfg_tool.py build-user-upsert /tmp/user91-edit.bin --user-id 91 --name USER91TEST --code 9999 --card1 0000000012200717 --comment 'THIS IS A SAMPLE USER91TEST NOTE' --permissions-raw 811 --sections-mask 63 --pg-masks 65535,0,0,0`
+- `python3 import_cfg_tool.py build-user-delete /tmp/user91-delete.bin --user-id 91`
 - `python3 fdb_tool.py info research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb`
 - `python3 fdb_tool.py extract-users research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb --format table`
 - `python3 fdb_tool.py unpack research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb /tmp/edit-user.xml --xml-only`
@@ -60,5 +63,9 @@ Notes:
 - For live reads, `EXPORT.CFG` on `FLEXI_CFG` can stay all-zero until a F-Link-style HID session refreshes it. A captured service-session replay now exists as `python3 jablotron_usb_debug.py --code 1812 --login-first --no-reset f-link-export-session`.
 - The live `EXPORT.CFG` blob is bytewise XORed with `0xff`. `export_cfg_tool.py` decodes that layer and can extract a user list directly from the pulled export blob.
 - Preferred live path: `export_cfg_tool.py pull-live` triggers the service-session replay and then reads sectors directly from `/dev/sdb1` with `dd iflag=direct`, which avoids the stale mounted-file cache problem.
+- `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
+- Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
+- `import_cfg_tool.py` round-trips the captured add/edit/delete sectors exactly, so user mutation sectors can now be synthesized offline without F-Link.
+- The still-unvalidated step is live application: the candidate path is service login, direct sector write to `IMPORT.CFG` LBA 2083, readback, then export refresh and verification.
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
