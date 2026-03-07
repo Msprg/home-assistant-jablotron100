@@ -20,8 +20,8 @@ logging.basicConfig(
 )
 
 # Import the Jablotron integration
-from jablotron100.jablotron import Jablotron
-from jablotron100.const import *
+from custom_components.jablotron100.jablotron import Jablotron
+from custom_components.jablotron100.const import *
 from homeassistant.const import CONF_PASSWORD
 
 class MockHomeAssistant:
@@ -235,6 +235,8 @@ async def test_jablotron_integration():
         # Test serial port detection
         detected_port = await jablotron._detect_serial_port()
         print(f"Detected serial port: {detected_port}")
+
+        print("is logged into jablotron?" + str(jablotron._successful_login))
         
         # Keep running for a short time to see if we get any data
         print("Running for 10 seconds to test communication...")

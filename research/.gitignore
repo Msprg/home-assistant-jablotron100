@@ -1,0 +1,5 @@
+# Keep the structure and docs, but ignore bulky local research artifacts by default.
+*
+!/.gitignore
+!/README.md
+!/**/.gitkeep

@@ -223,6 +223,7 @@ from custom_components.jablotron100.const import SystemInfo  # noqa: E402
 from custom_components.jablotron100.jablotron import Jablotron  # noqa: E402
 
 _LOGGER = logging.getLogger("jablotron_usb_debug")
+DEFAULT_LOGIN_SETTLE_TIME = 0.5
 
 
 def ensure_serial_port(port: str | None) -> str:
@@ -241,6 +242,7 @@ class JablotronUSBClient:
     def __init__(self, serial_port: str, *, write_delay: float = 0.1) -> None:
         self._serial_port = serial_port
         self._write_delay = write_delay
+        self._fd = os.open(self._serial_port, os.O_RDWR | os.O_NONBLOCK)
 
     def send_packet(self, packet: bytes) -> None:
         self._log_outgoing(packet)
@@ -261,8 +263,7 @@ class JablotronUSBClient:
             self._write(buffer)
 
     def _write(self, payload: bytes) -> None:
-        with open(self._serial_port, "wb", buffering=0) as stream:
-            stream.write(payload)
+        os.write(self._fd, payload)
         time.sleep(self._write_delay)
 
     def _log_outgoing(self, packet: bytes) -> None:
@@ -270,7 +271,6 @@ class JablotronUSBClient:
             _LOGGER.debug("TX %s", Jablotron.format_packet_to_string(packet))
 
     def read_packets(self, *, timeout: Optional[float] = None) -> Iterator[bytes]:
-        fd = os.open(self._serial_port, os.O_RDONLY | os.O_NONBLOCK)
         start = time.monotonic()
 
         try:
@@ -283,12 +283,12 @@ class JablotronUSBClient:
                         break
                     wait_timeout = remaining
 
-                ready, _, _ = select.select([fd], [], [], wait_timeout)
+                ready, _, _ = select.select([self._fd], [], [], wait_timeout)
                 if not ready:
                     break
 
                 try:
-                    raw = os.read(fd, STREAM_PACKET_SIZE)
+                    raw = os.read(self._fd, STREAM_PACKET_SIZE)
                 except BlockingIOError:
                     continue
 
@@ -297,8 +297,11 @@ class JablotronUSBClient:
 
                 for packet in Jablotron.get_packets_from_packet(raw):
                     yield packet
-        finally:
-            os.close(fd)
+        except OSError as exc:
+            raise SystemExit(f"USB read failed on {self._serial_port}: {exc}") from exc
+
+    def close(self) -> None:
+        os.close(self._fd)
 
 
 def describe_packet(packet: bytes, *, decode: bool = False) -> str:
@@ -369,20 +372,26 @@ def perform_login(client: JablotronUSBClient, code: str, *, reset: bool) -> None
     if len(code) < 4:
         raise SystemExit("Authorisation code must have at least 4 digits.")
 
+    _LOGGER.info("Attempting to perform login")
     packets: List[bytes] = []
     if reset:
+        _LOGGER.info("Login: Reset is true. Sending UI_CONTROL_AUTHORISATION_END")
         packets.append(Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END))
     packets.append(Jablotron.create_packet_authorisation_code(code))
+    _LOGGER.info("Login: Sending packet_authorisation_code")
     client.send_packets(packets)
 
 
 def perform_keepalive(client: JablotronUSBClient, code: str) -> None:
     packets = Jablotron.create_packets_keepalive(code)
+    _LOGGER.debug("<Sending keepalive>")
     client.send_packets(packets)
 
 
 def perform_system_info_query(client: JablotronUSBClient, targets: Iterable[SystemInfo]) -> None:
     packets = [Jablotron.create_packet_get_system_info(target) for target in targets]
+    target_list = list(targets)
+    _LOGGER.debug("perform_system_info_query targets=%s", [target.name for target in target_list])
     client.send_packets(packets)
 
 
@@ -422,6 +431,30 @@ def configure_logging(verbose: bool) -> None:
     INTEGRATION_LOGGER.setLevel(level)
 
 
+def read_and_print_responses(client: JablotronUSBClient, *, timeout: float, decode: bool) -> None:
+    if timeout <= 0:
+        return
+
+    received = False
+    for packet in client.read_packets(timeout=timeout):
+        received = True
+        print(describe_packet(packet, decode=decode))
+
+    if not received:
+        _LOGGER.info("No packets received within %.1fs", timeout)
+
+
+def maybe_login_first(client: JablotronUSBClient, *, code: Optional[str], login_first: bool, reset: bool) -> None:
+    if not login_first:
+        return
+    if not code:
+        raise SystemExit("--code is required when using --login-first")
+
+    perform_login(client, code, reset=reset)
+    # Give the panel a brief moment to process the auth packet before the next query.
+    time.sleep(DEFAULT_LOGIN_SETTLE_TIME)
+
+
 def _build_common_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -443,6 +476,27 @@ def _build_common_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Enable verbose logging including TX packets.",
     )
+    common.add_argument(
+        "--login-first",
+        dest="login_first",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Authenticate in the same process before sending the selected command.",
+    )
+    common.add_argument(
+        "--no-reset",
+        dest="no_reset",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Skip the initial authorisation-end reset packet when logging in.",
+    )
+    common.add_argument(
+        "--response-timeout",
+        dest="response_timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Listen for responses for this many seconds after commands that request data (default 2).",
+    )
     return common
 
 
@@ -457,7 +511,6 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     login_parser = subparsers.add_parser("login", help="Send login packets (UI authorisation).", parents=[common])
-    login_parser.add_argument("--no-reset", action="store_true", help="Skip the initial authorisation end reset packet.")
 
     subparsers.add_parser("logout", help="Send UI authorisation end packet.", parents=[common])
 
@@ -494,38 +547,51 @@ def main() -> None:
     port = getattr(args, "port", "auto")
     code = getattr(args, "code", None)
     verbose = getattr(args, "verbose", False)
+    response_timeout = float(getattr(args, "response_timeout", 2.0))
+    login_first = getattr(args, "login_first", False)
+    no_reset = getattr(args, "no_reset", False)
 
     configure_logging(verbose)
 
     serial_port = ensure_serial_port(port)
     client = JablotronUSBClient(serial_port)
-
-    if args.command == "login":
-        if not code:
-            raise SystemExit("--code is required for login")
-        perform_login(client, code, reset=not args.no_reset)
-    elif args.command == "logout":
-        perform_logout(client)
-    elif args.command == "keepalive":
-        if not code:
-            raise SystemExit("--code is required for keepalive")
-        perform_keepalive(client, code)
-    elif args.command == "get-system-info":
-        if args.info:
-            target = SystemInfo[args.info.upper()]
-            perform_system_info_query(client, [target])
+    try:
+        if args.command == "login":
+            if not code:
+                raise SystemExit("--code is required for login")
+            perform_login(client, code, reset=not no_reset)
+        elif args.command == "logout":
+            perform_logout(client)
+        elif args.command == "keepalive":
+            if not code:
+                raise SystemExit("--code is required for keepalive")
+            perform_keepalive(client, code)
+        elif args.command == "get-system-info":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            if args.info:
+                target = SystemInfo[args.info.upper()]
+                perform_system_info_query(client, [target])
+            else:
+                perform_system_info_query(client, [SystemInfo.MODEL, SystemInfo.HARDWARE_VERSION, SystemInfo.FIRMWARE_VERSION])
+            read_and_print_responses(client, timeout=response_timeout, decode=True)
+        elif args.command == "get-sections":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            perform_sections_query(client)
+            read_and_print_responses(client, timeout=response_timeout, decode=True)
+        elif args.command == "get-device-status":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            perform_device_status_query(client, args.device)
+            read_and_print_responses(client, timeout=response_timeout, decode=True)
+        elif args.command == "enable-device-states":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            perform_enable_device_states(client)
+        elif args.command == "monitor":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            monitor_packets(client, timeout=args.timeout, count=args.count, decode=args.decode)
         else:
-            perform_system_info_query(client, [SystemInfo.MODEL, SystemInfo.HARDWARE_VERSION, SystemInfo.FIRMWARE_VERSION])
-    elif args.command == "get-sections":
-        perform_sections_query(client)
-    elif args.command == "get-device-status":
-        perform_device_status_query(client, args.device)
-    elif args.command == "enable-device-states":
-        perform_enable_device_states(client)
-    elif args.command == "monitor":
-        monitor_packets(client, timeout=args.timeout, count=args.count, decode=args.decode)
-    else:
-        parser.error(f"Unhandled command: {args.command}")
+            parser.error(f"Unhandled command: {args.command}")
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
