@@ -25,6 +25,7 @@ import select
 import sys
 import time
 import types
+import re
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
 
@@ -413,6 +414,63 @@ def perform_logout(client: JablotronUSBClient) -> None:
     client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END))
 
 
+def parse_raw_report_hex(value: str) -> bytes:
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", value)
+    if not cleaned:
+        raise SystemExit("Raw report hex is empty.")
+    if len(cleaned) % 2 != 0:
+        raise SystemExit("Raw report hex must contain a whole number of bytes.")
+    report = bytes.fromhex(cleaned)
+    if len(report) != 64:
+        raise SystemExit(f"Raw report must be exactly 64 bytes, got {len(report)}.")
+    return report
+
+
+def perform_send_raw_report(client: JablotronUSBClient, report_hex: str) -> None:
+    client._write(parse_raw_report_hex(report_hex))
+
+
+def perform_send_raw_reports(client: JablotronUSBClient, reports: Iterable[str]) -> None:
+    for report in reports:
+        perform_send_raw_report(client, report)
+
+
+EXPORT_TRIGGER_INFO_QUERY = "30010130010230010330010430010530010830010930010a30010b30010c30011152031a01003c01010000000000000000000000000000000000000000000000"
+EXPORT_TRIGGER_READ_FL_VAR = "52031a000052031a060052031a0a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+EXPORT_TRIGGER_STAGE_1 = "80010152010e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+EXPORT_TRIGGER_STAGE_2 = "52010e72010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+FLINK_EXPORT_SESSION_REPORTS = [
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "80010f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "520213059a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "483e03a07c03496e666f2830293a2d2d462d4c696e6b20322e392e322e31353039207374617274656420617420332f372f3230323620373a31343a333020504d",
+    "493e2d2d3b555549443d7b32613532383633382d393763302d346263632d623462312d6531656538356631636164372057494e2d4d41542d4445565c6d737072",
+    "4a03677d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52012500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "80010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+]
+
+
+def perform_trigger_export(client: JablotronUSBClient, *, include_info_query: bool, include_fl_var_query: bool) -> None:
+    reports: List[str] = []
+    if include_info_query:
+        reports.append(EXPORT_TRIGGER_INFO_QUERY)
+    if include_fl_var_query:
+        reports.append(EXPORT_TRIGGER_READ_FL_VAR)
+    reports.extend([EXPORT_TRIGGER_STAGE_1, EXPORT_TRIGGER_STAGE_2])
+    perform_send_raw_reports(client, reports)
+
+
+def perform_flink_export_session(client: JablotronUSBClient) -> None:
+    perform_send_raw_reports(client, FLINK_EXPORT_SESSION_REPORTS)
+
+
 def monitor_packets(client: JablotronUSBClient, *, timeout: Optional[float], count: Optional[int], decode: bool) -> None:
     seen = 0
     try:
@@ -532,6 +590,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("enable-device-states", help="Enable streaming device state packets.", parents=[common])
 
+    raw_report_parser = subparsers.add_parser(
+        "send-raw-report", help="Send one raw 64-byte HID report as hex.", parents=[common]
+    )
+    raw_report_parser.add_argument("report_hex", help="64-byte HID report encoded as hex.")
+
+    trigger_export_parser = subparsers.add_parser(
+        "trigger-export",
+        help="Replay the captured HID report sequence that precedes a live EXPORT.CFG read.",
+        parents=[common],
+    )
+    trigger_export_parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="Only send the two final export-trigger reports, skipping the preceding info/FL-var queries.",
+    )
+
+    subparsers.add_parser(
+        "f-link-export-session",
+        help="Replay the later F-Link service-session sequence that precedes the full live EXPORT.CFG read.",
+        parents=[common],
+    )
+
     monitor_parser = subparsers.add_parser("monitor", help="Read and print packets from the USB interface.", parents=[common])
     monitor_parser.add_argument("--timeout", type=float, help="Maximum time (seconds) to wait for packets before exiting.")
     monitor_parser.add_argument("--count", type=int, help="Stop after receiving this many packets.")
@@ -585,6 +665,22 @@ def main() -> None:
         elif args.command == "enable-device-states":
             maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
             perform_enable_device_states(client)
+        elif args.command == "send-raw-report":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            perform_send_raw_report(client, args.report_hex)
+            read_and_print_responses(client, timeout=response_timeout, decode=True)
+        elif args.command == "trigger-export":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            perform_trigger_export(
+                client,
+                include_info_query=not args.minimal,
+                include_fl_var_query=not args.minimal,
+            )
+            read_and_print_responses(client, timeout=response_timeout, decode=True)
+        elif args.command == "f-link-export-session":
+            maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
+            perform_flink_export_session(client)
+            read_and_print_responses(client, timeout=response_timeout, decode=True)
         elif args.command == "monitor":
             maybe_login_first(client, code=code, login_first=login_first, reset=not no_reset)
             monitor_packets(client, timeout=args.timeout, count=args.count, decode=args.decode)

@@ -4,6 +4,8 @@ This tree is for Jablotron protocol-reversing artifacts that should not live in 
 
 Directory layout:
 
+- `data ingest/`
+  Temporary staging area for newly dropped bundles before they are sorted.
 - `captures/usb/f_link/`
   Existing and future USB captures from F-Link sessions.
 - `captures/usb/live/`
@@ -20,6 +22,8 @@ Directory layout:
   Config exports, backups, or other files written by F-Link.
 - `traces/procmon/`
   Procmon traces or similar Windows-side file activity captures around F-Link.
+- `traces/process_memory/`
+  Process memory dumps taken from `f-link.exe` or related tooling.
 - `notes/`
   Short text notes describing exact actions, timestamps, and test values used in a capture.
 
@@ -37,3 +41,17 @@ For high-value datasets, keep a matching note file in `notes/` with:
 - exact F-Link actions taken
 - usernames / codes / user numbers used
 - absolute timestamps if available
+
+Useful offline analysis commands:
+
+- `python3 f_link_user_tool.py list-snapshots research/traces/process_memory/f-link-edit-user-USER91TEST.dmp`
+- `python3 f_link_user_tool.py extract-users research/traces/process_memory/f-link-edit-user-USER91TEST.dmp --format tsv`
+- `python3 f_link_user_tool.py diff-users research/traces/process_memory/f-link-delete-user-USER91TEST.dmp research/traces/process_memory/f-link-edit-user-USER91TEST.dmp`
+- `python3 export_cfg_tool.py extract-users research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format tsv`
+
+Notes:
+
+- The memory dumps can contain stale heap fragments. Use `f_link_user_tool.py` to pick a coherent `JA100UsersSetup` / `TJA100AllUsers` snapshot instead of grepping loose strings across the whole dump.
+- The latest complete snapshots in the current edit/delete dumps resolve the authoritative state of user 91 correctly: populated in the edit session, empty/default in the delete session.
+- For live reads, `EXPORT.CFG` on `FLEXI_CFG` can stay all-zero until a F-Link-style HID session refreshes it. A captured service-session replay now exists as `python3 jablotron_usb_debug.py --code 1812 --login-first --no-reset f-link-export-session`.
+- The live `EXPORT.CFG` blob is bytewise XORed with `0xff`. `export_cfg_tool.py` decodes that layer and can extract a user list directly from the pulled export blob.
