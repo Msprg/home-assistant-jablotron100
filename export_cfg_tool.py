@@ -12,6 +12,8 @@ import argparse
 import json
 import hashlib
 import os
+import sys
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -201,6 +203,12 @@ def print_tsv(records: Iterable[UserRecord]) -> None:
         )
 
 
+def iter_printable_strings(blob: bytes, *, min_length: int) -> Iterable[str]:
+    pattern = re.compile(rb"[\x20-\x7e\xc0-\xff]{" + str(min_length).encode("ascii") + rb",}")
+    for match in pattern.finditer(blob):
+        yield match.group().decode("utf-8", "replace")
+
+
 def cmd_extract_users(args: argparse.Namespace) -> None:
     records = extract_users(Path(args.export_cfg))
     if args.format == "json":
@@ -222,6 +230,12 @@ def cmd_pull_live(args: argparse.Namespace) -> None:
     print(f"sha256 {digest}")
     if args.extract_users:
         print_tsv(extract_users(output))
+
+
+def cmd_dump_text(args: argparse.Namespace) -> None:
+    blob = invert_blob(Path(args.export_cfg).read_bytes())
+    for text in iter_printable_strings(blob, min_length=args.min_length):
+        print(text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -252,13 +266,29 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--format", choices=["table", "tsv", "json"], default="table")
     extract_parser.set_defaults(func=cmd_extract_users)
 
+    dump_text_parser = subparsers.add_parser(
+        "dump-text",
+        help="Print printable UTF-8-ish strings from a decoded EXPORT.CFG blob.",
+    )
+    dump_text_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
+    dump_text_parser.add_argument(
+        "--min-length",
+        type=int,
+        default=4,
+        help="Minimum printable string length to emit (default: 4).",
+    )
+    dump_text_parser.set_defaults(func=cmd_dump_text)
+
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 if __name__ == "__main__":

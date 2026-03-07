@@ -55,6 +55,11 @@ Useful offline analysis commands:
 - `python3 fdb_tool.py info research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb`
 - `python3 fdb_tool.py extract-users research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb --format table`
 - `python3 fdb_tool.py unpack research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb /tmp/edit-user.xml --xml-only`
+- `python3 enum_rtti_scan.py scan research/traces/process_memory/*.dmp --dedupe --keyword System --keyword Service --keyword Permission --keyword Authorization --keyword Access`
+- `python3 property_rtti_correlation.py correlate research/fdb/after/*.fdb --dumps research/traces/process_memory/*.dmp --only-matched --keyword Permissions --keyword TimeLimitGroup --keyword PGAccess --keyword Sections`
+- `python3 jablotron_noauth_probe.py probe --read-export --export-output research/exports/noauth_probe_EXPORT.CFG.bin`
+- `python3 f_link_schema_tool.py extract research/traces/process_memory/f-link-schema-access-system-minidump.dmp research/exports/f-link-schema.json`
+- `python3 f_link_schema_tool.py access-report research/traces/process_memory/f-link-schema-access-system-minidump.dmp`
 
 Notes:
 
@@ -66,6 +71,24 @@ Notes:
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
 - `import_cfg_tool.py` round-trips the captured add/edit/delete sectors exactly, so user mutation sectors can now be synthesized offline without F-Link.
-- The still-unvalidated step is live application: the candidate path is service login, direct sector write to `IMPORT.CFG` LBA 2083, readback, then export refresh and verification.
+- A live no-op write has now been validated: deleting confirmed-empty user slot `4` left the refreshed `EXPORT.CFG` hash and parsed user map unchanged.
+- The validated live write sequence is: service login, direct sector write to `IMPORT.CFG` LBA 2083, immediate sector readback, then export refresh and verification.
+- During that no-op test, `IMPORT.CFG` sector 0 changed from a pre-command sentinel (`false`) to the written delete command, then to a different post-refresh sentinel (`-1`), which suggests the panel consumes or clears the command after processing.
+- A later live attempt to edit `TESTUSERWALDO` showed that raw sector writes are not enough for a real mutation. The authoritative user record stayed unchanged even when the staged command and readback were correct.
+- Writing through the mounted `FLEXI_CFG/IMPORT.CFG` path does cause the export hash to change persistently, but the change appears as a ghost copy of the staged command near the end of `EXPORT.CFG`, while the authoritative user record at slot `86` remains unchanged.
+- Captured F-Link add/edit/delete sessions always perform a second write to `lba=27 sectors=8` after the `IMPORT.CFG` exchange, which is consistent with FAT directory metadata updates for `IMPORT.CFG`.
+- Replaying the obvious edit-window HID `SET_REPORT` candidates (`80010252010e7201...` and `520124...`) still did not make the authoritative user edit apply.
+- Current conclusion: a further apply/commit mechanism is still missing, likely a more specific HID/control-side trigger or stricter filesystem semantics than the currently replayed path.
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
+- `enum_rtti_scan.py` can recover Delphi RTTI enum definitions directly from the F-Link process dumps; the current deduped catalog contains 162 enum definitions.
+- `property_rtti_correlation.py` correlates `.fdb` `tkEnumeration` and `tkSet` properties with the RTTI enum catalog. Current high-confidence mappings include `Permissions -> TJA100PermissionsEnum`, `TimeLimitGroup -> TJA100UserTimeLimitEnum`, `PGAccess -> TJA100PGEnum`, `Sections/SectionMask -> TJA100SectionEnum`, and `IsNull`/`ReadOnly`/`Updated -> Boolean`.
+- `jablotron_noauth_probe.py` confirms a limited unauthenticated metadata leak over HID: model, hardware version, firmware version, registration code, installation name, and section/PG state packets are readable without sending any authorisation code.
+- The same no-auth probe does not populate `EXPORT.CFG`: direct O_DIRECT reads after the unauthenticated trigger still return an all-zero 1 MiB blob, so the current evidence does not support pre-auth reading of the full config export or user table.
+- `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.
+- That embedded schema confirms a distinct software-only internal privilege tier above normal service access: `ACCESS_SYSTEM` (`def=15`) and `COMP_SYSTEM`.
+- The schema also exposes access gates for stored config groups via `cfg_data_t`, for example:
+  - `user`: `r_access=+ACCESS_SERVICE+ACCESS_MASTER+ACCESS_USER`, `w_access=+ACCESS_SERVICE+ACCESS_MASTER`
+  - `system`: `r_access=+ACCESS_SERVICE`, `w_access=+ACCESS_SERVICE`
+  - `users_time_limit`: `r_access=+ACCESS_SERVICE+ACCESS_MASTER+ACCESS_USER`, `w_access=+ACCESS_SERVICE+ACCESS_MASTER`
+- `cfg_user_t.access` maps directly to `access_t` with F-Link record name `Permissions`, which helps bridge the internal access model to the exported/imported user records.
