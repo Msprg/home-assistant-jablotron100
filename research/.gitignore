@@ -3,3 +3,6 @@
 !/.gitignore
 !/README.md
 !/**/.gitkeep
+!/notes/
+!/notes/2026-03-10_setup-mode-handshake.txt
+/notes/.gitkeep

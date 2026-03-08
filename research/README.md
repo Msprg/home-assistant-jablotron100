@@ -71,18 +71,34 @@ Notes:
 - The latest complete snapshots in the current edit/delete dumps resolve the authoritative state of user 91 correctly: populated in the edit session, empty/default in the delete session.
 - For live reads, `EXPORT.CFG` on `FLEXI_CFG` can stay all-zero until a F-Link-style HID session refreshes it. A captured service-session replay now exists as `python3 jablotron_usb_debug.py --code 1812 --login-first --no-reset f-link-export-session`.
 - The live `EXPORT.CFG` blob is bytewise XORed with `0xff`. `export_cfg_tool.py` decodes that layer and can extract a user list directly from the pulled export blob.
+- `EXPORT.CFG` user strings are encoded with MessagePack string markers, not just `fixstr`. `export_cfg_tool.py` now handles `fixstr`, `str8`, `str16`, and `str32`, which matters once fields exceed 31 bytes.
 - Preferred live path: `export_cfg_tool.py pull-live` triggers the service-session replay and then reads sectors directly from `/dev/sdb1` with `dd iflag=direct`, which avoids the stale mounted-file cache problem.
+- On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
 - `import_cfg_tool.py` round-trips the captured add/edit/delete sectors exactly, so user mutation sectors can now be synthesized offline without F-Link.
 - A live no-op write has now been validated: deleting confirmed-empty user slot `4` left the refreshed `EXPORT.CFG` hash and parsed user map unchanged.
-- The validated live write sequence is: service login, direct sector write to `IMPORT.CFG` LBA 2083, immediate sector readback, then export refresh and verification.
+- The live transport path was validated first with a no-op direct sector write, but a real semantic mutation required filesystem-level staging rather than raw block writes alone.
 - During that no-op test, `IMPORT.CFG` sector 0 changed from a pre-command sentinel (`false`) to the written delete command, then to a different post-refresh sentinel (`-1`), which suggests the panel consumes or clears the command after processing.
-- A later live attempt to edit `TESTUSERWALDO` showed that raw sector writes are not enough for a real mutation. The authoritative user record stayed unchanged even when the staged command and readback were correct.
-- Writing through the mounted `FLEXI_CFG/IMPORT.CFG` path does cause the export hash to change persistently, but the change appears as a ghost copy of the staged command near the end of `EXPORT.CFG`, while the authoritative user record at slot `86` remains unchanged.
+- Raw direct sector writes on `/dev/sdb1` were not enough for a real mutation. They staged data, and sometimes produced ghost copies near the end of `EXPORT.CFG`, but they did not reliably update the authoritative user table.
 - Captured F-Link add/edit/delete sessions always perform a second write to `lba=27 sectors=8` after the `IMPORT.CFG` exchange, which is consistent with FAT directory metadata updates for `IMPORT.CFG`.
-- Replaying the obvious edit-window HID `SET_REPORT` candidates (`80010252010e7201...` and `520124...`) still did not make the authoritative user edit apply.
-- Current conclusion: a further apply/commit mechanism is still missing, likely a more specific HID/control-side trigger or stricter filesystem semantics than the currently replayed path.
+- A real live semantic user edit is now validated. On 2026-03-08, slot `86` (`TESTUSERWALDO`) was changed from comment `Waldo has a new comment` to `USB8`, and the new comment persisted across repeated fresh `pull-live` reads in new authenticated sessions.
+- The currently working live-apply sequence is:
+  - stage sector 0 of `IMPORT.CFG` through the mounted file path `/media/administrator/FLEXI_CFG/IMPORT.CFG`
+  - unmount `/dev/sdb1` to flush the FAT metadata to the device
+  - perform the minimal HID accept sequence: `52 01 02`, `52 01 24`, `52 01 02`, `52 01 0C`
+  - optionally answer `80 01 17` with `80 01 14`, and `80 02 1A 0A` with `80 01 0F`, then an extra `52 01 02` if the panel asks for it
+  - verify with a fresh `export_cfg_tool.py pull-live` in a new session
+- Operational note: when reproducing that sequence from a terminal, avoid `udisksctl` if possible. On this host it may block on a desktop auth dialog; `sudo umount /dev/sdb1` and an explicit `sudo mount` are more reliable for scripted runs.
+- The two post-apply verification exports are:
+  - `research/exports/2026-03-08_retry3_verify_EXPORT.CFG.bin`
+  - `research/exports/2026-03-08_retry4_persist_EXPORT.CFG.bin`
+  - both have SHA-256 `58b83a61b614db77d3535e62b3cde1a462ebdc42e3f4ebe0cc32d839055b3615`
+- `live_import_apply.py` now packages that stage/unmount/accept/remount workflow for reuse.
+- Capture analysis on 2026-03-10 shows that F-Link's write path is preceded by a setup-mode transition, not just plain service authentication. The key observed bridge is `80 1A 0C ...` (service rights accepted) followed by `80 01 0F`, then `52 01 02` keepalives until `80 01 12` (`Setting mode entered`). Manual live probing reproduced that transition at least once, but the timing is still sensitive and not yet packaged into a reliable helper. See `research/notes/2026-03-10_setup-mode-handshake.txt`.
+- A later scripted live run on 2026-03-10 used that setup-mode bridge to change user `86` (`TESTUSERWALDO`) from comment `USB8` to `USBA`, and a fresh post-run export confirmed the mutation. The same run also showed that direct post-apply reads of `IMPORT.CFG` sector 0 can snap back to the older `USB3` payload even when the authoritative `EXPORT.CFG` user table reflects the new value, so `IMPORT.CFG` sector 0 should not be treated as a durable record of the last successful command.
+- A second scripted live run on 2026-03-10 changed the same user comment from `USBA` to `Longer comment test 2026-03-10 A` and confirmed the value in a fresh export at `/tmp/2026-03-10_post-longcomment_EXPORT.CFG.bin` with SHA-256 `fda7940ba19ce6584a90df1062e2059910041a269f7bc04313cf71d6cdf6daf4`. This also exposed and fixed an `export_cfg_tool.py` parsing bug: 32-byte comments switch from MessagePack `fixstr` to `str8`, so earlier extraction code falsely showed trailing garbage even though the panel stored the value correctly.
+- Another scripted live run on 2026-03-10 changed user `86`'s name from `TESTUSERWALDO` to `TESTUSERWALDO2` while preserving the long comment, and a fresh export at `/tmp/2026-03-10_post-namechange_EXPORT.CFG.bin` confirmed the rename with SHA-256 `88e6959fdae8e566b4a54aee670541cb8ee7fc2a7f841cfea193b2daddf0d296`. This is the first live proof that field `4` in the user upsert payload controls the exported user name, not just comments. As with the comment edits, direct post-apply reads of `IMPORT.CFG` sector 0 still reverted to the older `USB3` payload, so verification should continue to rely on a fresh `EXPORT.CFG` pull.
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
 - `enum_rtti_scan.py` can recover Delphi RTTI enum definitions directly from the F-Link process dumps; the current deduped catalog contains 162 enum definitions.
@@ -93,6 +109,7 @@ Notes:
 - Running `F-Link.exe /?` confirmed that communication logging is a supported command-line feature: `-commlog` / `--commlog` means `Log comunication to a file`.
 - The same help dialog also confirmed the following built-in switches: `-defcodes`, `-langcheck`, `-notimeout`, `-offline`, `-notheme`, `-hlimit x`, `-ownevtxt`, and `-noinvalidate`.
 - The process dumps contain one UTF-16 help-string table holding `comm.log.htm`, `-commlog`, `--commlog`, `Log comunication to a file`, `-defcodes`, `--defcodes`, and `Use default central codes`, so those hits are real command-line help text rather than orphaned strings.
+- A panel event-log export is now archived as `research/exports/2026-03-08_panel-event-log.csv`; it confirms that successful USB config applies generate `Zmena konfigurácie` followed shortly by `Created backup configuration`, while failed probes show `Neplatná autorizace`.
 - Other schema/translation strings in the dumps explain what `-defcodes` is likely meant to use:
   - the service code is kept in user/code position `0`
   - the main administrator code is kept in position `1`

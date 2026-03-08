@@ -64,15 +64,32 @@ def decode_user_id(id_bytes: bytes) -> Optional[int]:
     return None
 
 
+def decode_msgpack_string(data: bytes, start: int) -> str:
+    if start >= len(data):
+        return ""
+    marker = data[start]
+    if 0xA0 <= marker <= 0xBF:
+        length = marker - 0xA0
+        offset = start + 1
+    elif marker == 0xD9 and start + 1 < len(data):
+        length = data[start + 1]
+        offset = start + 2
+    elif marker == 0xDA and start + 2 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 3], "big")
+        offset = start + 3
+    elif marker == 0xDB and start + 4 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 5], "big")
+        offset = start + 5
+    else:
+        return ""
+    return data[offset : offset + length].decode("utf-8", "replace")
+
+
 def parse_len_string(record: bytes, tag: int) -> str:
     index = record.find(bytes([tag]))
     if index == -1 or index + 1 >= len(record):
         return ""
-    marker = record[index + 1]
-    if marker < 0xA0:
-        return ""
-    length = marker - 0xA0
-    return record[index + 2 : index + 2 + length].decode("utf-8", "replace")
+    return decode_msgpack_string(record, index + 1)
 
 
 def parse_card(record: bytes) -> str:
@@ -86,11 +103,7 @@ def parse_card(record: bytes) -> str:
     marker_index = field.find(b"\x81\x00")
     if marker_index == -1 or marker_index + 2 >= len(field):
         return ""
-    marker = field[marker_index + 2]
-    if marker < 0xA0:
-        return ""
-    length = marker - 0xA0
-    return field[marker_index + 3 : marker_index + 3 + length].decode("ascii", "ignore")
+    return decode_msgpack_string(field, marker_index + 2)
 
 
 def extract_users(path: Path) -> List[UserRecord]:

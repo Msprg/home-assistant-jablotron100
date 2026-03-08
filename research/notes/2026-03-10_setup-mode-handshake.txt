@@ -1,0 +1,91 @@
+Source:
+- committed F-Link edit captures in `research/captures/usb/f_link/`
+- decoded F-Link communication logs in `research/exports/f_link_comm_logs_text/`
+- manual live HID probes against the panel on 2026-03-10
+
+Question:
+- how does F-Link get from a plain authenticated HID session into the setup/configuration state used for `IMPORT.CFG` apply?
+
+Confirmed from captures/logs:
+- successful user-edit writes are performed while F-Link is already in setup mode
+- F-Link does not jump directly from `80 08 03 <code>` to `52 01 24` / `52 01 0C`
+- in the valid service-code path, F-Link first reaches `Setting mode entered` (`Rx: 80 01 12`)
+- after the later import-accept phase, F-Link again re-enters setup mode before continuing with config/version reads
+
+Useful packet-level detail from the decoded logs:
+- service-code entry uses `Tx: 80 08 03 39 39 39 31 38 31 32`
+- service rights are acknowledged by `Rx: 80 1A 0C ...`
+- the logs then show `Tx: 80 01 0F`
+- after that, F-Link sends `52 01 02` keepalives and eventually receives `Rx: 80 01 12` (`Setting mode entered`)
+
+Manual live probe on 2026-03-10:
+- sending only the service code produced:
+  - `80 01 01`
+  - `80 1A 0C ...` (service rights accepted)
+  - status packets (`51...`, `d0...`, `d2...`)
+  - but not `80 01 12`
+- sending `80 01 0F` immediately after `80 1A 0C ...`, then following with `52 01 02`, did at least once produce:
+  - `80 02 1A 0A`
+  - `80 01 12`
+
+Current interpretation:
+- `80 01 0F` is part of the bridge from plain service authentication into setup mode, not just a post-import backup acknowledgement
+- the transition is timing-sensitive; a naive automated replay did not reproduce it reliably on every attempt
+- current write tooling should not yet be considered fixed based on this alone
+
+Successful live edit on 2026-03-10:
+- target user: `86` / `TESTUSERWALDO`
+- pre-state from fresh export: comment `USB8`
+- staged upsert: same record shape, comment changed to `USBA`
+- the sequence that succeeded in a scripted live run was:
+  - send raw service-code report `80 08 03 39 39 39 31 38 31 32`
+  - wait for `80 1A 0C ...`
+  - if `80 02 1A 0A` does not arrive promptly, send `80 01 0F` proactively
+  - when `80 02 1A 0A` arrives, answer with `80 01 0F`
+  - send `52 01 02` keepalives until `80 01 12` (`Setting mode entered`)
+  - while still in that setup-mode session, stage sector 0 of `IMPORT.CFG`
+  - `umount /dev/sdb1`
+  - run the import-accept sequence: `52 01 02`, `52 01 24`, `52 01 02`, `52 01 0C`
+  - verify with a fresh `export_cfg_tool.py pull-live` in a new authenticated session
+- post-state from fresh export: comment `USBA`
+- verification file used in the successful run:
+  - `/tmp/2026-03-10_post-testuserwaldo_EXPORT.CFG.bin`
+  - SHA-256 `7cd375dcb2494844e76550bb8abe58f2d49b30df18f9309da29320a911e5a5c5`
+
+Important side finding from the same successful run:
+- immediately after the successful apply, a direct O_DIRECT read of `IMPORT.CFG` sector 0 still decoded as the older `USB3` upsert payload, not the just-written `USBA` command
+- despite that, the authoritative refreshed `EXPORT.CFG` user table showed `USBA`
+- current interpretation: the on-device `IMPORT.CFG` sector should not be treated as a durable mirror of the last successful command; the panel may rewrite or restore that sector during/after processing
+
+Longer-comment robustness check on 2026-03-10:
+- starting state before the test: user `86` comment `USBA`
+- staged upsert: same record shape, comment changed to `Longer comment test 2026-03-10 A`
+- a later live run used the same setup-mode bridge and import-accept sequence and completed cleanly:
+  - reached `80 01 12` (`Setting mode entered`)
+  - staged sector 0 of `IMPORT.CFG`
+  - `umount /dev/sdb1`
+  - accepted with `52 01 02`, `52 01 24`, `52 01 02`, `52 01 0C`
+- post-state from fresh export:
+  - `/tmp/2026-03-10_post-longcomment_EXPORT.CFG.bin`
+  - SHA-256 `fda7940ba19ce6584a90df1062e2059910041a269f7bc04313cf71d6cdf6daf4`
+  - user `86` comment decoded as `Longer comment test 2026-03-10 A`
+- direct post-apply O_DIRECT read of `IMPORT.CFG` sector 0 still decoded as the older `USB3` upsert payload
+- the first export parse looked corrupted (`" Longer comment test 2026-03-10 A\x0b..."`), but that was a tooling bug:
+  - `EXPORT.CFG` stores short strings as MessagePack `fixstr`, but this 32-byte comment used `str8` (`0xd9 0x20`)
+  - `export_cfg_tool.py` initially decoded only `fixstr`
+  - after adding `str8` / `str16` / `str32` support, the same export decoded cleanly
+
+Live name-field mutation check on 2026-03-10:
+- starting state before the test: user `86` name `TESTUSERWALDO`, comment `Longer comment test 2026-03-10 A`
+- staged upsert: same record shape, name changed to `TESTUSERWALDO2`
+- the same setup-mode bridge and import-accept sequence completed cleanly again
+- post-state from fresh export:
+  - `/tmp/2026-03-10_post-namechange_EXPORT.CFG.bin`
+  - SHA-256 `88e6959fdae8e566b4a54aee670541cb8ee7fc2a7f841cfea193b2daddf0d296`
+  - user `86` decoded as name `TESTUSERWALDO2`, comment `Longer comment test 2026-03-10 A`
+- direct post-apply O_DIRECT read of `IMPORT.CFG` sector 0 still decoded as the older `USB3` / `TESTUSERWALDO` payload
+- conclusion: live user-name edits are now confirmed in addition to comment edits, and `EXPORT.CFG` remains the authoritative source for post-apply verification
+
+Next debugging target:
+- capture the exact timing window between `80 1A 0C ...`, `80 01 0F`, the first `52 01 02`, and `80 01 12`
+- compare the successful manual probe with F-Link's `JA100_ENTER_SETUP` timing in `comm.log.[1|4|6|7|9].txt`
