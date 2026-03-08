@@ -62,6 +62,8 @@ Useful offline analysis commands:
 - `python3 jablotron_noauth_probe.py probe --read-export --export-output research/exports/noauth_probe_EXPORT.CFG.bin`
 - `python3 f_link_schema_tool.py extract research/traces/process_memory/f-link-schema-access-system-minidump.dmp research/exports/f-link-schema.json`
 - `python3 f_link_schema_tool.py access-report research/traces/process_memory/f-link-schema-access-system-minidump.dmp`
+- `python3 f_link_comm_log_tool.py decode-tree research/traces/f_link_logs/roaming_Jablotron_FLink research/exports/f_link_comm_logs_html`
+- `python3 f_link_comm_log_tool.py dump-text-tree research/traces/f_link_logs/roaming_Jablotron_FLink research/exports/f_link_comm_logs_text`
 
 Notes:
 
@@ -97,7 +99,15 @@ Notes:
   - factory defaults are explicitly documented as administrator `12345678` and service `10101010`
   - `cfg.ja100.systemparams.warndefaultcodes` warns by SMS when default access codes are still in use after leaving service mode
 - Current interpretation: `-defcodes` / `--defcodes` most likely tells F-Link to use the panel's built-in factory default administrator/service codes when connecting.
-- The copied `comm.log*.htm` files in `research/traces/f_link_logs/roaming_Jablotron_FLink` are not readable HTML; they currently look like high-entropy binary logs with a shared header/prefix and no obvious standard compression wrapper.
+- The copied `comm.log*.htm` files in `research/traces/f_link_logs/roaming_Jablotron_FLink` are now decoded: they are UTF-8 HTML logs wrapped by F-Link's `TObfuscatedLogStream`, not encrypted with Windows CryptoAPI.
+- The successful decode path comes from `TObfuscatedLogStream` methods at `0x00702314` (`Create`), `0x00702350` (`Read`), and `0x00702388` (`Write`), using the 256-byte XOR table at virtual address `0x011DBE31`.
+- The stream wrapper keeps a one-byte rolling key position that starts at zero for each file and XORs each byte with `table[index & 0xff]`, incrementing the index after every byte.
+- `f_link_comm_log_tool.py` implements that exact decode path and can bulk-decode copied `%APPDATA%\\Jablotron\\FLink\\comm.log*.htm` files to HTML or plaintext without requiring the original executable.
+- The decoded logs contain directly useful protocol/runtime evidence, including `Rx:` / `Tx:` frame dumps, talker lifecycle messages such as `JA100_GET_DEVICE_DESCRIPTOR`, `JA100_READ_FL_VAR`, and `JA100_EXIT_AUTHORISATION`, plus device-mount details like `FLEXI_CFG`, `FLEXI_LOG`, `THIDCommThread`, and `TJA100StreamedFileComm`.
+- Example decoded evidence from `research/exports/f_link_comm_logs_text/comm.log.txt` includes:
+  - `00:38:27:546 : Device connected using TJA100StreamedFileComm on F:\\`
+  - `00:38:27:591 : Rx: 40 08 02 4A 41 2D 31 30 37 4B`
+  - `00:38:27:733 : Talker JA100_READ_FL_VAR created`
 - `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.
 - That embedded schema confirms a distinct software-only internal privilege tier above normal service access: `ACCESS_SYSTEM` (`def=15`) and `COMP_SYSTEM`.
 - The schema also exposes access gates for stored config groups via `cfg_data_t`, for example:
