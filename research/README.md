@@ -12,6 +12,8 @@ Directory layout:
   USB captures from direct CLI or live probing against the panel.
 - `captures/derived/`
   Derived text artifacts from captures, such as TSV exports or filtered packet listings.
+- `traces/f_link_logs/`
+  Copied `%APPDATA%\\Jablotron\\FLink\\` folders containing `FLink.ini` and rotated `comm.log*.htm` communication logs.
 - `fdb/before/`
   `.fdb` files saved before a single controlled change.
 - `fdb/after/`
@@ -85,6 +87,17 @@ Notes:
 - `property_rtti_correlation.py` correlates `.fdb` `tkEnumeration` and `tkSet` properties with the RTTI enum catalog. Current high-confidence mappings include `Permissions -> TJA100PermissionsEnum`, `TimeLimitGroup -> TJA100UserTimeLimitEnum`, `PGAccess -> TJA100PGEnum`, `Sections/SectionMask -> TJA100SectionEnum`, and `IsNull`/`ReadOnly`/`Updated -> Boolean`.
 - `jablotron_noauth_probe.py` confirms a limited unauthenticated metadata leak over HID: model, hardware version, firmware version, registration code, installation name, and section/PG state packets are readable without sending any authorisation code.
 - The same no-auth probe does not populate `EXPORT.CFG`: direct O_DIRECT reads after the unauthenticated trigger still return an all-zero 1 MiB blob, so the current evidence does not support pre-auth reading of the full config export or user table.
+- Procmon-guided collection confirmed that F-Link stores communication logs under `%APPDATA%\\Jablotron\\FLink\\` as `comm.log.htm` plus rotated `comm.log.N.htm` files, alongside `FLink.ini`.
+- Running `F-Link.exe /?` confirmed that communication logging is a supported command-line feature: `-commlog` / `--commlog` means `Log comunication to a file`.
+- The same help dialog also confirmed the following built-in switches: `-defcodes`, `-langcheck`, `-notimeout`, `-offline`, `-notheme`, `-hlimit x`, `-ownevtxt`, and `-noinvalidate`.
+- The process dumps contain one UTF-16 help-string table holding `comm.log.htm`, `-commlog`, `--commlog`, `Log comunication to a file`, `-defcodes`, `--defcodes`, and `Use default central codes`, so those hits are real command-line help text rather than orphaned strings.
+- Other schema/translation strings in the dumps explain what `-defcodes` is likely meant to use:
+  - the service code is kept in user/code position `0`
+  - the main administrator code is kept in position `1`
+  - factory defaults are explicitly documented as administrator `12345678` and service `10101010`
+  - `cfg.ja100.systemparams.warndefaultcodes` warns by SMS when default access codes are still in use after leaving service mode
+- Current interpretation: `-defcodes` / `--defcodes` most likely tells F-Link to use the panel's built-in factory default administrator/service codes when connecting.
+- The copied `comm.log*.htm` files in `research/traces/f_link_logs/roaming_Jablotron_FLink` are not readable HTML; they currently look like high-entropy binary logs with a shared header/prefix and no obvious standard compression wrapper.
 - `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.
 - That embedded schema confirms a distinct software-only internal privilege tier above normal service access: `ACCESS_SYSTEM` (`def=15`) and `COMP_SYSTEM`.
 - The schema also exposes access gates for stored config groups via `cfg_data_t`, for example:
