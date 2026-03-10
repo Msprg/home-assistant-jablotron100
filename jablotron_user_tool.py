@@ -265,6 +265,18 @@ def add_live_apply_arguments(parser: argparse.ArgumentParser) -> None:
         default="sudo",
         help="Mount helper to use for remount/unmount (default: sudo).",
     )
+    parser.add_argument(
+        "--stage-mode",
+        choices=("direct", "filesystem"),
+        default="filesystem",
+        help="How to stage IMPORT.CFG before accept (default: filesystem write plus direct LBA readback).",
+    )
+    parser.add_argument(
+        "--write-cleanup-mode",
+        choices=("auto", "none", "exit-only", "login-exit"),
+        default="auto",
+        help="How to close the write session after apply when the inline exit does not fully reach 0x90 (default: auto).",
+    )
     parser.add_argument("--verify-output", help="If set, verify against this export path. Defaults to /tmp.")
     parser.add_argument("--no-apply", action="store_true", help="Only build the sector and do not touch the panel.")
     add_verbose_argument(parser)
@@ -337,6 +349,8 @@ def cmd_add(args: argparse.Namespace) -> None:
             code=args.auth_code,
             reset=not args.no_reset,
             mount_tool=args.mount_tool,
+            stage_mode=args.stage_mode,
+            write_cleanup_mode=args.write_cleanup_mode,
             verbose=args.verbose,
             verify_output=verify_output,
         )
@@ -367,6 +381,8 @@ def cmd_edit(args: argparse.Namespace) -> None:
             code=args.auth_code,
             reset=not args.no_reset,
             mount_tool=args.mount_tool,
+            stage_mode=args.stage_mode,
+            write_cleanup_mode=args.write_cleanup_mode,
             verbose=args.verbose,
             verify_output=verify_output,
         )
@@ -395,6 +411,8 @@ def cmd_delete(args: argparse.Namespace) -> None:
             code=args.auth_code,
             reset=not args.no_reset,
             mount_tool=args.mount_tool,
+            stage_mode=args.stage_mode,
+            write_cleanup_mode=args.write_cleanup_mode,
             verbose=args.verbose,
             verify_output=verify_output,
         )

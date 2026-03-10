@@ -7,17 +7,19 @@ import hashlib
 import os
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from flexi_pcap_tool import IMPORT_START_LBA
 from jablotron_usb_debug import (
     Jablotron,
     JablotronUSBClient,
+    build_flink_info_log_reports,
     describe_packet,
     ensure_serial_port,
-    perform_flink_export_session,
     perform_login,
     perform_send_raw_report,
 )
@@ -32,13 +34,22 @@ DEFAULT_IMPORT_PATH = DEFAULT_IMPORT_MOUNTPOINT / "IMPORT.CFG"
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_ADD_TEMPLATE_PCAP = REPO_ROOT / "research/captures/usb/f_link/f-link-add-user-USER91TEST.pcapng"
 DEFAULT_ADD_TEMPLATE_FRAME = 2085
+IMPORT_METADATA_START_LBA = 27
+IMPORT_METADATA_SECTORS = 8
 
 REPORT_520102 = "520102" + "00" * 61
 REPORT_520124 = "520124" + "00" * 61
 REPORT_52010C = "52010c" + "00" * 61
 REPORT_800114 = "800114" + "00" * 61
 REPORT_80010F = "80010f" + "00" * 61
+REPORT_800102 = "800102" + "00" * 61
+REPORT_520125 = "520125" + "00" * 61
+REPORT_520213059A00 = "520213059a00" + "00" * 58
 EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
+EXITED_SECTIONS_MODE = 0x90
+SETUP_MODE_NUDGE_DELAY = 0.35
+SETUP_MODE_FIRST_KEEPALIVE_DELAY = 0.7
+SETUP_MODE_KEEPALIVE_INTERVAL = 1.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +112,20 @@ def resolve_flexi_cfg_device(device: str | None = None) -> str:
         "Unable to resolve the FLEXI_CFG block device. "
         "Connect the panel or pass --device /dev/sdX1 explicitly."
     )
+
+
+def is_device_mounted(device: str) -> bool:
+    resolved_device = resolve_flexi_cfg_device(device)
+    result = subprocess.run(
+        ["lsblk", "-P", "-o", "PATH,MOUNTPOINT", resolved_device],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return False
+    rows = _parse_lsblk_pairs(result.stdout)
+    return any(row.get("PATH") == resolved_device and row.get("MOUNTPOINT") for row in rows)
 
 
 def default_export_output(prefix: str) -> Path:
@@ -408,10 +433,191 @@ def read_export_direct(
     subprocess.run(command, check=True)
 
 
+def read_device_direct_bytes(*, device: str, start_lba: int, sectors: int) -> bytes:
+    resolved_device = resolve_flexi_cfg_device(device)
+    aligned_sectors = max(sectors, 8)
+    fd, temp_name = tempfile.mkstemp(prefix="jablotron-direct-read-", suffix=".bin")
+    os.close(fd)
+    os.unlink(temp_name)
+    temp_path = Path(temp_name)
+    try:
+        command = [
+            "dd",
+            f"if={resolved_device}",
+            f"of={temp_path}",
+            f"bs={SECTOR_SIZE}",
+            f"skip={start_lba}",
+            f"count={aligned_sectors}",
+            "iflag=direct",
+            "status=none",
+        ]
+        if os.geteuid() != 0:
+            command = ["sudo", "-n"] + command
+        subprocess.run(command, check=True)
+        return temp_path.read_bytes()[: sectors * SECTOR_SIZE]
+    finally:
+        try:
+            temp_path.unlink()
+        except PermissionError:
+            subprocess.run(["sudo", "-n", "rm", "-f", str(temp_path)], check=False)
+        except FileNotFoundError:
+            pass
+
+
+def write_device_direct_bytes(*, device: str, start_lba: int, data: bytes) -> None:
+    resolved_device = resolve_flexi_cfg_device(device)
+    fd, temp_name = tempfile.mkstemp(prefix="jablotron-direct-write-", suffix=".bin")
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_bytes(data)
+        base_command = [
+            "dd",
+            f"if={temp_path}",
+            f"of={resolved_device}",
+            f"bs={SECTOR_SIZE}",
+            f"seek={start_lba}",
+            f"count={(len(data) + SECTOR_SIZE - 1) // SECTOR_SIZE}",
+            "conv=fsync,notrunc",
+            "status=none",
+        ]
+        commands = [base_command + ["oflag=direct"], base_command]
+        if os.geteuid() != 0:
+            commands = [["sudo", "-n", *command] for command in commands]
+        last_error: subprocess.CalledProcessError | None = None
+        for command in commands:
+            try:
+                subprocess.run(command, check=True)
+                return
+            except subprocess.CalledProcessError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+    finally:
+        try:
+            temp_path.unlink()
+        except PermissionError:
+            subprocess.run(["sudo", "-n", "rm", "-f", str(temp_path)], check=False)
+        except FileNotFoundError:
+            pass
+
+
+def read_import_sector_direct(*, device: str) -> bytes:
+    data = read_device_direct_bytes(device=device, start_lba=IMPORT_START_LBA, sectors=1)
+    if len(data) < SECTOR_SIZE:
+        raise SystemExit(f"Short direct read for IMPORT.CFG sector 0: got {len(data)} bytes.")
+    return data[:SECTOR_SIZE]
+
+
+def verify_import_sector_direct(
+    *,
+    device: str,
+    expected_sector: bytes,
+    retries: int = 6,
+    retry_delay: float = 0.1,
+) -> bytes:
+    last_sector = b""
+    for attempt in range(retries):
+        last_sector = read_import_sector_direct(device=device)
+        if last_sector == expected_sector:
+            return last_sector
+        if attempt + 1 < retries:
+            time.sleep(retry_delay)
+    raise SystemExit(
+        "Direct IMPORT.CFG verification failed at LBA 2083 after unmount: "
+        "the staged sector was not readable back from the block device."
+    )
+
+
+def probe_import_sector_direct(
+    *,
+    device: str,
+    expected_sector: bytes,
+    retries: int = 3,
+    retry_delay: float = 0.1,
+) -> bool:
+    for attempt in range(retries):
+        if read_import_sector_direct(device=device) == expected_sector:
+            return True
+        if attempt + 1 < retries:
+            time.sleep(retry_delay)
+    return False
+
+
+def stage_import_direct(*, device: str, sector_path: Path) -> bytes:
+    expected_sector = sector_path.read_bytes()[:SECTOR_SIZE]
+    if len(expected_sector) != SECTOR_SIZE:
+        raise SystemExit(f"Expected a 512-byte encoded IMPORT sector in {sector_path}.")
+    write_device_direct_bytes(device=device, start_lba=IMPORT_START_LBA, data=expected_sector)
+    current = read_import_sector_direct(device=device)
+    if current != expected_sector:
+        raise SystemExit("Direct IMPORT.CFG staging failed verification at LBA 2083.")
+    return expected_sector
+
+
 def extract_sections_state_mode(packet: bytes) -> int | None:
     if Jablotron._is_sections_states_packet(packet) and packet:
         return packet[-1]
     return None
+
+
+def packet_startswith(packet: bytes, hex_prefix: str) -> bool:
+    return packet.startswith(bytes.fromhex(hex_prefix))
+
+
+def wait_for_packets(
+    client: JablotronUSBClient,
+    *,
+    deadline: float,
+    timeout: float,
+    prefix: str,
+    verbose: bool,
+) -> list[bytes]:
+    remaining = max(0.0, min(timeout, deadline - time.time()))
+    if remaining <= 0:
+        return []
+    return drain_packets(client, timeout=remaining, prefix=prefix, verbose=verbose)
+
+
+def send_flink_export_refresh_sequence(client: JablotronUSBClient, *, verbose: bool) -> None:
+    send_report(client, REPORT_520102, verbose=verbose)
+    send_report(client, REPORT_520102, verbose=verbose)
+    send_report(client, REPORT_80010F, verbose=verbose)
+    send_report(client, REPORT_520102, verbose=verbose)
+    send_report(client, REPORT_520213059A00, verbose=verbose)
+    for report in build_flink_info_log_reports():
+        send_report(client, report, verbose=verbose)
+    send_report(client, REPORT_520125, verbose=verbose)
+
+    deadline = time.time() + 8.0
+    last_keepalive = 0.0
+    saw_reload_complete = False
+
+    while time.time() < deadline:
+        packets = wait_for_packets(client, deadline=deadline, timeout=0.5, prefix="export", verbose=verbose)
+        now = time.time()
+        for packet in packets:
+            if packet_startswith(packet, "5204830b25"):
+                last_keepalive = now
+            elif packet_startswith(packet, "5207830125"):
+                saw_reload_complete = True
+
+        if not saw_reload_complete and now - last_keepalive >= 1.0:
+            send_report(client, REPORT_520102, verbose=verbose)
+            last_keepalive = now
+
+        if saw_reload_complete:
+            break
+
+    if not saw_reload_complete:
+        raise SystemExit("Export refresh did not reach the reload-complete state.")
+
+    send_report(client, REPORT_520102, verbose=verbose)
+    send_report(client, REPORT_800102, verbose=verbose)
+    time.sleep(0.05)
+    drain_packets(client, timeout=0.4, prefix="export-post", verbose=verbose)
+    send_report(client, REPORT_520102, verbose=verbose)
+    drain_packets(client, timeout=0.4, prefix="export-post", verbose=verbose)
 
 
 def trigger_live_export(*, port: str, code: str, reset: bool) -> None:
@@ -420,11 +626,7 @@ def trigger_live_export(*, port: str, code: str, reset: bool) -> None:
     try:
         perform_login(client, code, reset=reset)
         time.sleep(0.5)
-        perform_flink_export_session(client)
-        end = time.time() + 4.0
-        while time.time() < end:
-            for _packet in client.read_packets(timeout=0.2):
-                pass
+        send_flink_export_refresh_sequence(client, verbose=False)
     finally:
         client.close()
 
@@ -442,11 +644,17 @@ def pull_live_export_snapshot(
     cleanup_mode: str = "auto",
     verbose: bool = False,
 ) -> ExportSnapshot:
+    cleanup_sections_mode: int | None = None
     if trigger:
         trigger_live_export(port=port, code=code, reset=reset)
     read_export_direct(device=device, output=output, start_lba=start_lba, sectors=sectors)
     if trigger and cleanup_mode != "none":
-        cleanup_read_session(port=port, code=code, cleanup_mode=cleanup_mode, verbose=verbose)
+        cleanup_sections_mode = cleanup_read_session(port=port, code=code, cleanup_mode=cleanup_mode, verbose=verbose)
+        if cleanup_sections_mode != EXITED_SECTIONS_MODE:
+            raise SystemExit(
+                "Read-session cleanup did not reach the exited state "
+                f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {cleanup_sections_mode!r})."
+            )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     raw_records = extract_users(output, dedupe="raw")
     records = dedupe_user_records(raw_records)
@@ -558,10 +766,13 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
     service_rights_at: float | None = None
     nudged_0f = False
     saw_1a0a = False
-    sent_post_1a0a_520102 = False
+    saw_1a0a_at: float | None = None
+    saw_1b00 = False
+    saw_sections_94 = False
     entered_setup = False
     deadline = time.time() + 15.0
-    last_keepalive = 0.0
+    last_keepalive_at: float | None = None
+    next_keepalive_at: float | None = None
 
     while time.time() < deadline and not entered_setup:
         if initial_packets is not None:
@@ -572,26 +783,42 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
         now = time.time()
 
         for packet in packets:
-            if packet.startswith(bytes.fromhex("801a0c")) and not service_rights:
+            if packet_startswith(packet, "801a0c") and not service_rights:
                 service_rights = True
-                service_rights_at = time.time()
-            elif packet.startswith(bytes.fromhex("80021a0a")):
+                service_rights_at = now
+            elif packet_startswith(packet, "80021a0a") and not saw_1a0a:
                 saw_1a0a = True
+                saw_1a0a_at = now
                 send_report(client, REPORT_80010F, verbose=verbose)
-                last_keepalive = time.time()
-            elif packet.startswith(bytes.fromhex("800112")):
+                next_keepalive_at = now + SETUP_MODE_FIRST_KEEPALIVE_DELAY
+            elif packet_startswith(packet, "80021b00"):
+                saw_1b00 = True
+            elif packet_startswith(packet, "800112"):
                 entered_setup = True
+            else:
+                sections_mode = extract_sections_state_mode(packet)
+                if saw_1a0a and sections_mode == 0x94:
+                    saw_sections_94 = True
 
-        if service_rights and not saw_1a0a and not nudged_0f and service_rights_at and now - service_rights_at >= 0.35:
+        if (
+            service_rights
+            and not saw_1a0a
+            and not nudged_0f
+            and service_rights_at is not None
+            and now - service_rights_at >= SETUP_MODE_NUDGE_DELAY
+        ):
             send_report(client, REPORT_80010F, verbose=verbose)
             nudged_0f = True
-        elif saw_1a0a and not sent_post_1a0a_520102 and now - last_keepalive >= 0.7:
+        elif (
+            saw_1a0a
+            and not entered_setup
+            and next_keepalive_at is not None
+            and now >= next_keepalive_at
+            and (saw_sections_94 or saw_1b00 or (saw_1a0a_at is not None and now - saw_1a0a_at >= SETUP_MODE_FIRST_KEEPALIVE_DELAY))
+        ):
             send_report(client, REPORT_520102, verbose=verbose)
-            sent_post_1a0a_520102 = True
-            last_keepalive = now
-        elif sent_post_1a0a_520102 and now - last_keepalive >= 0.9:
-            send_report(client, REPORT_520102, verbose=verbose)
-            last_keepalive = now
+            last_keepalive_at = now
+            next_keepalive_at = now + SETUP_MODE_KEEPALIVE_INTERVAL
 
     if verbose:
         print(
@@ -600,7 +827,10 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
                 "service_rights": service_rights,
                 "nudged_0f": nudged_0f,
                 "saw_1a0a": saw_1a0a,
-                "sent_post_1a0a_520102": sent_post_1a0a_520102,
+                "saw_sections_94": saw_sections_94,
+                "saw_1b00": saw_1b00,
+                "last_keepalive_at": last_keepalive_at,
+                "next_keepalive_at": next_keepalive_at,
                 "entered_setup": entered_setup,
             },
         )
@@ -728,14 +958,25 @@ def apply_import_sector(
     code: str,
     reset: bool,
     mount_tool: str,
+    stage_mode: str,
+    write_cleanup_mode: str,
     verbose: bool,
     verify_output: Path | None = None,
 ) -> ExportSnapshot | None:
     resolved_device = resolve_flexi_cfg_device(device)
     mountpoint = import_path.parent
-    mount_device(resolved_device, mountpoint, mount_tool=mount_tool)
-    unmounted = False
+    remount_after = False
+    if stage_mode not in {"direct", "filesystem"}:
+        raise SystemExit(f"Unsupported stage mode: {stage_mode}")
+    if stage_mode == "filesystem":
+        mount_device(resolved_device, mountpoint, mount_tool=mount_tool)
+        remount_after = True
+    else:
+        if is_device_mounted(resolved_device):
+            unmount_device(resolved_device, mount_tool=mount_tool)
+            remount_after = True
     try:
+        write_exit_mode: int | None = None
         serial_port = ensure_serial_port(port)
         client = JablotronUSBClient(serial_port)
         try:
@@ -743,13 +984,37 @@ def apply_import_sector(
             time.sleep(0.7)
             pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=verbose)
             enter_setup_mode(client, verbose=verbose, initial_packets=pre_packets)
-            stage_import(import_path, sector_path)
-            unmount_device(resolved_device, mount_tool=mount_tool)
-            unmounted = True
+            if stage_mode == "filesystem":
+                stage_import(import_path, sector_path)
+                unmount_device(resolved_device, mount_tool=mount_tool)
+                if verbose:
+                    expected_sector = sector_path.read_bytes()[:SECTOR_SIZE]
+                    print("import_sector_probe", {"lba": IMPORT_START_LBA, "matched": probe_import_sector_direct(device=resolved_device, expected_sector=expected_sector)})
+            else:
+                stage_import_direct(device=resolved_device, sector_path=sector_path)
+                if verbose:
+                    print("import_sector_lba", IMPORT_START_LBA)
             perform_import_accept_sequence(client, verbose=verbose)
-            graceful_exit_session(client, verbose=verbose)
+            exit_packets = graceful_exit_session(client, verbose=verbose)
+            post_exit_packets = drain_packets(client, timeout=0.5, prefix="exit-post", verbose=verbose)
+            observed_modes = [
+                mode
+                for mode in (
+                    extract_sections_state_mode(packet)
+                    for packet in [*exit_packets, *post_exit_packets]
+                )
+                if mode is not None
+            ]
+            write_exit_mode = observed_modes[-1] if observed_modes else None
+            if verbose:
+                print("write_exit_mode", write_exit_mode)
         finally:
             client.close()
+
+        if write_cleanup_mode != "none" and write_exit_mode != EXITED_SECTIONS_MODE:
+            cleanup_mode = cleanup_read_session(port=port, code=code, cleanup_mode=write_cleanup_mode, verbose=verbose)
+            if verbose:
+                print("write_cleanup_mode", cleanup_mode)
 
         if verify_output is None:
             return None
@@ -761,5 +1026,5 @@ def apply_import_sector(
             reset=reset,
         )
     finally:
-        if unmounted:
+        if remount_after:
             mount_device(resolved_device, mountpoint, mount_tool=mount_tool)

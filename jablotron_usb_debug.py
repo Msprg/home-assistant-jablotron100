@@ -21,11 +21,14 @@ import argparse
 import enum
 import logging
 import os
+import getpass
 import select
 import sys
 import time
 import types
 import re
+import socket
+import uuid
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
 
@@ -455,6 +458,30 @@ FLINK_EXPORT_SESSION_REPORTS = [
     "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
     "52010200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
 ]
+
+
+def build_flink_info_log_message() -> bytes:
+    timestamp = time.strftime("%-m/%-d/%Y %-I:%M:%S %p")
+    hostname = socket.gethostname() or "codex-host"
+    username = getpass.getuser() or "codex"
+    session_uuid = uuid.uuid4()
+    message = (
+        f"Info(0):--F-Link 2.9.2.1509 started at {timestamp}--;"
+        f"UUID={{{session_uuid} {hostname}\\{username}}}"
+    )
+    return message.encode("utf-8", "replace")[:125]
+
+
+def build_flink_info_log_reports() -> list[str]:
+    payload = build_flink_info_log_message()
+    first = bytes([0x48, 0x3E, 0x03]) + payload[:61]
+    second = bytes([0x49, 0x3E]) + payload[61:123]
+    third = bytes([0x4A, 0x03]) + payload[123:185]
+    return [
+        first.ljust(64, b"\x00").hex(),
+        second.ljust(64, b"\x00").hex(),
+        third.ljust(64, b"\x00").hex(),
+    ]
 
 
 def perform_trigger_export(client: JablotronUSBClient, *, include_info_query: bool, include_fl_var_query: bool) -> None:

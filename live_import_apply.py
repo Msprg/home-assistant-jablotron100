@@ -44,6 +44,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="sudo",
         help="Mount helper to use for remount/unmount (default: sudo).",
     )
+    parser.add_argument(
+        "--stage-mode",
+        choices=("direct", "filesystem"),
+        default="filesystem",
+        help="How to stage IMPORT.CFG before accept (default: filesystem write plus direct LBA readback).",
+    )
+    parser.add_argument(
+        "--write-cleanup-mode",
+        choices=("auto", "none", "exit-only", "login-exit"),
+        default="auto",
+        help="How to close the write session after apply when the inline exit does not fully reach 0x90 (default: auto).",
+    )
     parser.add_argument("--verify-output", help="If set, pull a fresh EXPORT.CFG into this path after apply.")
     parser.add_argument(
         "--verify-user-id",
@@ -72,12 +84,14 @@ def main() -> None:
         code=args.code,
         reset=not args.no_reset,
         mount_tool=args.mount_tool,
+        stage_mode=args.stage_mode,
+        write_cleanup_mode=args.write_cleanup_mode,
         verbose=args.verbose,
         verify_output=Path(args.verify_output) if args.verify_output else None,
     )
 
     print(f"device {resolve_flexi_cfg_device(args.device)}")
-    print(f"staged {Path(args.sector)} into {Path(args.import_path)}")
+    print(f"staged {Path(args.sector)} via {args.stage_mode}")
 
     if snapshot is None:
         return

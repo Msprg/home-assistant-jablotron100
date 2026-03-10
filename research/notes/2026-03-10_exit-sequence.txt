@@ -1,0 +1,66 @@
+Question:
+- why do our scripted sessions leave the panel in configuration/setup mode until it times out, and what does F-Link send when it exits cleanly?
+
+Evidence:
+- matched decoded comm logs:
+  - `research/exports/f_link_comm_logs_text/f-link-base-read.from-comm.log.8.txt`
+  - `research/exports/f_link_comm_logs_text/f-link-add-user-USER91TEST.from-comm.log.7.txt`
+  - `research/exports/f_link_comm_logs_text/f-link-edit-user-USER91TEST.from-comm.log.6.txt`
+- live verbose no-op apply on 2026-03-10 using:
+  - `sudo -n python3 live_import_apply.py /tmp/2026-03-10_delete86_refactor.bin --verify-output /tmp/2026-03-10_exit-test2_EXPORT.CFG.bin --verify-user-id 86 --verbose`
+
+F-Link exit pattern from the matched logs:
+- after the config work is done, F-Link creates `JA100_EXIT_AUTHORISATION`
+- the wire sequence is consistently:
+  - `Tx: 94 02 01 00`
+  - `Tx: 80 01 01 52 01 0E`
+  - `Tx: 52 01 02`
+- shortly afterwards the panel emits a section-state packet whose last status byte changes from `...94` to `...90`
+- that transition appears in:
+  - `f-link-add-user-USER91TEST.from-comm.log.7.txt` around `19:38:02.413` to `19:38:02.655`
+  - `f-link-edit-user-USER91TEST.from-comm.log.6.txt` around `19:49:45.157` to `19:49:45.479`
+
+Interpretation:
+- `80 01 01` is the normal `UI_CONTROL_AUTHORISATION_END`
+- `52 01 0E` is the regular section/PG state query
+- `94 02 01 00` appears to be part of F-Link's standard session teardown before authorisation end; it matches a diagnostics packet with payload `01 00`
+- the final `sections_states ... 90` packet is the strongest currently observed indicator that the panel has actually left setup/config mode
+
+Implementation result:
+- `jablotron_re_tools.py` now uses that exit sequence automatically for setup-mode write/apply sessions
+- early live validation showed an inline write-session exit that reached `sections_states ... 90` directly, but later live add/edit/delete runs during the transport review showed that this panel often lands first on `sections_states ... 80` instead
+- current helper behavior:
+  - run the inline F-Link-shaped exit in the write session
+  - inspect the observed section-state mode
+  - if it did not finish on `0x90`, open a second cleanup session and reuse the read-side cleanup logic
+- live add/edit/delete validation on 2026-03-10 showed that the second cleanup session reliably finished on `0x90` without regressing the applied mutation
+- the earlier no-op apply still verified successfully with a fresh export:
+  - `/tmp/2026-03-10_exit-test2_EXPORT.CFG.bin`
+  - SHA-256 `f6acd86cf3ceeb2947690538d34fd35bcb212aeb39d26581c668b17ec176a8d4`
+  - `users_raw 81`, `users_deduped 81`
+
+Read-session follow-up on 2026-03-10:
+- inline graceful exit inside the minimal export-trigger helper still races the background refresh and produces an all-zero export blob:
+  - `/tmp/2026-03-10_post-exit-pull_EXPORT.CFG.bin`
+  - SHA-256 `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58`
+  - `users_raw 0`, `users_deduped 0`
+- a second post-read HID cleanup pass now works without breaking the export refresh
+- live verification command:
+  - `sudo -n python3 export_cfg_tool.py pull-live /tmp/2026-03-10_post-read-cleanup-test_EXPORT.CFG.bin --read-cleanup-mode auto --verbose`
+- result:
+  - export stayed valid with SHA-256 `f6acd86cf3ceeb2947690538d34fd35bcb212aeb39d26581c668b17ec176a8d4`
+  - `users_raw 81`, `users_deduped 81`
+  - first cleanup attempt `exit-only` ended on `sections_mode 0x80`, so that was not enough to prove the panel had fully left setup/config state
+  - automatic fallback `login-exit` then ended on `sections_mode 0x90`, which matches the successful F-Link exit pattern
+- implementation:
+  - `jablotron_re_tools.py pull_live_export_snapshot()` now supports `cleanup_mode=auto|none|exit-only|login-exit`
+  - default `auto` behavior is:
+    - trigger export
+    - read `EXPORT.CFG` directly from the block device
+    - open a fresh HID session
+    - try `exit-only`
+    - if the observed section-state mode is not `0x90`, retry as `login-exit`
+- current interpretation:
+  - the export refresh still needs the original trigger session to disconnect abruptly
+  - after the block read completes, a second HID session can safely perform the graceful teardown
+  - on this panel, read sessions appear to need `login-exit` rather than a plain unauthenticated `exit-only` teardown

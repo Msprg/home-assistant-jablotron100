@@ -1,0 +1,63 @@
+Question:
+- after the March 10 transport refactor, which low-level changes actually improved stability and which ones turned out to be stale or overconfident assumptions?
+
+Validated results:
+- read/export path:
+  - the shared export refresh now sends a synthesized F-Link-style info log and waits for the real `52 07 83 01 25 ...` reload-complete marker
+  - live verification:
+    - `sudo -n python3 export_cfg_tool.py pull-live /tmp/2026-03-10_final-read-smoke_EXPORT.CFG.bin --extract-users --format tsv --read-cleanup-mode auto`
+    - SHA-256 `8cb77ee6da1684e94b9fd8f1c2542ac1469f1532d7f1959386d33663e1875899`
+    - `users_raw 88`, `users_deduped 88`
+- write/apply path:
+  - add user `89` as `transport89`
+    - verification export `/tmp/2026-03-10_add89_restorecheck_EXPORT.CFG.bin`
+    - SHA-256 `2440476d942b1b5c0b83875c763a4f0c5b2497939403c3959215f73d87c6f493`
+  - edit user `89` comment to `cleanup89`
+    - verification export `/tmp/2026-03-10_edit89_cleanup_EXPORT.CFG.bin`
+    - SHA-256 `c604e3f6ce93873442bb512e143d6b330426a263de13448efd56f025f9e63906`
+  - delete user `89`
+    - verification export `/tmp/2026-03-10_delete89_final_EXPORT.CFG.bin`
+    - SHA-256 `8cb77ee6da1684e94b9fd8f1c2542ac1469f1532d7f1959386d33663e1875899`
+    - user `89` absent again
+
+Corrected assumptions:
+- stale assumption:
+  - filesystem staging of `IMPORT.CFG` could be made a hard-gated authoritative check by reading sector `0` back directly from the block device at `lba=2083`
+- current evidence:
+  - that direct readback is not reliable enough to use as a correctness gate for every payload shape
+  - during live tests on the same panel and same day:
+    - filesystem-staged delete payloads sometimes matched the direct readback probe
+    - filesystem-staged upserts often did not match the direct readback probe
+    - the later `EXPORT.CFG` verification still reflected the semantic mutation correctly
+- updated interpretation:
+  - direct `IMPORT.CFG` sector reads are still useful diagnostics for reversing
+  - they should not currently be treated as the authoritative pass/fail test for filesystem-staged mutations
+  - the authoritative post-apply check remains a fresh `EXPORT.CFG` pull
+
+Write-path findings:
+- pure raw block writes of the encoded `IMPORT.CFG` sector can be written and read back, but they were still not sufficient on their own to trigger a real semantic add/edit/delete
+- the working write path remains:
+  - enter setup mode
+  - stage `IMPORT.CFG` through the mounted filesystem path
+  - unmount
+  - run the older validated accept sequence:
+    - `52 01 02`
+    - `52 01 24`
+    - `52 01 02`
+    - `52 01 0C`
+    - plus `80 01 14` / `80 01 0F` responses if the panel asks
+- the more ambitious packet-driven accept rewrite from the transport review was regressive on the live panel and was removed
+
+Session teardown findings:
+- inline write-session teardown still often ended on `sections_states ... 80`
+- a second cleanup HID session using the same exit pattern as read cleanup reliably finished the panel exit to `sections_states ... 90`
+- current implementation:
+  - write sessions now expose `write_cleanup_mode=auto|none|exit-only|login-exit`
+  - default `auto` runs a second cleanup session only when the inline exit does not finish on `0x90`
+
+Practical conclusion:
+- keep the read-session improvements
+- keep the setup-mode helper improvements
+- keep filesystem staging as the default stable write path
+- keep direct staging as an explicit experimental/debug mode, not the normal operator path
+- keep fresh `EXPORT.CFG` verification as the final authority for user CRUD

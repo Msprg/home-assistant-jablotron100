@@ -79,6 +79,7 @@ Notes:
 - `EXPORT.CFG` user strings are encoded with MessagePack string markers, not just `fixstr`. `export_cfg_tool.py` now handles `fixstr`, `str8`, `str16`, and `str32`, which matters once fields exceed 31 bytes.
 - `EXPORT.CFG` user records also need structural MessagePack field parsing. A naive byte-scan for tags falsely hid user `4` (`jaroslav kardos`) because the one-byte user ID `0x04` collided with field tag `4` (`Name`). The current parser now decodes the whole 12-field user map first, which also restored previously truncated low-ID fields such as user `5`'s phone and user `6`'s code.
 - Preferred live path: `export_cfg_tool.py pull-live` triggers the service-session replay and then reads sectors directly from the auto-resolved `FLEXI_CFG` block device with `dd iflag=direct`, which avoids the stale mounted-file cache problem.
+- The shared export refresh no longer replays a stale hard-coded F-Link info-log blob and then sleeps a fixed four seconds. It now synthesizes fresh info-log packets per session and waits for the real `52 07 83 01 25 ...` reload-complete marker before reading `EXPORT.CFG`.
 - `jablotron_re_tools.py` now holds the shared live-panel plumbing used by `export_cfg_tool.py`, `live_import_apply.py`, `jablotron_user_tool.py`, and the smaller smoke-test `dev_test.py`. This keeps device discovery, setup-mode entry, staging, accept, and verification in one place while preserving the lower-level scripts for reversing.
 - FLEXI_CFG block-device resolution now defaults to `auto`, which prefers `/dev/disk/by-label/FLEXI_CFG` and falls back to `lsblk`. On this workstation that currently resolves to `/dev/sdc1`.
 - `export_cfg_tool.py extract-users` and `pull-live --extract-users` now have two views:
@@ -93,10 +94,11 @@ Notes:
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
 - `import_cfg_tool.py` round-trips the captured add/edit/delete sectors exactly, so user mutation sectors can now be synthesized offline without F-Link.
 - A live no-op write has now been validated: deleting confirmed-empty user slot `4` left the refreshed `EXPORT.CFG` hash and parsed user map unchanged.
-- The live transport path was validated first with a no-op direct sector write, but a real semantic mutation required filesystem-level staging rather than raw block writes alone.
-- During that no-op test, `IMPORT.CFG` sector 0 changed from a pre-command sentinel (`false`) to the written delete command, then to a different post-refresh sentinel (`-1`), which suggests the panel consumes or clears the command after processing.
-- Raw direct sector writes on `/dev/sdb1` were not enough for a real mutation. They staged data, and sometimes produced ghost copies near the end of `EXPORT.CFG`, but they did not reliably update the authoritative user table.
-- Captured F-Link add/edit/delete sessions always perform a second write to `lba=27 sectors=8` after the `IMPORT.CFG` exchange, which is consistent with FAT directory metadata updates for `IMPORT.CFG`.
+- Raw direct sector writes remain useful as a diagnostic: the encoded 512-byte command can be written and read back at `IMPORT.CFG` sector 0, but that alone was still not enough to trigger a real add/edit/delete on this panel.
+- The currently stable live mutation path still requires filesystem-level staging through the mounted `IMPORT.CFG`, followed by unmount and the existing HID accept sequence.
+- One stale assumption was corrected during the 2026-03-10 transport review: direct readback of `IMPORT.CFG` sector 0 after filesystem staging is not a reliable hard verification oracle for every payload shape. In live tests, some filesystem-staged deletes matched the expected direct readback while semantically valid upserts did not, yet the later `EXPORT.CFG` verification still reflected the mutation correctly.
+- Current interpretation: raw block-sector observations around `IMPORT.CFG` are still useful for reversing, but a fresh `EXPORT.CFG` pull remains the authoritative post-apply verification source.
+- Captured F-Link add/edit/delete sessions still consistently show a later write to `lba=27 sectors=8` after the `IMPORT.CFG` exchange, which remains consistent with FAT directory metadata updates for `IMPORT.CFG`.
 - A real live semantic user edit is now validated. On 2026-03-08, slot `86` (`TESTUSERWALDO`) was changed from comment `Waldo has a new comment` to `USB8`, and the new comment persisted across repeated fresh `pull-live` reads in new authenticated sessions.
 - The currently working live-apply sequence is:
   - stage sector 0 of `IMPORT.CFG` through the mounted file path `/media/administrator/FLEXI_CFG/IMPORT.CFG`
@@ -109,16 +111,18 @@ Notes:
   - `research/exports/2026-03-08_retry3_verify_EXPORT.CFG.bin`
   - `research/exports/2026-03-08_retry4_persist_EXPORT.CFG.bin`
   - both have SHA-256 `58b83a61b614db77d3535e62b3cde1a462ebdc42e3f4ebe0cc32d839055b3615`
-- `live_import_apply.py` now packages the full reusable write path: setup-mode entry, filesystem staging, unmount, import accept, optional export verification, and remount. Its current setup helper follows the matched F-Link add/delete logs more closely: wait for `80 02 1A 0A`, answer with `80 01 0F`, then send the first `52 01 02`, with a delayed `80 01 0F` nudge after `80 1A 0C ...` if `80 02 1A 0A` does not arrive on its own. It also defaults to `sudo mount` / `sudo umount` rather than `udisksctl`.
+- `live_import_apply.py` now packages the full reusable write path: setup-mode entry, filesystem staging, unmount, import accept, optional export verification, remount, and post-write cleanup. Its current setup helper follows the matched F-Link add/delete logs more closely: wait for `80 02 1A 0A`, answer with `80 01 0F`, then send the first `52 01 02`, with a delayed `80 01 0F` nudge after `80 1A 0C ...` if `80 02 1A 0A` does not arrive on its own. It also defaults to `sudo mount` / `sudo umount` rather than `udisksctl`.
 - The shared live helper now also mirrors F-Link's exit sequence for setup-mode write sessions instead of just dropping the HID handle:
   - `94 02 01 00`
   - `80 01 01`
   - `52 01 0E`
   - `52 01 02`
-  - in live verbose output this ends with the same `sections_states ... 90` transition seen in the matched F-Link logs, which is strong evidence that setup/config mode was actually left
+  - on this panel the inline write-session exit often lands first on `sections_states ... 80`, so the reusable helper now follows it with the same second-session cleanup logic used for read sessions when needed
+  - live add/edit/delete verification on 2026-03-10 showed that this second cleanup session reliably finishes on `sections_states ... 90`
 - Pure read/export sessions now use a second post-read HID cleanup pass instead of trying to close the original trigger session inline. The current shared helper supports `cleanup_mode=auto|none|exit-only|login-exit`; default `auto` triggers the export, reads `EXPORT.CFG` directly, then opens a fresh HID session to close the panel state cleanly.
 - Live verification on 2026-03-10 showed that `exit-only` was not sufficient for read sessions on this panel: it ended on `sections_states ... 80`. The automatic fallback `login-exit` did reach `sections_states ... 90`, while the pulled export stayed valid at SHA-256 `f6acd86cf3ceeb2947690538d34fd35bcb212aeb39d26581c668b17ec176a8d4`.
 - The earlier limitation still applies in a narrower form: applying graceful exit inline to the original minimal export-trigger session still races the refresh and returns an all-zero `EXPORT.CFG`. The working approach is to let the trigger session disconnect first, then do the graceful teardown in a second HID session after the direct block read.
+- Write/apply sessions now use the same cleanup idea after the inline teardown. If the immediate write-session exit does not end on `0x90`, the helper opens a second HID cleanup session (`write_cleanup_mode=auto|none|exit-only|login-exit`, default `auto`) so the panel does not sit in configuration mode until timeout.
 - That packaged helper was revalidated on 2026-03-10 first with a no-op delete of already-empty slot `86`, then again after a real add of user `88` with a same-value upsert. The revalidation export after the user-88 add was `/tmp/2026-03-10_live-import-apply-user88-reverify_EXPORT.CFG.bin` with SHA-256 `b580cfb055dfd628eb9827823328d28176f6a7210a8497a108fee8ac3a198525`.
 - Capture analysis on 2026-03-10 shows that F-Link's write path is preceded by a setup-mode transition, not just plain service authentication. The key observed bridge is `80 1A 0C ...` (service rights accepted) followed by `80 01 0F`, then `52 01 02` keepalives until `80 01 12` (`Setting mode entered`). Manual live probing reproduced that transition at least once, but the timing is still sensitive and not yet packaged into a reliable helper. See `research/notes/2026-03-10_setup-mode-handshake.txt`.
 - A later scripted live run on 2026-03-10 used that setup-mode bridge to change user `86` (`TESTUSERWALDO`) from comment `USB8` to `USBA`, and a fresh post-run export confirmed the mutation. The same run also showed that direct post-apply reads of `IMPORT.CFG` sector 0 can snap back to the older `USB3` payload even when the authoritative `EXPORT.CFG` user table reflects the new value, so `IMPORT.CFG` sector 0 should not be treated as a durable record of the last successful command.
@@ -138,6 +142,11 @@ Notes:
   - known examples from the current live export:
     - user `7` decodes as `coService` and enabled
     - users `13`, `34`, and `39` decode as `coUserNoSelfedit` and disabled
+- A later transport-review validation on 2026-03-10 re-ran the refactored tooling live after low-level changes:
+  - add user `89` as `transport89`
+  - edit user `89` comment to `cleanup89`
+  - delete user `89`
+  - all three mutations verified in fresh exports, and the final post-delete export `/tmp/2026-03-10_delete89_final_EXPORT.CFG.bin` came back with SHA-256 `8cb77ee6da1684e94b9fd8f1c2542ac1469f1532d7f1959386d33663e1875899`
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
 - `research/fdb/after/VO-66_after-add-test-rights-users-80-86.fdb` is the current reference file for the extra user-role permutations added in F-Link. `fdb_tool.py extract-users` on that file confirms the live export mappings for slots `80-86`: `coNoAccess`, `coUserGuard`, `coPanic`, `coPGOnly`, `coArmOnly`, `coUserNoSelfedit`, and `coPCOGuard`.
