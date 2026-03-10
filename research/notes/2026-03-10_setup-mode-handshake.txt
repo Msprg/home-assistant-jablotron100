@@ -86,6 +86,63 @@ Live name-field mutation check on 2026-03-10:
 - direct post-apply O_DIRECT read of `IMPORT.CFG` sector 0 still decoded as the older `USB3` / `TESTUSERWALDO` payload
 - conclusion: live user-name edits are now confirmed in addition to comment edits, and `EXPORT.CFG` remains the authoritative source for post-apply verification
 
+Live delete check on 2026-03-10:
+- starting state before the test: user `86` name `TESTUSERWALDO2`, comment `Longer comment test 2026-03-10 A`
+- staged payload: delete command `{7: {86: nil}}`
+- first live attempt failed before setup mode:
+  - service rights were accepted
+  - sending `52 01 02` first and only then `80 01 0F` produced `80 02 1B 00` plus device-state chatter, but not `80 02 1A 0A` / `80 01 12`
+- second live attempt succeeded with a slightly different setup bridge:
+  - after `80 1A 0C ...`, send `80 01 0F` immediately
+  - then send `52 01 02`
+  - when `80 02 1A 0A` arrives, answer with `80 01 0F`
+  - `80 02 1B 00` and `80 01 12` then followed, allowing the delete to be staged and accepted
+- post-state from fresh export:
+  - `/tmp/2026-03-10_post-delete-testuserwaldo2_EXPORT.CFG.bin`
+  - SHA-256 `25991e1bdf8d1c968442458165b31a083c337f3bcbe2ae0f3a416daf7521fd1c`
+  - user `86` no longer present in the parsed user table
+  - parsed user count dropped from `81` to `80`
+- direct post-apply O_DIRECT read of `IMPORT.CFG` sector 0 still decoded as the older `USB3` upsert payload for user `86`
+- conclusion:
+  - live user deletion is now confirmed, not just add/edit
+  - the setup-mode bridge is timing/order-sensitive; sending `80 01 0F` before the first `52 01 02` can matter
+  - `EXPORT.CFG` still remains the authoritative verification source
+
+Live add check on 2026-03-10:
+- starting state before the test: slots `87`, `88`, and `89` were empty in a fresh export with SHA-256 `25991e1bdf8d1c968442458165b31a083c337f3bcbe2ae0f3a416daf7521fd1c`
+- staged payload:
+  - template source: captured minimal add from `f-link-add-user-USER91TEST.pcapng` frame `2085`
+  - target payload: user `88`, name `testuser88`, all other fields empty/default
+- setup-mode behavior:
+  - the currently packaged helper still failed on the first add attempt because it sent the first `52 01 02` too early and got stuck in repeated `80 02 1B 00`
+  - comparing the matched add/delete comm logs showed a better pattern:
+    - wait for `80 02 1A 0A`
+    - answer with `80 01 0F`
+    - only then send the first `52 01 02`
+    - if `80 02 1A 0A` does not appear shortly after `80 1A 0C ...`, send a delayed `80 01 0F` nudge
+  - a one-off live run using that log-shaped setup loop succeeded:
+    - `80 1A 0C ...`
+    - delayed `80 01 0F` nudge
+    - `80 02 1A 0A`
+    - `80 01 0F`
+    - `80 02 1B 00`
+    - `80 01 12`
+- post-state from fresh export:
+  - `/tmp/2026-03-10_post-add-user88_EXPORT.CFG.bin`
+  - SHA-256 `b580cfb055dfd628eb9827823328d28176f6a7210a8497a108fee8ac3a198525`
+  - user `88` decoded as name `testuser88`
+  - parsed user count increased from `80` to `82`, but that includes a duplicated `88` record
+- helper follow-up:
+  - `live_import_apply.py` was then updated to follow that log-shaped setup loop
+  - the revised helper was revalidated with a same-value upsert for user `88`
+  - verification export:
+    - `/tmp/2026-03-10_live-import-apply-user88-reverify_EXPORT.CFG.bin`
+    - same SHA-256 `b580cfb055dfd628eb9827823328d28176f6a7210a8497a108fee8ac3a198525`
+- important caveat:
+  - the refreshed export hash is stable and user `88` is definitely present in the main table at offset `6107`
+  - `extract_users()` also sees a second identical user `88` record near the end of the blob at offset `1048065`
+  - this looks like the previously observed ghost-copy phenomenon in `EXPORT.CFG`, so user-count summaries should use unique IDs rather than raw record count after this add
+
 Next debugging target:
 - capture the exact timing window between `80 1A 0C ...`, `80 01 0F`, the first `52 01 02`, and `80 01 12`
 - compare the successful manual probe with F-Link's `JA100_ENTER_SETUP` timing in `comm.log.[1|4|6|7|9].txt`
