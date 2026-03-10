@@ -339,11 +339,21 @@ def build_user_upsert_payload(args: argparse.Namespace) -> OrderedDict[Any, Any]
     collection.clear()
     collection[int(args.user_id)] = user_record
 
-    user_record[4] = args.name
-    user_record[5] = args.phone
-    user_record[6] = args.code
-    user_record[7] = [OrderedDict({0: args.card1}), OrderedDict({0: args.card2})]
-    user_record[10] = args.comment
+    if args.name is not None:
+        user_record[4] = args.name
+    if args.phone is not None:
+        user_record[5] = args.phone
+    if args.code is not None:
+        user_record[6] = args.code
+    if args.card1 is not None or args.card2 is not None:
+        current_cards = user_record.get(7, [OrderedDict({0: ""}), OrderedDict({0: ""})])
+        if not isinstance(current_cards, list) or len(current_cards) < 2:
+            current_cards = [OrderedDict({0: ""}), OrderedDict({0: ""})]
+        card1 = args.card1 if args.card1 is not None else current_cards[0].get(0, "")
+        card2 = args.card2 if args.card2 is not None else current_cards[1].get(0, "")
+        user_record[7] = [OrderedDict({0: card1}), OrderedDict({0: card2})]
+    if args.comment is not None:
+        user_record[10] = args.comment
 
     if args.field0_raw is not None:
         user_record[0] = args.field0_raw

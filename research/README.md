@@ -51,6 +51,11 @@ Useful offline analysis commands:
 - `python3 f_link_user_tool.py diff-users research/traces/process_memory/f-link-delete-user-USER91TEST.dmp research/traces/process_memory/f-link-edit-user-USER91TEST.dmp`
 - `python3 export_cfg_tool.py extract-users research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format tsv`
 - `python3 export_cfg_tool.py pull-live research/exports/live_EXPORT.CFG.bin --extract-users`
+- `python3 jablotron_user_tool.py list`
+- `python3 jablotron_user_tool.py get 88`
+- `python3 jablotron_user_tool.py add 89 --name testuser89`
+- `python3 jablotron_user_tool.py edit 88 --comment 'Renamed from CLI' --use-minimal-template`
+- `python3 jablotron_user_tool.py delete 89`
 - `python3 import_cfg_tool.py decode-frame research/captures/usb/f_link/f-link-edit-user-USER91TEST.pcapng 1787 --format json`
 - `python3 import_cfg_tool.py build-user-upsert /tmp/user91-edit.bin --user-id 91 --name USER91TEST --code 9999 --card1 0000000012200717 --comment 'THIS IS A SAMPLE USER91TEST NOTE' --permissions-raw 811 --sections-mask 63 --pg-masks 65535,0,0,0`
 - `python3 import_cfg_tool.py build-user-delete /tmp/user91-delete.bin --user-id 91`
@@ -72,7 +77,12 @@ Notes:
 - For live reads, `EXPORT.CFG` on `FLEXI_CFG` can stay all-zero until a F-Link-style HID session refreshes it. A captured service-session replay now exists as `python3 jablotron_usb_debug.py --code 1812 --login-first --no-reset f-link-export-session`.
 - The live `EXPORT.CFG` blob is bytewise XORed with `0xff`. `export_cfg_tool.py` decodes that layer and can extract a user list directly from the pulled export blob.
 - `EXPORT.CFG` user strings are encoded with MessagePack string markers, not just `fixstr`. `export_cfg_tool.py` now handles `fixstr`, `str8`, `str16`, and `str32`, which matters once fields exceed 31 bytes.
-- Preferred live path: `export_cfg_tool.py pull-live` triggers the service-session replay and then reads sectors directly from `/dev/sdb1` with `dd iflag=direct`, which avoids the stale mounted-file cache problem.
+- Preferred live path: `export_cfg_tool.py pull-live` triggers the service-session replay and then reads sectors directly from the auto-resolved `FLEXI_CFG` block device with `dd iflag=direct`, which avoids the stale mounted-file cache problem.
+- `jablotron_re_tools.py` now holds the shared live-panel plumbing used by `export_cfg_tool.py`, `live_import_apply.py`, `jablotron_user_tool.py`, and the smaller smoke-test `dev_test.py`. This keeps device discovery, setup-mode entry, staging, accept, and verification in one place while preserving the lower-level scripts for reversing.
+- FLEXI_CFG block-device resolution now defaults to `auto`, which prefers `/dev/disk/by-label/FLEXI_CFG` and falls back to `lsblk`. On this workstation that currently resolves to `/dev/sdc1`.
+- `export_cfg_tool.py extract-users` and `pull-live --extract-users` now have two views:
+  - `--user-mode dedupe` for operator-safe summaries and CRUD verification
+  - `--user-mode raw` for reverse engineering when repeated record-shaped hits matter
 - On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
@@ -102,6 +112,12 @@ Notes:
 - Another scripted live run on 2026-03-10 changed user `86`'s name from `TESTUSERWALDO` to `TESTUSERWALDO2` while preserving the long comment, and a fresh export at `/tmp/2026-03-10_post-namechange_EXPORT.CFG.bin` confirmed the rename with SHA-256 `88e6959fdae8e566b4a54aee670541cb8ee7fc2a7f841cfea193b2daddf0d296`. This is the first live proof that field `4` in the user upsert payload controls the exported user name, not just comments. As with the comment edits, direct post-apply reads of `IMPORT.CFG` sector 0 still reverted to the older `USB3` payload, so verification should continue to rely on a fresh `EXPORT.CFG` pull.
 - A later scripted live run on 2026-03-10 deleted that same user `86` successfully with the captured delete shape `{7: {86: nil}}`. The verification export at `/tmp/2026-03-10_post-delete-testuserwaldo2_EXPORT.CFG.bin` had SHA-256 `25991e1bdf8d1c968442458165b31a083c337f3bcbe2ae0f3a416daf7521fd1c`, user `86` was absent, and the parsed user count dropped from `81` to `80`. The successful retry also narrowed the setup bridge: in that run, sending `80 01 0F` immediately after `80 1A 0C ...` and only then the first `52 01 02` was enough to enter setup mode reliably, while the reverse order failed in the preceding attempt. As before, direct post-apply reads of `IMPORT.CFG` sector 0 still snapped back to the older `USB3` payload, so verification should continue to rely on a fresh `EXPORT.CFG` pull.
 - A later scripted live run on 2026-03-10 added a new minimal user `88` named `testuser88` using the captured low-privilege add shape from `f-link-add-user-USER91TEST.pcapng`. The verification export at `/tmp/2026-03-10_post-add-user88_EXPORT.CFG.bin` had SHA-256 `b580cfb055dfd628eb9827823328d28176f6a7210a8497a108fee8ac3a198525`, and user `88` decoded correctly from the main user table. That add also refined the reusable setup helper again: the successful add path matched the decoded F-Link logs more closely by waiting for `80 02 1A 0A`, answering with `80 01 0F`, and only then sending the first `52 01 02`, with a delayed `80 01 0F` nudge if `80 02 1A 0A` does not appear on its own. One remaining caveat is that the refreshed export contains a second identical user-88 record near the end of the blob, so raw parsed-record counts can overcount by one; user summaries should dedupe by user ID.
+- The user-management workflow was refactored again on 2026-03-10:
+  - `jablotron_user_tool.py` now provides the operator-facing `pull-export`, `list`, `get`, `add`, `edit`, and `delete` commands
+  - the old Home Assistant-oriented `dev_test.py` moved to `legacy/dev_test_homeassistant_legacy.py`
+  - the new `dev_test.py` is a smaller smoke-test CLI for the current live RE path
+  - live verification with the new CLI succeeded for a same-value edit of user `88`, an add of user `89` (`toolsmoke89`), and a delete of that same user `89`
+  - interestingly, the post-delete export `/tmp/2026-03-10_user-tool-delete89_EXPORT.CFG.bin` had SHA-256 `a69d5fc13338f0bffcb9b4c3f571189ddc0c8662db606fb55b1b47022bb18a0d`, and the earlier raw ghost copy of user `88` had disappeared, leaving `users_raw 81` and `users_deduped 81`
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
 - `enum_rtti_scan.py` can recover Delphi RTTI enum definitions directly from the F-Link process dumps; the current deduped catalog contains 162 enum definitions.
