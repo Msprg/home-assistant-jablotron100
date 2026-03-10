@@ -44,6 +44,10 @@ class UserRecord:
     offset: int
     user_id: Optional[int]
     raw_id_bytes: str
+    status_raw: Optional[int]
+    permissions_raw: Optional[int]
+    rights: str
+    enabled: Optional[bool]
     name: str
     phone: str
     code: str
@@ -149,6 +153,29 @@ def decode_msgpack_string(data: bytes, start: int) -> str:
     return data[offset : offset + length].decode("utf-8", "replace")
 
 
+def decode_msgpack_int(data: bytes, start: int) -> tuple[Optional[int], int]:
+    if start >= len(data):
+        return None, start
+    marker = data[start]
+    if marker <= 0x7F:
+        return marker, start + 1
+    if marker >= 0xE0:
+        return marker - 0x100, start + 1
+    if marker == 0xCC and start + 1 < len(data):
+        return data[start + 1], start + 2
+    if marker == 0xCD and start + 2 < len(data):
+        return int.from_bytes(data[start + 1 : start + 3], "big"), start + 3
+    if marker == 0xCE and start + 4 < len(data):
+        return int.from_bytes(data[start + 1 : start + 5], "big"), start + 5
+    if marker == 0xD0 and start + 1 < len(data):
+        return int.from_bytes(data[start + 1 : start + 2], "big", signed=True), start + 2
+    if marker == 0xD1 and start + 2 < len(data):
+        return int.from_bytes(data[start + 1 : start + 3], "big", signed=True), start + 3
+    if marker == 0xD2 and start + 4 < len(data):
+        return int.from_bytes(data[start + 1 : start + 5], "big", signed=True), start + 5
+    return None, start
+
+
 def parse_len_string(record: bytes, tag: int) -> str:
     index = record.find(bytes([tag]))
     if index == -1 or index + 1 >= len(record):
@@ -168,6 +195,19 @@ def parse_card(record: bytes) -> str:
     if marker_index == -1 or marker_index + 2 >= len(field):
         return ""
     return decode_msgpack_string(field, marker_index + 2)
+
+
+def decode_rights_name(permissions_raw: Optional[int]) -> str:
+    mapping = {
+        2875: "coService",
+        1851: "coMaster",
+        811: "coUserNoSelfedit",
+    }
+    if permissions_raw in mapping:
+        return mapping[permissions_raw]
+    if permissions_raw is None:
+        return ""
+    return f"raw:{permissions_raw}"
 
 
 def dedupe_user_records(records: Iterable[UserRecord]) -> list[UserRecord]:
@@ -200,6 +240,14 @@ def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
         if cursor >= len(record) or record[cursor] != 0x8C:
             continue
 
+        inner = cursor + 1
+        status_raw: Optional[int] = None
+        permissions_raw: Optional[int] = None
+        if inner + 1 < len(record) and record[inner] == 0:
+            status_raw, inner = decode_msgpack_int(record, inner + 1)
+        if inner + 1 < len(record) and record[inner] == 1:
+            permissions_raw, inner = decode_msgpack_int(record, inner + 1)
+
         name = parse_len_string(record, 0x04)
         if not name:
             continue
@@ -209,6 +257,10 @@ def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
                 offset=start,
                 user_id=decode_user_id(bytes(id_bytes)),
                 raw_id_bytes=bytes(id_bytes).hex(),
+                status_raw=status_raw,
+                permissions_raw=permissions_raw,
+                rights=decode_rights_name(permissions_raw),
+                enabled=None if status_raw is None else status_raw != 1,
                 name=name,
                 phone=parse_len_string(record, 0x05),
                 code=parse_len_string(record, 0x06),

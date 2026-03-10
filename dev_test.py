@@ -37,6 +37,8 @@ def cmd_read_users(args: argparse.Namespace) -> None:
             "\t".join(
                 [
                     "" if record.user_id is None else str(record.user_id),
+                    record.rights,
+                    "" if record.enabled is None else ("yes" if record.enabled else "no"),
                     record.name,
                     record.code,
                     record.comment,

@@ -98,6 +98,8 @@ def main() -> None:
                 [
                     "" if record.user_id is None else str(record.user_id),
                     record.raw_id_bytes,
+                    record.rights,
+                    "" if record.enabled is None else ("yes" if record.enabled else "no"),
                     record.name,
                     record.code,
                     record.phone,

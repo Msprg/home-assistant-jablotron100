@@ -83,6 +83,9 @@ Notes:
 - `export_cfg_tool.py extract-users` and `pull-live --extract-users` now have two views:
   - `--user-mode dedupe` for operator-safe summaries and CRUD verification
   - `--user-mode raw` for reverse engineering when repeated record-shaped hits matter
+- Current user-listing output now also prints:
+  - rights label inferred from export field `1` (`2875 -> coService`, `1851 -> coMaster`, `811 -> coUserNoSelfedit`)
+  - enabled/disabled state inferred from export field `0`, where the current live/FDB evidence treats `field0 == 1` as disabled/blocked
 - On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
@@ -118,6 +121,12 @@ Notes:
   - the new `dev_test.py` is a smaller smoke-test CLI for the current live RE path
   - live verification with the new CLI succeeded for a same-value edit of user `88`, an add of user `89` (`toolsmoke89`), and a delete of that same user `89`
   - interestingly, the post-delete export `/tmp/2026-03-10_user-tool-delete89_EXPORT.CFG.bin` had SHA-256 `a69d5fc13338f0bffcb9b4c3f571189ddc0c8662db606fb55b1b47022bb18a0d`, and the earlier raw ghost copy of user `88` had disappeared, leaving `users_raw 81` and `users_deduped 81`
+  - the shared parser now exposes two additional user columns:
+    - rights label from raw field `1`
+    - enabled state from raw field `0`
+  - known examples from the current live export:
+    - user `7` decodes as `coService` and enabled
+    - users `13`, `34`, and `39` decode as `coUserNoSelfedit` and disabled
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
 - `enum_rtti_scan.py` can recover Delphi RTTI enum definitions directly from the F-Link process dumps; the current deduped catalog contains 162 enum definitions.

@@ -36,11 +36,13 @@ from jablotron_re_tools import (
 
 
 def print_table(records: Iterable[UserRecord]) -> None:
-    rows = [("ID", "Name", "Code", "Phone", "Card", "Comment", "Offset")]
+    rows = [("ID", "Rights", "Enabled", "Name", "Code", "Phone", "Card", "Comment", "Offset")]
     for record in records:
         rows.append(
             (
                 "" if record.user_id is None else str(record.user_id),
+                record.rights,
+                "" if record.enabled is None else ("yes" if record.enabled else "no"),
                 record.name,
                 record.code,
                 record.phone,
@@ -55,12 +57,14 @@ def print_table(records: Iterable[UserRecord]) -> None:
 
 
 def print_tsv(records: Iterable[UserRecord]) -> None:
-    print("\t".join(["ID", "Name", "Code", "Phone", "Card", "Comment", "Offset"]))
+    print("\t".join(["ID", "Rights", "Enabled", "Name", "Code", "Phone", "Card", "Comment", "Offset"]))
     for record in records:
         print(
             "\t".join(
                 [
                     "" if record.user_id is None else str(record.user_id),
+                    record.rights,
+                    "" if record.enabled is None else ("yes" if record.enabled else "no"),
                     record.name,
                     record.code,
                     record.phone,
