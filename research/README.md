@@ -84,7 +84,7 @@ Notes:
   - `--user-mode dedupe` for operator-safe summaries and CRUD verification
   - `--user-mode raw` for reverse engineering when repeated record-shaped hits matter
 - Current user-listing output now also prints:
-  - rights label inferred from export field `1` (`0 -> coNoAccess`, `2875 -> coService`, `1851 -> coMaster`, `811 -> coUserNoSelfedit`)
+  - rights label inferred from export field `1` (`0 -> coNoAccess`, `1 -> coPanic`, `2 -> coPGOnly`, `256 -> coArmOnly`, `799 -> coUserGuard`, `811 -> coUserNoSelfedit`, `1851 -> coMaster`, `2875 -> coService`, `4639 -> coPCOGuard`)
   - the remaining live non-user value `827` is now labelled `WPPPhone` for IDs `603-610`, because those records line up with the communicator `WPPPhones` list in the unpacked `.fdb` XML rather than normal keypad users
   - enabled/disabled state inferred from export field `0`, where the current live/FDB evidence treats `field0 == 1` as disabled/blocked
 - On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
@@ -139,6 +139,7 @@ Notes:
     - users `13`, `34`, and `39` decode as `coUserNoSelfedit` and disabled
 - `.fdb` files are not XORed. They use a 29-byte `ODBO-Link database file` header, followed by a zlib stream, followed by a decompressed payload whose XML starts at offset 16.
 - `fdb_tool.py pack` can rebuild an `.fdb` container from XML or a full decompressed payload. Repacked files preserve the decompressed content, but the compressed bytes may differ from the original due to zlib recompression.
+- `research/fdb/after/VO-66_after-add-test-rights-users-80-86.fdb` is the current reference file for the extra user-role permutations added in F-Link. `fdb_tool.py extract-users` on that file confirms the live export mappings for slots `80-86`: `coNoAccess`, `coUserGuard`, `coPanic`, `coPGOnly`, `coArmOnly`, `coUserNoSelfedit`, and `coPCOGuard`.
 - `enum_rtti_scan.py` can recover Delphi RTTI enum definitions directly from the F-Link process dumps; the current deduped catalog contains 162 enum definitions.
 - `property_rtti_correlation.py` correlates `.fdb` `tkEnumeration` and `tkSet` properties with the RTTI enum catalog. Current high-confidence mappings include `Permissions -> TJA100PermissionsEnum`, `TimeLimitGroup -> TJA100UserTimeLimitEnum`, `PGAccess -> TJA100PGEnum`, `Sections/SectionMask -> TJA100SectionEnum`, and `IsNull`/`ReadOnly`/`Updated -> Boolean`.
 - `jablotron_noauth_probe.py` confirms a limited unauthenticated metadata leak over HID: model, hardware version, firmware version, registration code, installation name, and section/PG state packets are readable without sending any authorisation code.

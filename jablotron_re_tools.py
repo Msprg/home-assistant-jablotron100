@@ -210,7 +210,12 @@ def decode_rights_name(
 ) -> str:
     mapping = {
         0: "coNoAccess",
+        1: "coPanic",
+        2: "coPGOnly",
+        256: "coArmOnly",
+        799: "coUserGuard",
         2875: "coService",
+        4639: "coPCOGuard",
         1851: "coMaster",
         811: "coUserNoSelfedit",
     }
