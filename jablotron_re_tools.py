@@ -178,25 +178,98 @@ def decode_msgpack_int(data: bytes, start: int) -> tuple[Optional[int], int]:
     return None, start
 
 
-def parse_len_string(record: bytes, tag: int) -> str:
-    index = record.find(bytes([tag]))
-    if index == -1 or index + 1 >= len(record):
-        return ""
-    return decode_msgpack_string(record, index + 1)
+def decode_msgpack_value(data: bytes, start: int) -> tuple[object | None, int]:
+    if start >= len(data):
+        return None, start
+
+    marker = data[start]
+
+    if marker == 0xC0:
+        return None, start + 1
+    if marker == 0xC2:
+        return False, start + 1
+    if marker == 0xC3:
+        return True, start + 1
+    if marker <= 0x7F or marker >= 0xE0 or marker in {0xCC, 0xCD, 0xCE, 0xD0, 0xD1, 0xD2}:
+        return decode_msgpack_int(data, start)
+    if 0xA0 <= marker <= 0xBF or marker in {0xD9, 0xDA, 0xDB}:
+        return decode_msgpack_string(data, start), _skip_msgpack_string(data, start)
+    if 0x90 <= marker <= 0x9F:
+        length = marker - 0x90
+        cursor = start + 1
+        items: list[object | None] = []
+        for _ in range(length):
+            item, cursor = decode_msgpack_value(data, cursor)
+            items.append(item)
+        return items, cursor
+    if 0x80 <= marker <= 0x8F:
+        length = marker - 0x80
+        cursor = start + 1
+        mapping: dict[object, object | None] = {}
+        for _ in range(length):
+            key, cursor = decode_msgpack_value(data, cursor)
+            value, cursor = decode_msgpack_value(data, cursor)
+            mapping[normalize_msgpack_key(key)] = value
+        return mapping, cursor
+    if marker == 0xDC and start + 2 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 3], "big")
+        cursor = start + 3
+        items: list[object | None] = []
+        for _ in range(length):
+            item, cursor = decode_msgpack_value(data, cursor)
+            items.append(item)
+        return items, cursor
+    if marker == 0xDE and start + 2 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 3], "big")
+        cursor = start + 3
+        mapping: dict[object, object | None] = {}
+        for _ in range(length):
+            key, cursor = decode_msgpack_value(data, cursor)
+            value, cursor = decode_msgpack_value(data, cursor)
+            mapping[normalize_msgpack_key(key)] = value
+        return mapping, cursor
+    return None, start
 
 
-def parse_card(record: bytes) -> str:
-    start = record.find(b"\x07")
-    if start == -1:
+def _skip_msgpack_string(data: bytes, start: int) -> int:
+    marker = data[start]
+    if 0xA0 <= marker <= 0xBF:
+        return start + 1 + (marker - 0xA0)
+    if marker == 0xD9 and start + 1 < len(data):
+        return start + 2 + data[start + 1]
+    if marker == 0xDA and start + 2 < len(data):
+        return start + 3 + int.from_bytes(data[start + 1 : start + 3], "big")
+    if marker == 0xDB and start + 4 < len(data):
+        return start + 5 + int.from_bytes(data[start + 1 : start + 5], "big")
+    return start
+
+
+def normalize_msgpack_key(key: object | None) -> object:
+    if isinstance(key, list):
+        return tuple(normalize_msgpack_key(item) for item in key)
+    if isinstance(key, dict):
+        return tuple((normalize_msgpack_key(item_key), normalize_msgpack_key(item_value)) for item_key, item_value in key.items())
+    return key
+
+
+def value_as_string(value: object | None) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def value_as_int(value: object | None) -> Optional[int]:
+    return value if isinstance(value, int) else None
+
+
+def parse_card_value(value: object | None) -> str:
+    if not isinstance(value, list):
         return ""
-    end = record.find(b"\x08", start)
-    if end == -1:
-        end = len(record)
-    field = record[start:end]
-    marker_index = field.find(b"\x81\x00")
-    if marker_index == -1 or marker_index + 2 >= len(field):
-        return ""
-    return decode_msgpack_string(field, marker_index + 2)
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        card = entry.get(0)
+        if isinstance(card, str) and card:
+            return card
+    return ""
 
 
 def decode_rights_name(
@@ -258,23 +331,21 @@ def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
         if cursor >= len(record) or record[cursor] != 0x8C:
             continue
 
-        inner = cursor + 1
-        status_raw: Optional[int] = None
-        permissions_raw: Optional[int] = None
-        if inner + 1 < len(record) and record[inner] == 0:
-            status_raw, inner = decode_msgpack_int(record, inner + 1)
-        if inner + 1 < len(record) and record[inner] == 1:
-            permissions_raw, inner = decode_msgpack_int(record, inner + 1)
+        field_map_value, _next = decode_msgpack_value(record, cursor)
+        if not isinstance(field_map_value, dict):
+            continue
 
-        name = parse_len_string(record, 0x04)
+        status_raw = value_as_int(field_map_value.get(0))
+        permissions_raw = value_as_int(field_map_value.get(1))
+        name = value_as_string(field_map_value.get(4))
         if not name:
             continue
 
         user_id = decode_user_id(bytes(id_bytes))
-        phone = parse_len_string(record, 0x05)
-        code = parse_len_string(record, 0x06)
-        card = parse_card(record)
-        comment = parse_len_string(record, 0x0A)
+        phone = value_as_string(field_map_value.get(5))
+        code = value_as_string(field_map_value.get(6))
+        card = parse_card_value(field_map_value.get(7))
+        comment = value_as_string(field_map_value.get(10))
 
         users.append(
             UserRecord(
