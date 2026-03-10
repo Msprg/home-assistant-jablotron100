@@ -94,6 +94,8 @@ def cmd_pull_live(args: argparse.Namespace) -> None:
         trigger=not args.no_trigger,
         start_lba=args.start_lba,
         sectors=args.sectors,
+        cleanup_mode=args.read_cleanup_mode,
+        verbose=args.verbose,
     )
     print(f"wrote {snapshot.path}")
     print(f"sha256 {snapshot.sha256}")
@@ -136,10 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pull_parser.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
     pull_parser.add_argument("--no-trigger", action="store_true", help="Only perform the direct block read.")
+    pull_parser.add_argument(
+        "--read-cleanup-mode",
+        choices=["auto", "none", "exit-only", "login-exit"],
+        default="auto",
+        help="How to close the post-read HID session after a live trigger (default: auto).",
+    )
     pull_parser.add_argument("--start-lba", type=int, default=EXPORT_START_LBA, help="Starting LBA to read.")
     pull_parser.add_argument("--sectors", type=int, default=EXPORT_SECTORS, help="Number of sectors to read.")
     pull_parser.add_argument("--extract-users", action="store_true", help="Also print parsed users after pulling.")
     pull_parser.add_argument("--format", choices=["table", "tsv", "json"], default="tsv")
+    pull_parser.add_argument("--verbose", action="store_true", help="Print the observed HID packets for debugging.")
     pull_parser.add_argument(
         "--user-mode",
         choices=["dedupe", "raw"],

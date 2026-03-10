@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from jablotron_usb_debug import (
+    Jablotron,
     JablotronUSBClient,
     describe_packet,
     ensure_serial_port,
@@ -37,6 +38,7 @@ REPORT_520124 = "520124" + "00" * 61
 REPORT_52010C = "52010c" + "00" * 61
 REPORT_800114 = "800114" + "00" * 61
 REPORT_80010F = "80010f" + "00" * 61
+EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
 
 
 @dataclass(frozen=True)
@@ -197,12 +199,23 @@ def parse_card(record: bytes) -> str:
     return decode_msgpack_string(field, marker_index + 2)
 
 
-def decode_rights_name(permissions_raw: Optional[int]) -> str:
+def decode_rights_name(
+    permissions_raw: Optional[int],
+    *,
+    user_id: Optional[int],
+    name: str,
+    phone: str,
+    code: str,
+    card: str,
+) -> str:
     mapping = {
+        0: "coNoAccess",
         2875: "coService",
         1851: "coMaster",
         811: "coUserNoSelfedit",
     }
+    if permissions_raw == 827 and user_id is not None and 603 <= user_id <= 610 and name.startswith("User ") and not code and not card:
+        return "WPPPhone"
     if permissions_raw in mapping:
         return mapping[permissions_raw]
     if permissions_raw is None:
@@ -252,20 +265,33 @@ def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
         if not name:
             continue
 
+        user_id = decode_user_id(bytes(id_bytes))
+        phone = parse_len_string(record, 0x05)
+        code = parse_len_string(record, 0x06)
+        card = parse_card(record)
+        comment = parse_len_string(record, 0x0A)
+
         users.append(
             UserRecord(
                 offset=start,
-                user_id=decode_user_id(bytes(id_bytes)),
+                user_id=user_id,
                 raw_id_bytes=bytes(id_bytes).hex(),
                 status_raw=status_raw,
                 permissions_raw=permissions_raw,
-                rights=decode_rights_name(permissions_raw),
+                rights=decode_rights_name(
+                    permissions_raw,
+                    user_id=user_id,
+                    name=name,
+                    phone=phone,
+                    code=code,
+                    card=card,
+                ),
                 enabled=None if status_raw is None else status_raw != 1,
                 name=name,
-                phone=parse_len_string(record, 0x05),
-                code=parse_len_string(record, 0x06),
-                card=parse_card(record),
-                comment=parse_len_string(record, 0x0A),
+                phone=phone,
+                code=code,
+                card=card,
+                comment=comment,
             )
         )
 
@@ -306,6 +332,12 @@ def read_export_direct(
     subprocess.run(command, check=True)
 
 
+def extract_sections_state_mode(packet: bytes) -> int | None:
+    if Jablotron._is_sections_states_packet(packet) and packet:
+        return packet[-1]
+    return None
+
+
 def trigger_live_export(*, port: str, code: str, reset: bool) -> None:
     serial_port = ensure_serial_port(port)
     client = JablotronUSBClient(serial_port)
@@ -331,10 +363,14 @@ def pull_live_export_snapshot(
     trigger: bool = True,
     start_lba: int = EXPORT_START_LBA,
     sectors: int = EXPORT_SECTORS,
+    cleanup_mode: str = "auto",
+    verbose: bool = False,
 ) -> ExportSnapshot:
     if trigger:
         trigger_live_export(port=port, code=code, reset=reset)
     read_export_direct(device=device, output=output, start_lba=start_lba, sectors=sectors)
+    if trigger and cleanup_mode != "none":
+        cleanup_read_session(port=port, code=code, cleanup_mode=cleanup_mode, verbose=verbose)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     raw_records = extract_users(output, dedupe="raw")
     records = dedupe_user_records(raw_records)
@@ -425,6 +461,20 @@ def send_report(client: JablotronUSBClient, report_hex: str, *, verbose: bool) -
     perform_send_raw_report(client, report_hex)
     if verbose:
         print("tx", report_hex[:6])
+
+
+def send_packet(client: JablotronUSBClient, packet: bytes, *, verbose: bool) -> None:
+    client.send_packet(packet)
+    if verbose:
+        print("tx", Jablotron.format_packet_to_string(packet))
+
+
+def send_packets(client: JablotronUSBClient, packets: Iterable[bytes], *, verbose: bool) -> None:
+    packet_list = list(packets)
+    client.send_packets(packet_list)
+    if verbose:
+        for packet in packet_list:
+            print("tx", Jablotron.format_packet_to_string(packet))
 
 
 def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packets: list[bytes] | None = None) -> None:
@@ -528,6 +578,71 @@ def perform_import_accept_sequence(client: JablotronUSBClient, *, verbose: bool)
         )
 
 
+def graceful_exit_session(client: JablotronUSBClient, *, verbose: bool) -> list[bytes]:
+    """Mirror the F-Link exit sequence instead of dropping the HID session abruptly."""
+
+    send_packet(client, EXIT_DIAGNOSTICS_OFF_PACKET, verbose=verbose)
+    time.sleep(0.03)
+    send_packets(
+        client,
+        [
+            Jablotron.create_packet_ui_control(b"\x01"),
+            Jablotron.create_packet_command(b"\x0e"),
+        ],
+        verbose=verbose,
+    )
+    time.sleep(0.06)
+    send_packet(client, Jablotron.create_packet_command(b"\x02"), verbose=verbose)
+    return drain_packets(client, timeout=0.8, prefix="exit", verbose=verbose)
+
+
+def cleanup_read_session(
+    *,
+    port: str,
+    code: str,
+    cleanup_mode: str,
+    verbose: bool,
+) -> int | None:
+    """Close a read/export session after the block read without racing EXPORT.CFG refresh."""
+
+    if cleanup_mode not in {"none", "auto", "exit-only", "login-exit"}:
+        raise SystemExit(f"Unsupported read cleanup mode: {cleanup_mode}")
+    if cleanup_mode == "none":
+        return None
+
+    serial_port = ensure_serial_port(port)
+    attempts = ["exit-only", "login-exit"] if cleanup_mode == "auto" else [cleanup_mode]
+    final_mode: int | None = None
+
+    for attempt in attempts:
+        client = JablotronUSBClient(serial_port)
+        try:
+            pre_packets = drain_packets(client, timeout=0.4, prefix=f"{attempt}-pre", verbose=verbose)
+            if attempt == "login-exit":
+                perform_login(client, code, reset=False)
+                time.sleep(0.5)
+                pre_packets.extend(drain_packets(client, timeout=0.8, prefix="login", verbose=verbose))
+            exit_packets = graceful_exit_session(client, verbose=verbose)
+            post_packets = drain_packets(client, timeout=0.5, prefix=f"{attempt}-post", verbose=verbose)
+            observed_modes = [
+                mode
+                for mode in (
+                    extract_sections_state_mode(packet)
+                    for packet in [*pre_packets, *exit_packets, *post_packets]
+                )
+                if mode is not None
+            ]
+            final_mode = observed_modes[-1] if observed_modes else None
+            if verbose:
+                print("read_cleanup", {"attempt": attempt, "sections_mode": final_mode})
+            if final_mode == 0x90:
+                return final_mode
+        finally:
+            client.close()
+
+    return final_mode
+
+
 def apply_import_sector(
     *,
     sector_path: Path,
@@ -556,6 +671,7 @@ def apply_import_sector(
             unmount_device(resolved_device, mount_tool=mount_tool)
             unmounted = True
             perform_import_accept_sequence(client, verbose=verbose)
+            graceful_exit_session(client, verbose=verbose)
         finally:
             client.close()
 

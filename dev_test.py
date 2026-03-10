@@ -12,6 +12,7 @@ from jablotron_re_tools import (
     drain_packets,
     enter_setup_mode,
     ensure_serial_port,
+    graceful_exit_session,
     perform_login,
     pull_live_export_snapshot,
     resolve_flexi_cfg_device,
@@ -26,6 +27,8 @@ def cmd_read_users(args: argparse.Namespace) -> None:
         port=args.port,
         code=args.auth_code,
         reset=not args.no_reset,
+        cleanup_mode=args.read_cleanup_mode,
+        verbose=args.verbose,
     )
     print(f"wrote {snapshot.path}")
     print(f"sha256 {snapshot.sha256}")
@@ -54,6 +57,7 @@ def cmd_setup_session(args: argparse.Namespace) -> None:
         perform_login(client, args.auth_code, reset=not args.no_reset)
         pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=args.verbose)
         enter_setup_mode(client, verbose=args.verbose, initial_packets=pre_packets)
+        graceful_exit_session(client, verbose=args.verbose)
     finally:
         client.close()
     print(f"setup mode entered on {port}")
@@ -70,7 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     read_users.add_argument("--port", default="auto", help="HID port (default: auto).")
     read_users.add_argument("--auth-code", default="1812", help="Authorisation code for the smoke test.")
     read_users.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
+    read_users.add_argument(
+        "--read-cleanup-mode",
+        choices=("auto", "none", "exit-only", "login-exit"),
+        default="auto",
+        help="How to close the post-read HID session after a live trigger (default: auto).",
+    )
     read_users.add_argument("--limit", type=int, default=5, help="Number of users to print from the deduped table.")
+    read_users.add_argument("--verbose", action="store_true", help="Print observed HID packets for debugging.")
     read_users.set_defaults(func=cmd_read_users)
 
     setup_session = subparsers.add_parser("setup-session", help="Log in and confirm setup-mode entry only.")

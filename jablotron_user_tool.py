@@ -110,6 +110,8 @@ def load_snapshot(args: argparse.Namespace, *, prefix: str) -> ExportSnapshot:
         code=args.auth_code,
         reset=not args.no_reset,
         trigger=not getattr(args, "no_trigger", False),
+        cleanup_mode=getattr(args, "read_cleanup_mode", "auto"),
+        verbose=getattr(args, "verbose", False),
     )
 
 
@@ -216,6 +218,11 @@ def maybe_cleanup(path: Path, *, cleanup: bool) -> None:
             pass
 
 
+def add_verbose_argument(parser: argparse.ArgumentParser) -> None:
+    if "--verbose" not in parser._option_string_actions:
+        parser.add_argument("--verbose", action="store_true", help="Print observed HID packets for debugging.")
+
+
 def add_live_read_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--export-cfg", help="Read users from an existing EXPORT.CFG blob instead of pulling live.")
     parser.add_argument(
@@ -223,6 +230,7 @@ def add_live_read_arguments(parser: argparse.ArgumentParser) -> None:
         help="When pulling live, write the export blob here. Defaults to a timestamped file in /tmp.",
     )
     add_live_session_arguments(parser)
+    add_verbose_argument(parser)
     parser.add_argument("--no-trigger", action="store_true", help="Skip the HID export trigger before the block read.")
 
 
@@ -235,6 +243,12 @@ def add_live_session_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", default="auto", help="HID port for live pulls (default: auto).")
     parser.add_argument("--auth-code", default="1812", help="Authorisation code for live sessions.")
     parser.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
+    parser.add_argument(
+        "--read-cleanup-mode",
+        choices=("auto", "none", "exit-only", "login-exit"),
+        default="auto",
+        help="How to close the post-read HID session after a live trigger (default: auto).",
+    )
 
 
 def add_live_apply_arguments(parser: argparse.ArgumentParser) -> None:
@@ -253,7 +267,7 @@ def add_live_apply_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--verify-output", help="If set, verify against this export path. Defaults to /tmp.")
     parser.add_argument("--no-apply", action="store_true", help="Only build the sector and do not touch the panel.")
-    parser.add_argument("--verbose", action="store_true", help="Print the observed HID packets.")
+    add_verbose_argument(parser)
 
 
 def add_upsert_field_arguments(parser: argparse.ArgumentParser, *, require_name: bool) -> None:

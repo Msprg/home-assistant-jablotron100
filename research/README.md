@@ -84,7 +84,8 @@ Notes:
   - `--user-mode dedupe` for operator-safe summaries and CRUD verification
   - `--user-mode raw` for reverse engineering when repeated record-shaped hits matter
 - Current user-listing output now also prints:
-  - rights label inferred from export field `1` (`2875 -> coService`, `1851 -> coMaster`, `811 -> coUserNoSelfedit`)
+  - rights label inferred from export field `1` (`0 -> coNoAccess`, `2875 -> coService`, `1851 -> coMaster`, `811 -> coUserNoSelfedit`)
+  - the remaining live non-user value `827` is now labelled `WPPPhone` for IDs `603-610`, because those records line up with the communicator `WPPPhones` list in the unpacked `.fdb` XML rather than normal keypad users
   - enabled/disabled state inferred from export field `0`, where the current live/FDB evidence treats `field0 == 1` as disabled/blocked
 - On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
@@ -108,6 +109,15 @@ Notes:
   - `research/exports/2026-03-08_retry4_persist_EXPORT.CFG.bin`
   - both have SHA-256 `58b83a61b614db77d3535e62b3cde1a462ebdc42e3f4ebe0cc32d839055b3615`
 - `live_import_apply.py` now packages the full reusable write path: setup-mode entry, filesystem staging, unmount, import accept, optional export verification, and remount. Its current setup helper follows the matched F-Link add/delete logs more closely: wait for `80 02 1A 0A`, answer with `80 01 0F`, then send the first `52 01 02`, with a delayed `80 01 0F` nudge after `80 1A 0C ...` if `80 02 1A 0A` does not arrive on its own. It also defaults to `sudo mount` / `sudo umount` rather than `udisksctl`.
+- The shared live helper now also mirrors F-Link's exit sequence for setup-mode write sessions instead of just dropping the HID handle:
+  - `94 02 01 00`
+  - `80 01 01`
+  - `52 01 0E`
+  - `52 01 02`
+  - in live verbose output this ends with the same `sections_states ... 90` transition seen in the matched F-Link logs, which is strong evidence that setup/config mode was actually left
+- Pure read/export sessions now use a second post-read HID cleanup pass instead of trying to close the original trigger session inline. The current shared helper supports `cleanup_mode=auto|none|exit-only|login-exit`; default `auto` triggers the export, reads `EXPORT.CFG` directly, then opens a fresh HID session to close the panel state cleanly.
+- Live verification on 2026-03-10 showed that `exit-only` was not sufficient for read sessions on this panel: it ended on `sections_states ... 80`. The automatic fallback `login-exit` did reach `sections_states ... 90`, while the pulled export stayed valid at SHA-256 `f6acd86cf3ceeb2947690538d34fd35bcb212aeb39d26581c668b17ec176a8d4`.
+- The earlier limitation still applies in a narrower form: applying graceful exit inline to the original minimal export-trigger session still races the refresh and returns an all-zero `EXPORT.CFG`. The working approach is to let the trigger session disconnect first, then do the graceful teardown in a second HID session after the direct block read.
 - That packaged helper was revalidated on 2026-03-10 first with a no-op delete of already-empty slot `86`, then again after a real add of user `88` with a same-value upsert. The revalidation export after the user-88 add was `/tmp/2026-03-10_live-import-apply-user88-reverify_EXPORT.CFG.bin` with SHA-256 `b580cfb055dfd628eb9827823328d28176f6a7210a8497a108fee8ac3a198525`.
 - Capture analysis on 2026-03-10 shows that F-Link's write path is preceded by a setup-mode transition, not just plain service authentication. The key observed bridge is `80 1A 0C ...` (service rights accepted) followed by `80 01 0F`, then `52 01 02` keepalives until `80 01 12` (`Setting mode entered`). Manual live probing reproduced that transition at least once, but the timing is still sensitive and not yet packaged into a reliable helper. See `research/notes/2026-03-10_setup-mode-handshake.txt`.
 - A later scripted live run on 2026-03-10 used that setup-mode bridge to change user `86` (`TESTUSERWALDO`) from comment `USB8` to `USBA`, and a fresh post-run export confirmed the mutation. The same run also showed that direct post-apply reads of `IMPORT.CFG` sector 0 can snap back to the older `USB3` payload even when the authoritative `EXPORT.CFG` user table reflects the new value, so `IMPORT.CFG` sector 0 should not be treated as a durable record of the last successful command.
