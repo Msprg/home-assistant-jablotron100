@@ -56,6 +56,12 @@ Useful offline analysis commands:
 - `python3 jablotron_user_tool.py add 89 --name testuser89`
 - `python3 jablotron_user_tool.py edit 88 --comment 'Renamed from CLI' --use-minimal-template`
 - `python3 jablotron_user_tool.py delete 89`
+- `python3 jablotron_event_tool.py recent --auth-code 1812`
+- `python3 jablotron_event_tool.py recent --auth-code 1812 --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb'`
+- `python3 jablotron_event_tool.py recent --transport archive --format tsv --limit 30`
+- `python3 jablotron_event_tool.py pull-live /tmp/live_events_archive.bin --records-output /tmp/live_events_records.jsonl`
+- `python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb' --decode`
+- `python3 jablotron_event_tool.py dump-index /tmp/live_events_files/LOGINDEX.BIN`
 - `python3 import_cfg_tool.py decode-frame research/captures/usb/f_link/f-link-edit-user-USER91TEST.pcapng 1787 --format json`
 - `python3 import_cfg_tool.py build-user-upsert /tmp/user91-edit.bin --user-id 91 --name USER91TEST --code 9999 --card1 0000000012200717 --comment 'THIS IS A SAMPLE USER91TEST NOTE' --permissions-raw 811 --sections-mask 63 --pg-masks 65535,0,0,0`
 - `python3 import_cfg_tool.py build-user-delete /tmp/user91-delete.bin --user-id 91`
@@ -177,6 +183,28 @@ Notes:
   - `f-link-delete-user-USER91TEST.from-comm.log.4`
   - `f-link-edit-user-TESTUSERWALDO-comment-only.from-comm.log.2`
 - The matching rationale and timing evidence are recorded in `research/notes/2026-03-10_f-link-comm-log-pairings.txt`.
+- Event-memory scenario artifacts are now sorted as:
+  - capture: `research/captures/usb/f_link/f-link-read-events-memory.pcapng`
+  - raw comm logs: `research/traces/f_link_logs/f-link-read-events-memory/`
+  - process dump: `research/traces/process_memory/f-link-read-events-memory.dmp`
+  - workflow note: `research/notes/2026-03-10_events-memory-workflow.txt`
+- Current event-memory interpretation:
+  - F-Link first reads `TJA100AllEventReports` during the normal config load
+  - the later `TfrmJA100EventsMemory` view then works against `FLEXI_LOG` files `FLEXILOG.OLD`, `FLEXILOG.TXT`, and `LOGINDEX.BIN`
+  - `LOGINDEX.BIN` offsets are in the combined `OLD + TXT` address space
+  - on this panel, the indexed `FLEXI_LOG` bytes become meaningfully readable only while an authenticated setup-mode session is still active
+  - the paired F-Link comm logs show that the UI does not slurp the whole volume; it opens logical file `log` via `JA100_READ_FILE TJA100DirList`, then follows with `5D 06 02 <handle> 01 00 <blocks>` to fetch a small recent archive window
+  - the `BRev` payload records are not opaque encryption; each CRLF-delimited record is cumulative-sum encoded, then rendered through F-Link's compact mixed alphabet
+  - `jablotron_event_tool.py pull-live` now supports both `--transport archive` and `--transport direct`
+  - `jablotron_event_tool.py recent` is now the operator-facing path: it defaults to the stable archive transport and the physical `FLEXILOG.OLD+TXT` tail, saves a timestamped raw snapshot in `/tmp`, and prints the most recent decoded rows in `table`, `tsv`, or `json`
+  - `--transport direct` can work and has been validated at least once live on 2026-03-11: it opens logical file `log`, reconstructs the streamed `48`/`49`/`4A` fragments back into `5D` payload packets, and emits the recent `BRev` page directly from the panel
+  - repeated live checks the same day showed that `--transport direct` is still not reliable enough for operator use: the panel intermittently answers the `5B` open with `5C ... status=3` followed by `5C ... status=9` instead of returning a `5D 08 01 <handle>` open response
+  - the tool now explicitly sends the observed F-Link-style `5B ... mode=00 ... log` close after successful direct reads and retries failed opens with status reporting, but that was not sufficient to eliminate the intermittent `5C 03/09` open failures
+  - `--transport archive` keeps setup mode active, reads the latest indexed archive window from `FLEXILOG.OLD/TXT`, and can emit decoded per-record JSONL/TSV with `--decode-records`
+  - current live evidence on 2026-03-12 shows that `LOGINDEX.BIN` can lag far behind the physical tail on this panel; the four `/tmp/flink_match_run{1..4}` archive pulls all ended at stale logical offset `95758528` even though the physical log kept growing, so operator-facing `recent` now defaults to `--end-mode physical`
+  - `jablotron_event_tool.py extract-records --decode --display-format table` can post-process a saved archive window into readable event/info lines using the saved `window_start`
+  - the decoder now normalizes the common communicator channel alias `INET_A` to the user-facing F-Link label `Server`; when you also pass `--source-fdb`, it can enrich code `150` user-login rows from plain names like `Matúš Prančík` to F-Link-style labels like `Užívateľ 7: Matúš Prančík`
+  - the decoder is now good enough to recover timestamps, event IDs, event text, source IDs/names, sections, and common info rows from both archive and direct pulls, but a few character mappings still need refinement in longer `INFO(...)` messages
 - `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.
 - That embedded schema confirms a distinct software-only internal privilege tier above normal service access: `ACCESS_SYSTEM` (`def=15`) and `COMP_SYSTEM`.
 - The schema also exposes access gates for stored config groups via `cfg_data_t`, for example:
