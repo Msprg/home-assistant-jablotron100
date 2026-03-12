@@ -57,10 +57,15 @@ Useful offline analysis commands:
 - `python3 jablotron_user_tool.py edit 88 --comment 'Renamed from CLI' --use-minimal-template`
 - `python3 jablotron_user_tool.py delete 89`
 - `python3 jablotron_event_tool.py recent --auth-code 1812`
+- `python3 jablotron_event_tool.py recent --auth-code 1812 --events-only`
+- `python3 jablotron_event_tool.py recent --auth-code 1812 --exclude-kinds INFO`
+- `python3 jablotron_event_tool.py recent --auth-code 1812 --source-export-cfg /tmp/2026-03-11_230311_user-tool-list_EXPORT.CFG.bin`
 - `python3 jablotron_event_tool.py recent --auth-code 1812 --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb'`
 - `python3 jablotron_event_tool.py recent --transport archive --format tsv --limit 30`
 - `python3 jablotron_event_tool.py pull-live /tmp/live_events_archive.bin --records-output /tmp/live_events_records.jsonl`
+- `python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json --source-export-cfg /tmp/2026-03-11_230311_user-tool-list_EXPORT.CFG.bin --decode`
 - `python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb' --decode`
+- `python3 jablotron_event_tool.py align-export --export 'research/data ingest/events/aligning test events pull.xml' --archive /tmp/flink_match_aligning_test1.bin --metadata /tmp/flink_match_aligning_test1.json --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb' --only-diffs`
 - `python3 jablotron_event_tool.py dump-index /tmp/live_events_files/LOGINDEX.BIN`
 - `python3 import_cfg_tool.py decode-frame research/captures/usb/f_link/f-link-edit-user-USER91TEST.pcapng 1787 --format json`
 - `python3 import_cfg_tool.py build-user-upsert /tmp/user91-edit.bin --user-id 91 --name USER91TEST --code 9999 --card1 0000000012200717 --comment 'THIS IS A SAMPLE USER91TEST NOTE' --permissions-raw 811 --sections-mask 63 --pg-masks 65535,0,0,0`
@@ -203,8 +208,17 @@ Notes:
   - `--transport archive` keeps setup mode active, reads the latest indexed archive window from `FLEXILOG.OLD/TXT`, and can emit decoded per-record JSONL/TSV with `--decode-records`
   - current live evidence on 2026-03-12 shows that `LOGINDEX.BIN` can lag far behind the physical tail on this panel; the four `/tmp/flink_match_run{1..4}` archive pulls all ended at stale logical offset `95758528` even though the physical log kept growing, so operator-facing `recent` now defaults to `--end-mode physical`
   - `jablotron_event_tool.py extract-records --decode --display-format table` can post-process a saved archive window into readable event/info lines using the saved `window_start`
-  - the decoder now normalizes the common communicator channel alias `INET_A` to the user-facing F-Link label `Server`; when you also pass `--source-fdb`, it can enrich code `150` user-login rows from plain names like `Matúš Prančík` to F-Link-style labels like `Užívateľ 7: Matúš Prančík`
-  - the decoder is now good enough to recover timestamps, event IDs, event text, source IDs/names, sections, and common info rows from both archive and direct pulls, but a few character mappings still need refinement in longer `INFO(...)` messages
+  - the compact-text decoder is now understood well enough to treat the payload as a two-stage transform instead of a bag of ad hoc replacements:
+    - first do the cumulative-sum reversal
+    - then apply the mixed compact alphabet where `P..Y` act as compact digits only in standalone numeric tokens, not inside words (`Src`, `Spojenie`, etc.)
+    - then resolve ambiguous `0x41..0x5A` bytes with a token-aware case rule: tokens with explicit lowercase later should generally decode lowercase except for the first letter after title separators like `:`, `(`, `-`, `\`, or `,`; tokens without lowercase evidence stay uppercase
+  - that token-aware case rule is what cleaned up rows like `Info(0):-MF-LInk... BRAINROT-IT\\MSprg`, `SPojenie`, and `ARC1L698464` into readable `Info(...)`, `Spojenie`, `EVENT DELIVERED`, and `BRAINROT-IT\\Msprg`
+  - the later decoder passes are now less heuristic than before: event texts come from exact code maps or `.fdb` dictionaries first, and source/channel cleanup prefers exact normalized aliases plus ID-based `.fdb` resolution instead of global fuzzy matching
+  - `jablotron_event_tool.py` can now also build a decoder catalog from `EXPORT.CFG`: `--source-export-cfg` feeds the already reversed user-table parser into the event decoder so user labels come from slot IDs instead of hardcoded name aliases
+  - `jablotron_event_tool.py recent` now auto-pulls a fresh `EXPORT.CFG` after the event snapshot when no explicit `--source-export-cfg` is given, then rewrites the saved decoded JSONL/TSV using that export-derived user catalog
+  - the decoder now normalizes the common communicator channel alias `INET_A` to the user-facing F-Link label `Server`; when you also pass `--source-fdb`, it can also resolve section labels (`1: SUTEREN`), keypad/peripheral channels (`44: RFID čítačka VO`), PG on/off event texts (`PG 6: VSTUP HLAVNY Zap.`), and user/peripheral source labels such as `Užívateľ 7: Matúš Prančík` and `Periféria 31: Magnet rack`
+  - `jablotron_event_tool.py align-export` aligns a F-Link XML/CSV event export with a decoded raw pull by `event_id` and reports field-level diffs; on the March 12 aligning test bundle, the remaining mismatches were reduced mostly to expected `export-only` / `decoded-only` rows caused by the two sessions not covering the exact same window
+  - the decoder is now good enough to recover timestamps, event IDs, event text, source IDs/names, channel labels, and section labels from archive pulls with much better Slovak diacritic recovery on event rows; the remaining weaknesses are mostly long free-form `INFO(DEVICE,...)` strings where there is no `.fdb`/export structure to snap against
 - `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.
 - That embedded schema confirms a distinct software-only internal privilege tier above normal service access: `ACCESS_SYSTEM` (`def=15`) and `COMP_SYSTEM`.
 - The schema also exposes access gates for stored config groups via `cfg_data_t`, for example:

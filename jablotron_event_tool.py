@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import difflib
 import hashlib
 import json
 import re
@@ -12,7 +11,8 @@ import shutil
 import sys
 import time
 import unicodedata
-from dataclasses import asdict, dataclass
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -24,9 +24,11 @@ from jablotron_re_tools import (
     cleanup_read_session,
     drain_packets,
     enter_setup_mode,
+    extract_users,
     extract_sections_state_mode,
     graceful_exit_session,
     mount_device,
+    pull_live_export_snapshot,
     unmount_device,
 )
 from jablotron_usb_debug import ensure_serial_port, perform_login
@@ -61,7 +63,7 @@ DECODED_EVENT_RE = re.compile(
     r"(?: Sect:(?P<section>[^;]*);)?"
 )
 TIMESTAMP_PREFIX_RE = re.compile(r"(?:[0-9P-Y]{6} )?[0-9P-Y]{2}[:Z][0-9P-Y]{2}[:Z][0-9P-Y]{2} ")
-NUMERIC_REGION_RE = re.compile(r"[0-9P-YZ:]{2,}")
+NUMERIC_REGION_RE = re.compile(r"(?<![A-Za-zÀ-ž])([0-9P-YZ][0-9P-YZ:.-]{1,})(?![A-Za-zÀ-ž])")
 INFO_DELIVERED_RE = re.compile(
     r"^(?:(?P<date>\d{6}) )?(?P<time>\d{2}:\d{2}:\d{2}) "
     r"INFO\((?P<route>[^,]+),(?P<event_id>\d+)\):(?P<message>EVENT DELIVERED|EVENT NOT DELIVERED)$",
@@ -72,51 +74,27 @@ INFO_GENERIC_RE = re.compile(
     r"INFO\((?P<subject>[^)]*)\):(?P<message>.+)$",
     re.IGNORECASE,
 )
+UUID_RE = re.compile(r"(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+HOST_USER_RE = re.compile(r"([A-Za-z0-9_.-]+\\[A-Za-z0-9_.-]+)")
 EVENT_TEXT_BY_CODE = {
-    "40": "Zapnutá ochrana",
-    "41": "Vypnutá ochrana",
+    "18": "Oneskorený poplach",
+    "19": "Zrušenie poplachu",
+    "21": "Aktivacia-oneskoreny detektor",
+    "22": "Ukludnenie-oneskor. Detektor",
+    "44": "Vstup do režimu servis",
     "48": "Zmena konfigurácie",
     "119": "Neplatná autorizace",
     "123": "Kontrolný prenos na PCO 1",
     "150": "Autorizácia OK",
     "156": "Spojenie nadviazané",
     "157": "Spojenie ukončené",
+    "194": "Zablokované pri zap. ochrany",
+    "195": "Blokovanie ukončené",
+    "40": "Zapnutá ochrana",
+    "41": "Vypnutá ochrana",
 }
-EVENT_TEXT_CANDIDATES = [
-    "Autorizácia OK",
-    "Created backup configuration",
-    "Kontrolný prenos na PCO 1",
-    "Neplatná autorizace",
-    "Spojenie nadviazané",
-    "Spojenie ukončené",
-    "Vypnutá ochrana",
-    "Zapnutá ochrana",
-    "Zmena konfigurácie",
-]
-CHANNEL_CANDIDATES = [
-    "USB",
-    "Server",
-    "LAN",
-    "PSTN",
-    "SMS",
-    "INET_A",
-    "0: Ústredňa",
-    "18: termostat 1NP office",
-]
-SOURCE_NAME_CANDIDATES = [
-    "Ústredňa",
-    "Matúš Prančík",
-    "HomeAssistant",
-    "PCO 1",
-    "ARC 1",
-    "ARC1",
-    "LAN communicator",
-    "termostat 1NP office",
-    "Termostat 2NP radio",
-    "DO MB",
-    "Veronika Bachrat",
-]
 CHANNEL_ALIAS_MAP = {
+    "0": "0: Ústredňa",
     "arc 1": "ARC 1",
     "gsm": "GSM",
     "inet_a": "Server",
@@ -124,9 +102,49 @@ CHANNEL_ALIAS_MAP = {
     "sms": "SMS",
     "usb": "USB",
 }
-SPECIAL_SOURCE_LABELS = {
-    ("26", "156"): "Detector 0: Ústredňa",
-    ("26", "157"): "Detector 0: Ústredňa",
+PERIPHERAL_SOURCE_BASE = 26
+USER_SOURCE_BASE = 267
+PG_ON_MIN_CODE = 51
+PG_ON_MAX_CODE = 82
+PG_OFF_MIN_CODE = 83
+PG_OFF_MAX_CODE = 114
+
+EXACT_EVENT_TEXT_ALIASES = {
+    "autorizaciaok": "Autorizácia OK",
+    "autorizciaok": "Autorizácia OK",
+    "kontrolnyprenosnapco1": "Kontrolný prenos na PCO 1",
+    "neplatnaautorizace": "Neplatná autorizace",
+    "spojenienadviazane": "Spojenie nadviazané",
+    "spojenieukoncene": "Spojenie ukončené",
+    "vstupdorezimuservis": "Vstup do režimu servis",
+    "zapnutaochrana": "Zapnutá ochrana",
+    "vypnutaochrana": "Vypnutá ochrana",
+}
+EXACT_CHANNEL_ALIASES = {
+    "0": "0: Ústredňa",
+    "arc1": "ARC 1",
+    "gsm": "GSM",
+    "ineta": "Server",
+    "inetb": "Server",
+    "lan": "LAN",
+    "pstn": "PSTN",
+    "server": "Server",
+    "sms": "SMS",
+    "usb": "USB",
+}
+EXACT_SOURCE_ALIASES = {
+    "arc": "ARC",
+    "arc1": "ARC1",
+    "domb": "DO MB",
+    "homeassistant": "HomeAssistant",
+    "kalendar": "Kalendár",
+    "kalendr": "Kalendár",
+    "lancommunicator": "LAN communicator",
+    "pco1": "PCO 1",
+    "pcoq": "PCO 1",
+    "termostat1npoffice": "termostat 1NP office",
+    "termostat2npradio": "Termostat 2NP radio",
+    "ustredna": "Ústredňa",
 }
 
 
@@ -186,6 +204,39 @@ class DecodedEventRecord:
 @dataclass(frozen=True)
 class DecoderCatalog:
     user_labels_by_name_key: dict[str, str]
+    event_text_by_code: dict[str, str]
+    peripheral_labels_by_id: dict[int, str]
+    pg_names_by_id: dict[int, str]
+    section_names_by_display_id: dict[int, str]
+    user_labels_by_slot: dict[int, str]
+    user_name_by_slot: dict[int, str]
+
+
+@dataclass(frozen=True)
+class FLinkExportRow:
+    event_id: str | None
+    timestamp: str
+    source: str
+    section: str
+    event: str
+    channel: str
+
+
+@dataclass(frozen=True)
+class AlignedEventRow:
+    event_id: str
+    decoded_timestamp: str | None
+    decoded_code: str | None
+    decoded_event: str | None
+    decoded_source: str | None
+    decoded_channel: str | None
+    decoded_section: str | None
+    export_timestamp: str | None
+    export_event: str | None
+    export_source: str | None
+    export_channel: str | None
+    export_section: str | None
+    status: str
 
 
 def _parse_lsblk_pairs(text: str) -> list[dict[str, str]]:
@@ -326,6 +377,46 @@ def delta_decode_record(data: bytes) -> bytes:
     return bytes(decoded)
 
 
+def is_compact_upper_ascii(value: int) -> bool:
+    return 0x21 <= value <= 0x3A
+
+
+def is_ambiguous_alpha(value: int) -> bool:
+    return 0x41 <= value <= 0x5A
+
+
+def compact_base_ascii(value: int) -> int:
+    if value <= 0x3F:
+        return value + 0x20
+    return value
+
+
+def compact_is_token_separator(value: int) -> bool:
+    return compact_base_ascii(value) in {0x20, 0x28, 0x29, 0x2C, 0x3A, 0x3B, 0x3D, 0x5B, 0x5C, 0x5D, 0x7B, 0x7D}
+
+
+def compact_token_has_explicit_lowercase(delta: bytes, index: int) -> bool:
+    for probe in range(index, len(delta)):
+        candidate = delta[probe]
+        if compact_is_token_separator(candidate):
+            break
+        if 0x61 <= candidate <= 0x7A:
+            return True
+    return False
+
+
+def compact_case_mode_hint(delta: bytes, index: int) -> str | None:
+    for probe in range(index + 1, min(len(delta), index + 4)):
+        candidate = delta[probe]
+        if candidate in {0x00, 0x0C, 0x1B, 0x3B, 0x3F}:
+            return None
+        if is_compact_upper_ascii(candidate):
+            return "upper"
+        if is_ambiguous_alpha(candidate) or 0x61 <= candidate <= 0x7A:
+            return "lower"
+    return None
+
+
 def compact_decode_text(data: bytes) -> str:
     delta = delta_decode_record(data)
     if delta and (delta[0] < 0x20 or delta[0] > 0x7E):
@@ -333,14 +424,30 @@ def compact_decode_text(data: bytes) -> str:
 
     decoded = bytearray()
     remaining_utf8 = 0
-    for byte in delta:
+    case_mode: str | None = None
+    title_prefixes = {0x28, 0x3A, 0x2C, 0x2D, 0x5C, 0x7B}
+    for index, byte in enumerate(delta):
         value = byte
+        previous_value = decoded[-1] if decoded else None
         if remaining_utf8 and 0x40 <= value <= 0x7F:
             value += 0x20
         elif value <= 0x3F:
             value += 0x20
-        elif 0x41 <= value <= 0x5A:
-            value += 0x20
+            if 0x41 <= value <= 0x5A:
+                case_mode = "upper"
+            elif value in {0x20, 0x2C, 0x3B, 0x3D, 0x5D, 0x5F}:
+                case_mode = None
+        elif is_ambiguous_alpha(value):
+            has_lowercase_ahead = compact_token_has_explicit_lowercase(delta, index)
+            token_initial = previous_value is None or not chr(previous_value).isalnum()
+            if has_lowercase_ahead:
+                if not (token_initial and previous_value in title_prefixes):
+                    value += 0x20
+            else:
+                if case_mode is None:
+                    case_mode = compact_case_mode_hint(delta, index)
+                if case_mode != "upper":
+                    value += 0x20
         decoded.append(value)
 
         if 0xC2 <= value <= 0xDF:
@@ -351,6 +458,12 @@ def compact_decode_text(data: bytes) -> str:
             remaining_utf8 = 3
         elif remaining_utf8:
             remaining_utf8 -= 1
+        elif 0x41 <= value <= 0x5A:
+            case_mode = "upper"
+        elif 0x61 <= value <= 0x7A:
+            case_mode = "lower"
+        elif value in {0x20, 0x2C, 0x3B, 0x3D, 0x5D, 0x5F}:
+            case_mode = None
 
     return decoded.decode("utf-8", "replace").replace("\x00", " ").strip()
 
@@ -365,19 +478,41 @@ def simplify_match_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", ascii_only.lower())
 
 
-def choose_canonical_candidate(value: str, candidates: list[str], *, threshold: float) -> str:
-    simplified = simplify_match_text(value)
-    if not simplified:
-        return value
+def titlecase_words(value: str) -> str:
+    words: list[str] = []
+    for token in value.split():
+        if not token:
+            continue
+        if any(character.isdigit() for character in token):
+            words.append(token)
+            continue
+        if token.isupper() and len(token) <= 4:
+            words.append(token)
+            continue
+        words.append(token[:1].upper() + token[1:].lower())
+    return " ".join(words)
 
-    best_candidate = value
-    best_score = 0.0
-    for candidate in candidates:
-        score = difflib.SequenceMatcher(a=simplified, b=simplify_match_text(candidate)).ratio()
-        if score > best_score:
-            best_score = score
-            best_candidate = candidate
-    return best_candidate if best_score >= threshold else value
+
+def resolve_exact_alias(value: str, aliases: dict[str, str]) -> str | None:
+    return aliases.get(simplify_match_text(value))
+
+
+def text_quality_key(value: str) -> tuple[int, int, int, int]:
+    simplified = simplify_match_text(value)
+    return (
+        len(simplified),
+        sum(1 for character in value if character.isalpha()),
+        sum(1 for character in value if ord(character) > 127),
+        -value.count("\ufffd"),
+    )
+
+
+def choose_better_text(current: str | None, candidate: str | None) -> str | None:
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    return candidate if text_quality_key(candidate) > text_quality_key(current) else current
 
 
 def normalize_timestamp(date: str | None, time_value: str) -> str:
@@ -397,22 +532,16 @@ def normalize_decoded_text(text: str) -> str:
         .replace("INFOH", "INFO(")
         .replace("eVENTH", "EVENT(")
         .replace("iNFOH", "INFO(")
-        .replace("SrcZ", "Src:")
-        .replace("ChnlZ", "Chnl:")
-        .replace("SectZ", "Sect:")
-        .replace("INFO(ARc)", "INFO(ARC)")
-        .replace("INFO(ARc1)", "INFO(ARC1)")
-        .replace("INFO(aRC)", "INFO(ARC)")
-        .replace("INFO(aRC1)", "INFO(ARC1)")
-        .replace("INFO(s934eM)", "INFO(SYSTEM)")
-        .replace("INFO(sYSTeM)", "INFO(SYSTEM)")
-        .replace("INFO(3934EM)", "INFO(SYSTEM)")
-        .replace("INFO(DeVICE", "INFO(DEVICE")
         .replace("[", ";")
-        .replace("Homeassistant", "HomeAssistant")
     )
     text = re.sub(r"(?i)\bevent(?=\()", "EVENT", text)
     text = re.sub(r"(?i)\binfo(?=\()", "INFO", text)
+    text = re.sub(r"(?i)INFO\((ARC1?)\)", lambda item: f"INFO({item.group(1).upper()})", text)
+    text = re.sub(r"(?i)INFO\(DEVICE([LI])", "INFO(DEVICE,", text)
+    text = re.sub(r"(?i)INFO\(ARC[1Q]L(\d+)\)", r"INFO(ARC1,\1)", text)
+    text = re.sub(r"(?i)\bsrcz(?=\d|[,;:])", "Src:", text)
+    text = re.sub(r"(?i)\bchnlz(?=[A-Za-z0-9_]|[,;:])", "Chnl:", text)
+    text = re.sub(r"(?i)\bsectz(?=\d|[,;:])", "Sect:", text)
     text = re.sub(r"(?i)\bsrc(?=:)", "Src", text)
     text = re.sub(r"(?i)\bchnl(?=:)", "Chnl", text)
     text = re.sub(r"(?i)\bsect(?=:)", "Sect", text)
@@ -437,14 +566,21 @@ def prettify_value(value: str, *, mode: str) -> str:
     if not cleaned:
         return cleaned
     if mode == "channel":
+        if re.fullmatch(r"[0-9P-YZ]+", cleaned):
+            cleaned = normalize_numeric_token(cleaned)
+        exact = resolve_exact_alias(cleaned, EXACT_CHANNEL_ALIASES)
+        if exact:
+            return exact
         lowered = cleaned.lower()
         if lowered in CHANNEL_ALIAS_MAP:
             return CHANNEL_ALIAS_MAP[lowered]
-        if lowered in {"lan", "pstn"}:
-            return cleaned.upper()
-        return choose_canonical_candidate(cleaned.title(), CHANNEL_CANDIDATES, threshold=0.72)
+        return cleaned.upper() if lowered in {"lan", "pstn"} else cleaned
     if mode == "source":
-        return choose_canonical_candidate(cleaned.title(), SOURCE_NAME_CANDIDATES, threshold=0.6)
+        exact = resolve_exact_alias(cleaned, EXACT_SOURCE_ALIASES)
+        return exact if exact else titlecase_words(cleaned)
+    exact = resolve_exact_alias(cleaned, EXACT_EVENT_TEXT_ALIASES)
+    if exact:
+        return exact
     lowered = cleaned.lower()
     return lowered[:1].upper() + lowered[1:]
 
@@ -452,7 +588,29 @@ def prettify_value(value: str, *, mode: str) -> str:
 def normalize_event_text(event_code: str | None, value: str) -> str:
     if event_code and event_code in EVENT_TEXT_BY_CODE:
         return EVENT_TEXT_BY_CODE[event_code]
-    return choose_canonical_candidate(prettify_value(value, mode="event"), EVENT_TEXT_CANDIDATES, threshold=0.6)
+    return prettify_value(value, mode="event")
+
+
+def normalize_host_user(value: str) -> str:
+    cleaned = value.strip().strip("]}_;, ")
+    if "\\" not in cleaned:
+        return cleaned
+    host, user = cleaned.split("\\", 1)
+    host = re.sub(r"[^A-Za-z0-9_.-]+", "", host)
+    user = re.sub(r"[^A-Za-z0-9_.-]+", "", user)
+    if host:
+        host = host.upper()
+    if user:
+        user = user[:1].upper() + user[1:].lower()
+    return f"{host}\\{user}" if host and user else cleaned
+
+
+def extract_comm_log_name(value: str) -> str | None:
+    match = re.search(r"([A-Za-z]:\\[^;]*?comm\.log[^; ]*|/[^; ]*comm\.log[^; ]*)", value, re.IGNORECASE)
+    if not match:
+        return None
+    path = match.group(1)
+    return re.split(r"[\\/]", path)[-1]
 
 
 @lru_cache(maxsize=8)
@@ -461,8 +619,11 @@ def load_decoder_catalog(fdb_path: str) -> DecoderCatalog:
 
     container = read_fdb(Path(fdb_path))
     snapshot = choose_snapshot(find_user_snapshots(container.xml_text), "latest")
+    root = ET.fromstring(container.xml_bytes)
     labels: dict[str, str] = {}
     ambiguous: set[str] = set()
+    user_labels_by_slot: dict[int, str] = {}
+    user_name_by_slot: dict[int, str] = {}
 
     for record in iter_user_rows(snapshot, include_null=False):
         if record.slot_index != record.user_id:
@@ -474,6 +635,8 @@ def load_decoder_catalog(fdb_path: str) -> DecoderCatalog:
         if not key:
             continue
         label = f"Užívateľ {record.slot_index}: {name}"
+        user_labels_by_slot[record.slot_index] = label
+        user_name_by_slot[record.slot_index] = name
         existing = labels.get(key)
         if existing and existing != label:
             ambiguous.add(key)
@@ -482,13 +645,185 @@ def load_decoder_catalog(fdb_path: str) -> DecoderCatalog:
 
     for key in ambiguous:
         labels.pop(key, None)
-    return DecoderCatalog(user_labels_by_name_key=labels)
 
-
-def resolve_decoder_catalog(fdb_path: str | None) -> DecoderCatalog | None:
-    if not fdb_path:
+    def find_named_class(name: str) -> ET.Element | None:
+        for node in root.iter("class"):
+            if node.attrib.get("name") == name:
+                return node
         return None
-    return load_decoder_catalog(str(Path(fdb_path)))
+
+    def build_map(class_name: str, value_name: str) -> dict[int, str]:
+        node = find_named_class(class_name)
+        if node is None:
+            return {}
+        mapping: dict[int, str] = {}
+        for item in node.findall("./item"):
+            props = {
+                prop.attrib.get("name"): (prop.text or "").strip()
+                for prop in item.findall("./property")
+            }
+            if "ID" not in props or value_name not in props:
+                continue
+            try:
+                item_id = int(props["ID"])
+            except ValueError:
+                continue
+            mapping[item_id] = props[value_name]
+        return mapping
+
+    event_text_by_code = {str(key): value for key, value in build_map("TJA100AllTexts", "Text").items()}
+    peripheral_names = build_map("TJA100AllPeripherals", "Name")
+    pg_names_by_id = build_map("TJA100AllPGs", "Name")
+    section_names_raw = build_map("TJA100AllSections", "Name")
+    section_names_by_display_id = {section_id + 1: name for section_id, name in section_names_raw.items()}
+    peripheral_labels_by_id = {
+        peripheral_id: f"Periféria {peripheral_id}: {name}"
+        for peripheral_id, name in peripheral_names.items()
+    }
+
+    return DecoderCatalog(
+        user_labels_by_name_key=labels,
+        event_text_by_code=event_text_by_code,
+        peripheral_labels_by_id=peripheral_labels_by_id,
+        pg_names_by_id=pg_names_by_id,
+        section_names_by_display_id=section_names_by_display_id,
+        user_labels_by_slot=user_labels_by_slot,
+        user_name_by_slot=user_name_by_slot,
+    )
+
+
+@lru_cache(maxsize=16)
+def load_export_decoder_catalog(export_cfg_path: str) -> DecoderCatalog:
+    labels: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    user_labels_by_slot: dict[int, str] = {}
+    user_name_by_slot: dict[int, str] = {}
+
+    for record in extract_users(Path(export_cfg_path), dedupe="dedupe"):
+        if record.user_id is None or record.user_id <= 0:
+            continue
+        name = record.name.strip()
+        if not name:
+            continue
+        label = f"Užívateľ {record.user_id}: {name}"
+        user_labels_by_slot[record.user_id] = label
+        user_name_by_slot[record.user_id] = name
+        key = simplify_match_text(name)
+        if not key:
+            continue
+        existing = labels.get(key)
+        if existing and existing != label:
+            ambiguous.add(key)
+            continue
+        labels[key] = label
+
+    for key in ambiguous:
+        labels.pop(key, None)
+
+    return DecoderCatalog(
+        user_labels_by_name_key=labels,
+        event_text_by_code={},
+        peripheral_labels_by_id={},
+        pg_names_by_id={},
+        section_names_by_display_id={},
+        user_labels_by_slot=user_labels_by_slot,
+        user_name_by_slot=user_name_by_slot,
+    )
+
+
+def merge_decoder_catalogs(primary: DecoderCatalog | None, secondary: DecoderCatalog | None) -> DecoderCatalog | None:
+    if primary is None:
+        return secondary
+    if secondary is None:
+        return primary
+    return DecoderCatalog(
+        user_labels_by_name_key={**primary.user_labels_by_name_key, **secondary.user_labels_by_name_key},
+        event_text_by_code={**primary.event_text_by_code, **secondary.event_text_by_code},
+        peripheral_labels_by_id={**primary.peripheral_labels_by_id, **secondary.peripheral_labels_by_id},
+        pg_names_by_id={**primary.pg_names_by_id, **secondary.pg_names_by_id},
+        section_names_by_display_id={**primary.section_names_by_display_id, **secondary.section_names_by_display_id},
+        user_labels_by_slot={**primary.user_labels_by_slot, **secondary.user_labels_by_slot},
+        user_name_by_slot={**primary.user_name_by_slot, **secondary.user_name_by_slot},
+    )
+
+
+def resolve_decoder_catalog(
+    *,
+    fdb_path: str | None = None,
+    export_cfg_path: str | None = None,
+) -> DecoderCatalog | None:
+    catalog: DecoderCatalog | None = None
+    if fdb_path:
+        catalog = load_decoder_catalog(str(Path(fdb_path)))
+    if export_cfg_path:
+        catalog = merge_decoder_catalogs(catalog, load_export_decoder_catalog(str(Path(export_cfg_path))))
+    return catalog
+
+
+def pull_runtime_export_catalog(args: argparse.Namespace, *, prefix: str) -> tuple[DecoderCatalog | None, Path]:
+    output = Path("/tmp") / f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{prefix}_EXPORT.CFG.bin"
+    snapshot = pull_live_export_snapshot(
+        output=output,
+        device="auto",
+        port=args.port,
+        code=args.auth_code,
+        reset=not args.no_reset,
+        trigger=True,
+        cleanup_mode="auto",
+        verbose=args.verbose,
+    )
+    return load_export_decoder_catalog(str(snapshot.path)), snapshot.path
+
+
+def decode_pg_event_text(event_code: str, catalog: DecoderCatalog | None) -> str | None:
+    if not event_code.isdigit():
+        return None
+    code = int(event_code)
+    if PG_ON_MIN_CODE <= code <= PG_ON_MAX_CODE:
+        pg_number = code - 50
+        if catalog:
+            pg_name = catalog.pg_names_by_id.get(pg_number - 1)
+            if pg_name:
+                return f"PG {pg_number}: {pg_name} Zap."
+        return f"PG {pg_number}: Zap."
+    if PG_OFF_MIN_CODE <= code <= PG_OFF_MAX_CODE:
+        pg_number = code - 82
+        if catalog:
+            pg_name = catalog.pg_names_by_id.get(pg_number - 1)
+            if pg_name:
+                return f"PG {pg_number}: {pg_name} Vyp."
+        return f"PG {pg_number}: Vyp."
+    return None
+
+
+def normalize_event_label(*, event_code: str | None, event_text: str, catalog: DecoderCatalog | None) -> str:
+    if not event_code:
+        return event_text
+    pg_text = decode_pg_event_text(event_code, catalog)
+    if pg_text:
+        return pg_text
+    if catalog and event_code in catalog.event_text_by_code:
+        return catalog.event_text_by_code[event_code]
+    return event_text
+
+
+def normalize_channel_label(channel: str | None, catalog: DecoderCatalog | None) -> str | None:
+    if not channel:
+        return channel
+    lowered = channel.lower()
+    if lowered in CHANNEL_ALIAS_MAP:
+        return CHANNEL_ALIAS_MAP[lowered]
+    if not catalog:
+        return channel
+    if channel.isdigit():
+        channel_id = int(channel)
+        if channel_id == 0:
+            return "0: Ústredňa"
+        label = catalog.peripheral_labels_by_id.get(channel_id)
+        if label and ": " in label:
+            _, name = label.split(": ", 1)
+            return f"{channel_id}: {name}"
+    return channel
 
 
 def normalize_source_label(
@@ -499,27 +834,184 @@ def normalize_source_label(
     catalog: DecoderCatalog | None,
 ) -> str | None:
     if not source_name:
+        if source_id and catalog:
+            try:
+                raw_source_id = int(source_id)
+            except ValueError:
+                return source_name
+            if raw_source_id >= USER_SOURCE_BASE:
+                slot = raw_source_id - USER_SOURCE_BASE
+                return catalog.user_labels_by_slot.get(slot)
+            peripheral_id = raw_source_id - PERIPHERAL_SOURCE_BASE
+            if peripheral_id in catalog.peripheral_labels_by_id:
+                name = catalog.peripheral_labels_by_id[peripheral_id].split(": ", 1)[1]
+                return f"Periféria {peripheral_id}: {name}"
         return source_name
-    special = SPECIAL_SOURCE_LABELS.get((source_id or "", event_code or ""))
-    if special:
-        return special
-    if event_code == "150" and catalog:
+    if catalog and source_id:
+        try:
+            raw_source_id = int(source_id)
+        except ValueError:
+            raw_source_id = -1
+        if raw_source_id >= USER_SOURCE_BASE:
+            slot = raw_source_id - USER_SOURCE_BASE
+            label = catalog.user_labels_by_slot.get(slot)
+            if label:
+                return label
+        peripheral_id = raw_source_id - PERIPHERAL_SOURCE_BASE
+        if peripheral_id in catalog.peripheral_labels_by_id:
+            name = catalog.peripheral_labels_by_id[peripheral_id].split(": ", 1)[1]
+            return f"Periféria {peripheral_id}: {name}"
+    if event_code in {"150", "40", "41"} and catalog:
         label = catalog.user_labels_by_name_key.get(simplify_match_text(source_name))
         if label:
             return label
     return source_name
 
 
+def normalize_section_label(section: str | None, catalog: DecoderCatalog | None) -> str | None:
+    if not section:
+        return section
+    if not catalog:
+        return section
+    try:
+        display_id = int(section)
+    except ValueError:
+        return section
+    name = catalog.section_names_by_display_id.get(display_id)
+    if not name:
+        return section
+    return f"{display_id}: {name}"
+
+
+def source_id_to_user_slot(source_id: str | None) -> int | None:
+    if not source_id or not source_id.isdigit():
+        return None
+    raw_source_id = int(source_id)
+    if raw_source_id < USER_SOURCE_BASE:
+        return None
+    slot = raw_source_id - USER_SOURCE_BASE
+    if slot < 0 or slot > 128:
+        return None
+    return slot
+
+
+def source_id_to_peripheral_id(source_id: str | None) -> int | None:
+    if not source_id or not source_id.isdigit():
+        return None
+    raw_source_id = int(source_id)
+    peripheral_id = raw_source_id - PERIPHERAL_SOURCE_BASE
+    if raw_source_id >= USER_SOURCE_BASE or peripheral_id < 0 or peripheral_id > 128:
+        return None
+    return peripheral_id
+
+
+def rebuild_decoded_event_text(record: DecodedEventRecord) -> str:
+    if record.kind == "EVENT":
+        parts = [record.timestamp_prefix or "", f"EVENT({record.event_id}):{record.event_code},{record.event_text};"]
+        if record.source_id or record.source_name:
+            parts.append(f"Src:{record.source_id},{record.source_name};")
+        if record.channel:
+            parts.append(f"Chnl:{record.channel};")
+        if record.section:
+            parts.append(f"Sect:{record.section};")
+        return " ".join(part for part in parts if part)
+    if record.kind == "INFO":
+        label = f"INFO({record.info_subject}{',' + record.event_id if record.event_id else ''})"
+        return f"{record.timestamp_prefix} {label}:{record.info_message}"
+    return record.text
+
+
+def canonicalize_decoded_records(
+    records: list[DecodedEventRecord],
+    *,
+    catalog: DecoderCatalog | None = None,
+) -> list[DecodedEventRecord]:
+    if not records:
+        return records
+
+    best_source_name_by_id: dict[str, str] = {}
+    best_event_text_by_code: dict[str, str] = {}
+    peripheral_name_by_id: dict[int, str] = {}
+
+    for record in records:
+        if record.kind != "EVENT":
+            continue
+        if record.source_id and record.source_name:
+            best_source_name_by_id[record.source_id] = choose_better_text(
+                best_source_name_by_id.get(record.source_id),
+                record.source_name,
+            ) or record.source_name
+            peripheral_id = source_id_to_peripheral_id(record.source_id)
+            if peripheral_id is not None:
+                peripheral_name_by_id[peripheral_id] = choose_better_text(
+                    peripheral_name_by_id.get(peripheral_id),
+                    record.source_name,
+                ) or record.source_name
+        if record.event_code and record.event_text and record.event_text != "No text":
+            if record.event_code not in EVENT_TEXT_BY_CODE:
+                best_event_text_by_code[record.event_code] = choose_better_text(
+                    best_event_text_by_code.get(record.event_code),
+                    record.event_text,
+                ) or record.event_text
+
+    output: list[DecodedEventRecord] = []
+    for record in records:
+        if record.kind != "EVENT":
+            output.append(record)
+            continue
+
+        source_name = best_source_name_by_id.get(record.source_id or "", record.source_name)
+        channel = record.channel
+        section = record.section
+        event_text = record.event_text
+
+        if event_text == "No text" and record.event_code:
+            event_text = normalize_event_label(
+                event_code=record.event_code,
+                event_text=event_text,
+                catalog=catalog,
+            )
+        elif record.event_code and record.event_code in best_event_text_by_code:
+            event_text = best_event_text_by_code[record.event_code]
+
+        if not catalog:
+            user_slot = source_id_to_user_slot(record.source_id)
+            peripheral_id = source_id_to_peripheral_id(record.source_id)
+            if user_slot is not None and source_name and not source_name.startswith("Užívateľ "):
+                source_name = f"Užívateľ {user_slot}: {source_name}"
+            elif peripheral_id is not None and source_name and not source_name.startswith("Periféria "):
+                source_name = f"Periféria {peripheral_id}: {source_name}"
+
+            if channel and channel.isdigit():
+                channel_id = int(channel)
+                if channel_id == 0:
+                    channel = "0: Ústredňa"
+                elif channel_id in peripheral_name_by_id:
+                    channel = f"{channel_id}: {peripheral_name_by_id[channel_id]}"
+
+        updated = replace(
+            record,
+            event_text=event_text,
+            source_name=source_name,
+            channel=channel,
+            section=section,
+        )
+        output.append(replace(updated, text=rebuild_decoded_event_text(updated)))
+    return output
+
+
 def build_info_record(*, date: str | None, time_value: str, subject: str, message: str, event_id: str | None) -> DecodedEventRecord:
     timestamp_prefix = normalize_timestamp(date, time_value)
     normalized_subject = normalize_decoded_text(subject).upper()
     normalized_subject = normalized_subject.replace("ARCQ", "ARC1").replace("ARCZ", "ARC:")
+    normalized_subject = re.sub(r"^DEVICE[LI](\d+)$", r"DEVICE,\1", normalized_subject)
     normalized_message = normalize_decoded_text(message)
     if normalized_subject in {"ARC", "ARC1"} and "JABLO_IP" in normalized_message.upper():
         normalized_message = re.sub(r"(?i)\bARC[1Q]L(?=BK)", "ARC1,", normalized_message)
         normalized_message = re.sub(r"(?i)\bBKLA\b", "BK,A", normalized_message)
         normalized_message = re.sub(r"(?i)\bALLAN\b", "A,LAN", normalized_message)
         normalized_message = re.sub(r"(?i)\bLANL(?=JABLO_IP)", "LAN,", normalized_message)
+        normalized_message = re.sub(r"(?i)\bJABLO_IP([LX]?V)(?=,|$)", r"JABLO_IP,\1", normalized_message)
         parts = [item.strip() for item in normalized_message.split(",") if item.strip()]
         normalized_parts: list[str] = []
         for part in parts:
@@ -536,13 +1028,74 @@ def build_info_record(*, date: str | None, time_value: str, subject: str, messag
                 normalized_parts.append("GSM")
             elif lowered == "jablo_ip":
                 normalized_parts.append("JABLO_IP")
+            elif lowered in {"vldone", "xvdone", "lvdone"}:
+                normalized_parts.extend(["v", "DONE"])
+            elif lowered in {"lv", "xv", "86"}:
+                normalized_parts.append("v")
             elif lowered in {"done", "donee"}:
                 normalized_parts.append("DONE")
-            elif lowered in {"v", "xv"}:
+            elif lowered in {"v", "xv", "86"}:
                 normalized_parts.append("v")
             else:
                 normalized_parts.append(part)
         normalized_message = ",".join(normalized_parts)
+    elif normalized_subject.startswith("DEVICE"):
+        if "connected_" in normalized_message.lower() or "connected" in normalized_message.lower():
+            normalized_message = "Device connected on YTUN"
+        elif "disconnected" in normalized_message.lower():
+            normalized_message = "Device disconnected from YTUN"
+        elif "started at" in normalized_message.lower():
+            cleaned_for_parse = (
+                normalized_message.replace("55ID", "UUID")
+                .replace("55iD", "UUID")
+                .replace("UuID", "UUID")
+                .replace("uUID", "UUID")
+                .replace("UUID=;", "UUID=")
+                .replace("UUID];", "UUID=")
+                .replace("UUID=:", "UUID=")
+                .replace("F-link", "F-Link")
+                .replace("R.9.2.1509", "2.9.2.1509")
+                .replace("2N9.2.1509", "2.9.2.1509")
+                .replace("2.9.R.1509", "2.9.2.1509")
+                .replace("2.9.9.1509", "2.9.2.1509")
+            )
+            version_match = re.search(r"(?i)f-?link[^0-9]*([0-9][0-9A-Z.]*\.[0-9]+)", cleaned_for_parse)
+            timestamp_match = re.search(
+                r"(\d{1,2})[.\s]+(\d{1,2})[.\s]+(20\d{2})\s+(\d{2}:\d{2}:\d{2})",
+                cleaned_for_parse,
+            )
+            uuid_match = UUID_RE.search(cleaned_for_parse)
+            host_match = HOST_USER_RE.search(cleaned_for_parse)
+            parts = ["F-Link"]
+            if version_match:
+                version = version_match.group(1).replace("N", "9").replace("R", "9")
+                parts[0] = f"F-Link {version}"
+            if timestamp_match:
+                day, month, year, time_part = timestamp_match.groups()
+                parts.append(f"started at {int(day)}. {int(month)}. {year} {time_part}")
+            if uuid_match:
+                parts.append(f"UUID={uuid_match.group(1).lower()}")
+            if host_match:
+                parts.append(normalize_host_user(host_match.group(1)))
+            normalized_message = "; ".join(parts)
+        elif "comm.log" in normalized_message.lower():
+            cleaned_for_parse = (
+                normalized_message.replace("UuID", "UUID")
+                .replace("uUID", "UUID")
+                .replace("55ID", "UUID")
+                .replace("55iD", "UUID")
+            )
+            uuid_match = UUID_RE.search(cleaned_for_parse)
+            file_name = extract_comm_log_name(cleaned_for_parse)
+            host_match = HOST_USER_RE.search(cleaned_for_parse)
+            parts = ["comm.log saved"]
+            if file_name:
+                parts.append(file_name)
+            if uuid_match:
+                parts.append(f"UUID={uuid_match.group(1).lower()}")
+            if host_match:
+                parts.append(normalize_host_user(host_match.group(1)))
+            normalized_message = "; ".join(parts)
     label = f"INFO({normalized_subject}{',' + event_id if event_id else ''})"
     return DecodedEventRecord(
         text=f"{timestamp_prefix} {label}:{normalized_message}",
@@ -755,6 +1308,7 @@ def decode_event_record(data: bytes, *, catalog: DecoderCatalog | None = None) -
     event_id = normalize_numeric_token(match.group("id"))
     event_code = normalize_numeric_token(match.group("code"))
     event_text = normalize_event_text(event_code, match.group("text"))
+    event_text = normalize_event_label(event_code=event_code, event_text=event_text, catalog=catalog)
     source_id = normalize_numeric_token(match.group("src_id")) if match.group("src_id") else None
     source_name = prettify_value(match.group("src_name"), mode="source") if match.group("src_name") else None
     channel = prettify_value(match.group("channel"), mode="channel") if match.group("channel") else None
@@ -765,6 +1319,8 @@ def decode_event_record(data: bytes, *, catalog: DecoderCatalog | None = None) -
         event_code=event_code,
         catalog=catalog,
     )
+    channel = normalize_channel_label(channel, catalog)
+    section = normalize_section_label(section, catalog)
 
     parts = [timestamp_prefix, f"{kind}({event_id}):{event_code},{event_text};"]
     if source_id or source_name:
@@ -826,7 +1382,163 @@ def build_decoded_records(
         raw = archive[start : start + record.length]
         decoded = decode_event_record(raw, catalog=catalog)
         decoded_records.append(decoded)
-    return decoded_records
+    return canonicalize_decoded_records(decoded_records, catalog=catalog)
+
+
+def load_decoded_records_from_jsonl(path: Path) -> list[DecodedEventRecord]:
+    records: list[DecodedEventRecord] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            payload = json.loads(line)
+            parsed = payload.get("parsed")
+            if not parsed:
+                continue
+            records.append(DecodedEventRecord(**parsed))
+    return records
+
+
+def parse_flink_export_xml(path: Path) -> list[FLinkExportRow]:
+    root = ET.fromstring(path.read_text(encoding="utf-8", errors="replace"))
+    rows: list[FLinkExportRow] = []
+    for row in root.findall(".//row"):
+        values: dict[str, str] = {}
+        for child in row:
+            key = child.tag.strip()
+            values[key] = (child.text or "").strip()
+        rows.append(
+            FLinkExportRow(
+                event_id=values.get("id") or None,
+                timestamp=values.get("Čas", ""),
+                source=values.get("zdroj", ""),
+                section=values.get("sekcia", ""),
+                event=values.get("udalosť", ""),
+                channel=values.get("kanál", ""),
+            )
+        )
+    return rows
+
+
+def parse_flink_export_csv(path: Path) -> list[FLinkExportRow]:
+    import csv
+
+    rows: list[FLinkExportRow] = []
+    with path.open(encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=";")
+        for row in reader:
+            rows.append(
+                FLinkExportRow(
+                    event_id=(row.get("ID") or "").strip() or None,
+                    timestamp=(row.get("Time") or row.get("Čas") or "").strip(),
+                    source=(row.get("Source") or row.get("zdroj") or "").strip(),
+                    section=(row.get("Section") or row.get("sekcia") or "").strip(),
+                    event=(row.get("Event") or row.get("udalosť") or "").strip(),
+                    channel=(row.get("Channel") or row.get("kanál") or "").strip(),
+                )
+            )
+    return rows
+
+
+def parse_flink_export(path: Path) -> list[FLinkExportRow]:
+    suffix = path.suffix.lower()
+    if suffix == ".xml":
+        return parse_flink_export_xml(path)
+    if suffix == ".csv":
+        return parse_flink_export_csv(path)
+    raise SystemExit(f"Unsupported F-Link export format: {path.suffix}. Use XML or CSV.")
+
+
+def align_decoded_with_export(
+    *,
+    decoded_records: list[DecodedEventRecord],
+    export_rows: list[FLinkExportRow],
+) -> list[AlignedEventRow]:
+    decoded_by_id = {
+        record.event_id: record
+        for record in decoded_records
+        if record.kind == "EVENT" and record.event_id
+    }
+    export_by_id = {row.event_id: row for row in export_rows if row.event_id}
+    aligned: list[AlignedEventRow] = []
+
+    for event_id in sorted(set(decoded_by_id) | set(export_by_id), key=int):
+        decoded = decoded_by_id.get(event_id)
+        export = export_by_id.get(event_id)
+        if decoded and export:
+            mismatches: list[str] = []
+            if (decoded.event_text or "") != export.event:
+                mismatches.append("event")
+            if (decoded.source_name or "") != export.source:
+                mismatches.append("source")
+            if (decoded.channel or "") != export.channel:
+                mismatches.append("channel")
+            if (decoded.section or "") != export.section:
+                mismatches.append("section")
+            status = "match" if not mismatches else "diff:" + ",".join(mismatches)
+        elif decoded:
+            status = "decoded-only"
+        else:
+            status = "export-only"
+        aligned.append(
+            AlignedEventRow(
+                event_id=event_id,
+                decoded_timestamp=decoded.timestamp_prefix if decoded else None,
+                decoded_code=decoded.event_code if decoded else None,
+                decoded_event=decoded.event_text if decoded else None,
+                decoded_source=decoded.source_name if decoded else None,
+                decoded_channel=decoded.channel if decoded else None,
+                decoded_section=decoded.section if decoded else None,
+                export_timestamp=export.timestamp if export else None,
+                export_event=export.event if export else None,
+                export_source=export.source if export else None,
+                export_channel=export.channel if export else None,
+                export_section=export.section if export else None,
+                status=status,
+            )
+        )
+    return aligned
+
+
+def emit_aligned_rows(rows: list[AlignedEventRow], fmt: str) -> None:
+    if fmt == "json":
+        print(json.dumps([asdict(row) for row in rows], indent=2, ensure_ascii=False))
+        return
+    header = (
+        "EventID",
+        "Status",
+        "Code",
+        "DecodedEvent",
+        "ExportEvent",
+        "DecodedSource",
+        "ExportSource",
+        "DecodedChannel",
+        "ExportChannel",
+        "DecodedSection",
+        "ExportSection",
+    )
+    rendered = [header]
+    for row in rows:
+        rendered.append(
+            (
+                row.event_id,
+                row.status,
+                row.decoded_code or "",
+                row.decoded_event or "",
+                row.export_event or "",
+                row.decoded_source or "",
+                row.export_source or "",
+                row.decoded_channel or "",
+                row.export_channel or "",
+                row.decoded_section or "",
+                row.export_section or "",
+            )
+        )
+    if fmt == "tsv":
+        for row in rendered:
+            print("\t".join(row))
+        return
+    widths = [max(len(row[index]) for row in rendered) for index in range(len(header))]
+    for row in rendered:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
 
 
 def print_decoded_table(records: list[DecodedEventRecord]) -> None:
@@ -979,6 +1691,8 @@ def select_display_records(
     *,
     limit: int,
     include_raw: bool,
+    include_kinds: set[str] | None = None,
+    exclude_kinds: set[str] | None = None,
 ) -> list[DecodedEventRecord]:
     if include_raw:
         selected = [record for record in records if record.text]
@@ -986,9 +1700,24 @@ def select_display_records(
         selected = [record for record in records if record.kind]
         if not selected:
             selected = [record for record in records if record.text]
+    if include_kinds:
+        selected = [record for record in selected if (record.kind or "RAW") in include_kinds]
+    if exclude_kinds:
+        selected = [record for record in selected if (record.kind or "RAW") not in exclude_kinds]
     if limit <= 0:
         return selected
     return selected[-limit:]
+
+
+def parse_kind_filter(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    allowed = {"EVENT", "INFO", "RAW"}
+    parsed = {item.strip().upper() for item in value.split(",") if item.strip()}
+    invalid = sorted(parsed - allowed)
+    if invalid:
+        raise SystemExit(f"Unsupported kind filter(s): {', '.join(invalid)}. Use EVENT, INFO, RAW.")
+    return parsed
 
 
 def copy_archive_files(*, mountpoint: Path, output_dir: Path) -> None:
@@ -1007,6 +1736,8 @@ def write_record_dump(
     catalog: DecoderCatalog | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    decoded_records = build_decoded_records(records, archive, catalog=catalog) if decode else []
+    decoded_by_index = {record.index: decoded for record, decoded in zip(records, decoded_records)}
 
     if fmt == "jsonl":
         with path.open("w", encoding="utf-8") as handle:
@@ -1022,7 +1753,7 @@ def write_record_dump(
                     "printable_preview": record.printable_preview,
                 }
                 if decode:
-                    decoded = decode_event_record(raw, catalog=catalog)
+                    decoded = decoded_by_index[record.index]
                     payload["decoded_text"] = decoded.text
                     payload["parsed"] = asdict(decoded)
                 handle.write(json.dumps(payload) + "\n")
@@ -1059,8 +1790,7 @@ def write_record_dump(
                     record.printable_preview,
                 ]
                 if decode:
-                    raw = archive[record.offset - records[0].offset : record.offset - records[0].offset + record.length]
-                    decoded = decode_event_record(raw, catalog=catalog)
+                    decoded = decoded_by_index[record.index]
                     row.extend(
                         [
                             decoded.text,
@@ -1093,6 +1823,8 @@ def print_record_dump(
     catalog: DecoderCatalog | None = None,
 ) -> None:
     print(f"records {len(records)}", file=handle)
+    decoded_records = build_decoded_records(records, archive, catalog=catalog) if decode else []
+    decoded_by_index = {record.index: decoded for record, decoded in zip(records, decoded_records)}
     for record in records[:limit]:
         preview = f" preview={record.printable_preview}" if record.printable_preview else ""
         line = (
@@ -1100,8 +1832,7 @@ def print_record_dump(
             f"\thex_prefix={record.hex_prefix}{preview}"
         )
         if decode:
-            raw = archive[record.offset - records[0].offset : record.offset - records[0].offset + record.length]
-            decoded = decode_event_record(raw, catalog=catalog)
+            decoded = decoded_by_index[record.index]
             if decoded.text:
                 line += f"\tdecoded={decoded.text}"
         print(line, file=handle)
@@ -1118,7 +1849,10 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
     )
     log_device = resolve_flexi_log_device(args.log_device)
     mountpoint = Path(args.mountpoint)
-    catalog = resolve_decoder_catalog(getattr(args, "source_fdb", None))
+    catalog = resolve_decoder_catalog(
+        fdb_path=getattr(args, "source_fdb", None),
+        export_cfg_path=getattr(args, "source_export_cfg", None),
+    )
 
     client = JablotronUSBClient(ensure_serial_port(args.port))
     mounted = False
@@ -1258,14 +1992,42 @@ def cmd_recent(args: argparse.Namespace) -> None:
     snapshot = pull_live_archive(effective_args)
     archive = snapshot.output.read_bytes()
     records = split_crlf_records(archive, base_offset=snapshot.window_start)
-    decoded_records = build_decoded_records(records, archive, catalog=resolve_decoder_catalog(args.source_fdb))
+    catalog = resolve_decoder_catalog(
+        fdb_path=getattr(args, "source_fdb", None),
+        export_cfg_path=getattr(args, "source_export_cfg", None),
+    )
+    export_catalog_path: Path | None = None
+    if not getattr(args, "source_export_cfg", None):
+        try:
+            export_catalog, export_catalog_path = pull_runtime_export_catalog(args, prefix="event_catalog")
+        except SystemExit:
+            export_catalog = None
+        catalog = merge_decoder_catalogs(catalog, export_catalog)
+    decoded_records = build_decoded_records(records, archive, catalog=catalog)
+    if records_output:
+        write_record_dump(
+            records_output,
+            records=records,
+            archive=archive,
+            fmt=args.records_format,
+            decode=True,
+            catalog=catalog,
+        )
+    include_kinds = parse_kind_filter(args.kinds)
+    exclude_kinds = parse_kind_filter(args.exclude_kinds)
+    if args.events_only:
+        include_kinds = {"EVENT"}
     display_records = select_display_records(
         decoded_records,
         limit=args.limit,
         include_raw=args.include_raw,
+        include_kinds=include_kinds or None,
+        exclude_kinds=exclude_kinds or None,
     )
 
     print_snapshot_summary(snapshot)
+    if export_catalog_path is not None:
+        print(f"catalog_export {export_catalog_path}")
     if records_output:
         print(f"records {records_output}")
     print(f"displayed {len(display_records)}")
@@ -1287,7 +2049,10 @@ def cmd_extract_records(args: argparse.Namespace) -> None:
         metadata = json.loads(Path(args.metadata).read_text(encoding="utf-8"))
         base_offset = int(metadata.get("window_start", base_offset))
     records = split_crlf_records(data, base_offset=base_offset)
-    catalog = resolve_decoder_catalog(args.source_fdb)
+    catalog = resolve_decoder_catalog(
+        fdb_path=getattr(args, "source_fdb", None),
+        export_cfg_path=getattr(args, "source_export_cfg", None),
+    )
 
     if args.output:
         write_record_dump(
@@ -1302,11 +2067,17 @@ def cmd_extract_records(args: argparse.Namespace) -> None:
     else:
         if args.decode:
             decoded_records = build_decoded_records(records, data, catalog=catalog)
+            include_kinds = parse_kind_filter(args.kinds)
+            exclude_kinds = parse_kind_filter(args.exclude_kinds)
+            if args.events_only:
+                include_kinds = {"EVENT"}
             emit_decoded_records(
                 select_display_records(
                     decoded_records,
                     limit=args.limit,
                     include_raw=args.include_raw,
+                    include_kinds=include_kinds or None,
+                    exclude_kinds=exclude_kinds or None,
                 ),
                 args.display_format,
             )
@@ -1319,6 +2090,39 @@ def cmd_extract_records(args: argparse.Namespace) -> None:
             decode=args.decode,
             catalog=catalog,
         )
+
+
+def cmd_align_export(args: argparse.Namespace) -> None:
+    catalog = resolve_decoder_catalog(
+        fdb_path=getattr(args, "source_fdb", None),
+        export_cfg_path=getattr(args, "source_export_cfg", None),
+    )
+    if args.decoded_jsonl:
+        decoded_records = load_decoded_records_from_jsonl(Path(args.decoded_jsonl))
+    else:
+        archive_path = Path(args.archive)
+        data = archive_path.read_bytes()
+        base_offset = args.base_offset
+        if args.metadata:
+            metadata = json.loads(Path(args.metadata).read_text(encoding="utf-8"))
+            base_offset = int(metadata.get("window_start", base_offset))
+        records = split_crlf_records(data, base_offset=base_offset)
+        decoded_records = build_decoded_records(records, data, catalog=catalog)
+
+    export_rows = parse_flink_export(Path(args.export))
+    aligned_rows = align_decoded_with_export(decoded_records=decoded_records, export_rows=export_rows)
+    if args.only_diffs:
+        aligned_rows = [row for row in aligned_rows if row.status != "match"]
+    if args.limit > 0:
+        aligned_rows = aligned_rows[-args.limit :]
+    if args.output:
+        Path(args.output).write_text(
+            json.dumps([asdict(row) for row in aligned_rows], indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"output {args.output}")
+        return
+    emit_aligned_rows(aligned_rows, args.format)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1340,6 +2144,10 @@ def build_parser() -> argparse.ArgumentParser:
     pull_live.add_argument(
         "--source-fdb",
         help="Optional F-Link .fdb snapshot used to enrich decoded source labels for user events.",
+    )
+    pull_live.add_argument(
+        "--source-export-cfg",
+        help="Optional EXPORT.CFG blob used to enrich decoded user labels without relying on .fdb name tables.",
     )
     pull_live.add_argument(
         "--decode-records",
@@ -1401,6 +2209,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional F-Link .fdb snapshot used to enrich decoded source labels for user events.",
     )
     recent.add_argument(
+        "--source-export-cfg",
+        help="Optional EXPORT.CFG blob used to enrich decoded user labels. If omitted, recent auto-pulls one after the event snapshot.",
+    )
+    recent.add_argument(
         "--records-format",
         choices=("jsonl", "tsv"),
         default="jsonl",
@@ -1411,6 +2223,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("table", "tsv", "json"),
         default="table",
         help="Console output format for decoded events.",
+    )
+    recent.add_argument(
+        "--kinds",
+        help="Comma-separated decoded row kinds to include in console output: EVENT, INFO, RAW.",
+    )
+    recent.add_argument(
+        "--exclude-kinds",
+        help="Comma-separated decoded row kinds to suppress from console output: EVENT, INFO, RAW.",
+    )
+    recent.add_argument(
+        "--events-only",
+        action="store_true",
+        help="Shortcut for showing only EVENT rows in console output.",
     )
     recent.add_argument("--limit", type=int, default=150, help="How many most-recent decoded rows to display.")
     recent.add_argument("--include-raw", action="store_true", help="Include undecoded rows in console output.")
@@ -1467,6 +2292,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-fdb",
         help="Optional F-Link .fdb snapshot used to enrich decoded source labels for user events.",
     )
+    extract_records.add_argument(
+        "--source-export-cfg",
+        help="Optional EXPORT.CFG blob used to enrich decoded user labels without relying on .fdb name tables.",
+    )
     extract_records.add_argument("--base-offset", type=int, default=0, help="Logical archive offset of archive byte 0.")
     extract_records.add_argument("--output", help="Optional JSONL/TSV output file.")
     extract_records.add_argument("--format", choices=("jsonl", "tsv"), default="jsonl", help="Output format.")
@@ -1481,9 +2310,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Decode compact event-memory records into readable lines when possible.",
     )
+    extract_records.add_argument(
+        "--kinds",
+        help="Comma-separated decoded row kinds to include in console output: EVENT, INFO, RAW.",
+    )
+    extract_records.add_argument(
+        "--exclude-kinds",
+        help="Comma-separated decoded row kinds to suppress from console output: EVENT, INFO, RAW.",
+    )
+    extract_records.add_argument(
+        "--events-only",
+        action="store_true",
+        help="Shortcut for showing only EVENT rows in console output.",
+    )
     extract_records.add_argument("--include-raw", action="store_true", help="Include undecoded rows in console output.")
     extract_records.add_argument("--limit", type=int, default=40, help="Console preview limit when --output is not used.")
     extract_records.set_defaults(func=cmd_extract_records)
+
+    align_export = subparsers.add_parser(
+        "align-export",
+        help="Align a F-Link XML/CSV event export with decoded raw records by event ID.",
+    )
+    align_export.add_argument("--export", required=True, help="Path to a F-Link XML or CSV event export.")
+    align_export.add_argument("--archive", help="Raw archive window from pull-live/recent.")
+    align_export.add_argument("--metadata", help="Optional metadata JSON for --archive.")
+    align_export.add_argument("--base-offset", type=int, default=0, help="Logical archive offset of archive byte 0.")
+    align_export.add_argument("--decoded-jsonl", help="Optional predecoded JSONL produced by --records-output.")
+    align_export.add_argument(
+        "--source-fdb",
+        help="Optional F-Link .fdb snapshot used to enrich decoded source labels before alignment.",
+    )
+    align_export.add_argument(
+        "--source-export-cfg",
+        help="Optional EXPORT.CFG blob used to enrich decoded user labels before alignment.",
+    )
+    align_export.add_argument("--only-diffs", action="store_true", help="Show only rows whose fields do not match.")
+    align_export.add_argument("--limit", type=int, default=100, help="Limit aligned rows shown or written.")
+    align_export.add_argument("--output", help="Optional JSON output file.")
+    align_export.add_argument("--format", choices=("table", "tsv", "json"), default="table")
+    align_export.set_defaults(func=cmd_align_export)
 
     return parser
 
