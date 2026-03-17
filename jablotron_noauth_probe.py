@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from export_cfg_tool import extract_users, read_export_direct
+from jablotron_re_tools import add_flexi_cfg_device_argument, resolve_flexi_cfg_device
 from jablotron_usb_debug import (
     JablotronUSBClient,
     Jablotron,
@@ -72,12 +73,14 @@ def probe_noauth(*, port: str, response_timeout: float, minimal: bool) -> dict:
 
 
 def inspect_export(*, device: str, output: Path, start_lba: int, sectors: int) -> dict:
-    read_export_direct(device=device, output=output, start_lba=start_lba, sectors=sectors)
+    resolved_device = resolve_flexi_cfg_device(device)
+    read_export_direct(device=resolved_device, output=output, start_lba=start_lba, sectors=sectors)
     blob = output.read_bytes()
     sha256 = hashlib.sha256(blob).hexdigest()
     all_zero = not any(blob)
     payload = {
         "path": str(output),
+        "device": resolved_device,
         "sha256": sha256,
         "all_zero": all_zero,
         "size": len(blob),
@@ -162,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="After the HID probe, read EXPORT.CFG directly from the block device and report whether it is populated.",
     )
-    probe_parser.add_argument("--device", default="/dev/sdb1", help="Block device for FLEXI_CFG (default: /dev/sdb1).")
+    add_flexi_cfg_device_argument(probe_parser)
     probe_parser.add_argument(
         "--export-output",
         default="research/exports/noauth_probe_EXPORT.CFG.bin",

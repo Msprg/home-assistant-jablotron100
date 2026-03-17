@@ -162,7 +162,8 @@ Notes:
 - Preferred live path: `export_cfg_tool.py pull-live` triggers the service-session replay and then reads sectors directly from the auto-resolved `FLEXI_CFG` block device with `dd iflag=direct`, which avoids the stale mounted-file cache problem.
 - The shared export refresh no longer replays a stale hard-coded F-Link info-log blob and then sleeps a fixed four seconds. It now synthesizes fresh info-log packets per session and waits for the real `52 07 83 01 25 ...` reload-complete marker before reading `EXPORT.CFG`.
 - `jablotron_re_tools.py` now holds the shared live-panel plumbing used by `export_cfg_tool.py`, `live_import_apply.py`, `jablotron_user_tool.py`, and the smaller smoke-test `dev_test.py`. This keeps device discovery, setup-mode entry, staging, accept, and verification in one place while preserving the lower-level scripts for reversing.
-- FLEXI_CFG block-device resolution now defaults to `auto`, which prefers `/dev/disk/by-label/FLEXI_CFG` and falls back to `lsblk`. On this workstation that currently resolves to `/dev/sdc1`.
+- FLEXI_CFG block-device resolution now defaults to `auto`, which prefers `/dev/disk/by-label/FLEXI_CFG` and falls back to `lsblk`. On this workstation that currently resolves to `/dev/sdb1`.
+- FLEXI_LOG block-device resolution now also defaults to `auto`, which prefers `/dev/disk/by-label/FLEXI_LOG` and falls back to `lsblk`. Event/log tooling now uses the same shared resolver path as the config tooling.
 - `export_cfg_tool.py extract-users` and `pull-live --extract-users` now have two views:
   - `--user-mode dedupe` for operator-safe summaries and CRUD verification
   - `--user-mode raw` for reverse engineering when repeated record-shaped hits matter

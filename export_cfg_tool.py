@@ -9,19 +9,28 @@ import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
 
 from jablotron_re_tools import (
     EXPORT_SECTORS,
     EXPORT_START_LBA,
     ExportCatalogSnapshot,
     UserRecord,
+    add_flexi_cfg_device_argument,
+    compress_numeric_ids,
     decode_msgpack_value,
     default_export_output,
+    emit_user_records,
     extract_export_catalog,
     extract_users,
+    format_allow_code_change,
+    format_cards,
+    format_log_user_actions,
+    format_pg_access,
+    format_section_access,
+    format_time_limit_binding,
     invert_blob,
     iter_printable_strings,
+    print_export_snapshot_summary,
     pull_live_export_snapshot,
     read_export_direct,
     resolve_flexi_cfg_device,
@@ -45,210 +54,8 @@ KNOWN_COLLECTIONS = {
     0x18: "unknown",
 }
 
-
-def _compress_ids(values: Iterable[int]) -> str:
-    numbers = sorted(set(values))
-    if not numbers:
-        return ""
-    ranges: list[str] = []
-    start = numbers[0]
-    end = numbers[0]
-    for value in numbers[1:]:
-        if value == end + 1:
-            end = value
-            continue
-        ranges.append(f"{start}-{end}" if start != end else str(start))
-        start = end = value
-    ranges.append(f"{start}-{end}" if start != end else str(start))
-    return ",".join(ranges)
-
-
-def _format_section_access(record: UserRecord, snapshot: ExportCatalogSnapshot) -> str:
-    if not record.section_ids:
-        return "-"
-    parts = []
-    for section_id in record.section_ids:
-        section = snapshot.sections_by_id.get(section_id)
-        parts.append(f"{section_id}:{section.name}" if section is not None else str(section_id))
-    return ",".join(parts)
-
-
-def _format_pg_access(record: UserRecord, snapshot: ExportCatalogSnapshot) -> str:
-    if not record.pg_ids:
-        return "-"
-    if len(record.pg_ids) > 12:
-        return _compress_ids(record.pg_ids)
-    parts = []
-    for pg_id in record.pg_ids:
-        pg = snapshot.pgs_by_id.get(pg_id - 1)
-        parts.append(f"{pg_id}:{pg.name}" if pg is not None else str(pg_id))
-    return ",".join(parts)
-
-
-def _format_cards(record: UserRecord) -> str:
-    cards = [card for card in record.cards if card]
-    return ",".join(cards) if cards else "-"
-
-
-def _allow_code_change(record: UserRecord) -> bool | None:
-    if record.rights in {"coMaster", "coService"}:
-        return True
-    if record.rights == "coUserNoSelfedit":
-        return False
-    if record.rights in {"coNoAccess", "coPanic", "coPGOnly", "coArmOnly", "coUserGuard", "coPCOGuard", "WPPPhone"}:
-        return None
-    if record.access_raw is None:
-        return None
-    return bool(record.access_raw & (1 << 4))
-
-
-def _format_allow_code_change(record: UserRecord) -> str:
-    value = _allow_code_change(record)
-    if value is None:
-        return "-"
-    return "yes" if value else "no"
-
-
-def _log_user_actions(record: UserRecord) -> bool:
-    return "suppress_control_events" not in record.flags
-
-
-def _format_log_user_actions(record: UserRecord) -> str:
-    return "yes" if _log_user_actions(record) else "no"
-
-
-def _summarize_time_limit(record: UserRecord, snapshot: ExportCatalogSnapshot) -> str:
-    raw_value = record.time_limited_group_raw
-    if raw_value in (None, 0):
-        return "-"
-    group = snapshot.time_limit_groups_by_id.get(raw_value - 1) or snapshot.time_limit_groups_by_id.get(raw_value)
-    if group is None:
-        return f"raw:{raw_value}"
-    active_days = [day.day_name for day in group.days if day.section_rules]
-    active_sections = sorted({rule.section_id for day in group.days for rule in day.section_rules})
-    parts = [f"G{group.group_display_id}"]
-    if active_days:
-        parts.append(",".join(active_days))
-    if active_sections:
-        parts.append(f"S{_compress_ids(active_sections)}")
-    if group.comment:
-        parts.append(group.comment)
-    return " ".join(parts)
-
-
-def _record_to_output_dict(record: UserRecord, snapshot: ExportCatalogSnapshot) -> dict[str, object]:
-    data = asdict(record)
-    data["cards"] = [card for card in record.cards if card]
-    data["allow_code_change"] = _allow_code_change(record)
-    data["allow_code_change_display"] = _format_allow_code_change(record)
-    data["log_user_actions"] = _log_user_actions(record)
-    data["log_user_actions_display"] = _format_log_user_actions(record)
-    data["sections_display"] = _format_section_access(record, snapshot)
-    data["pgs_display"] = _format_pg_access(record, snapshot)
-    data["flags_display"] = ",".join(record.flags) if record.flags else "-"
-    data["time_limit_display"] = _summarize_time_limit(record, snapshot)
-    return data
-
-
-def print_table(records: Iterable[UserRecord], snapshot: ExportCatalogSnapshot) -> None:
-    rows = [
-        (
-            "ID",
-            "RawID",
-            "Name",
-            "Phone",
-            "Code",
-            "Cards",
-            "Access",
-            "SelfCode",
-            "Log",
-            "TimeLimit",
-            "Sections",
-            "PGs",
-            "Flags",
-            "Comment",
-            "Offset",
-        )
-    ]
-    for record in records:
-        rows.append(
-            (
-                "" if record.user_id is None else str(record.user_id),
-                record.raw_id_bytes,
-                record.name,
-                record.phone,
-                record.code,
-                _format_cards(record),
-                record.rights,
-                _format_allow_code_change(record),
-                _format_log_user_actions(record),
-                _summarize_time_limit(record, snapshot),
-                _format_section_access(record, snapshot),
-                _format_pg_access(record, snapshot),
-                ",".join(record.flags) if record.flags else "-",
-                record.comment,
-                str(record.offset),
-            )
-        )
-    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
-    for row in rows:
-        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
-
-
-def print_tsv(records: Iterable[UserRecord], snapshot: ExportCatalogSnapshot) -> None:
-    print(
-        "\t".join(
-            [
-                "ID",
-                "RawID",
-                "Name",
-                "Phone",
-                "Code",
-                "Cards",
-                "Access",
-                "SelfCode",
-                "Log",
-                "TimeLimit",
-                "Sections",
-                "PGs",
-                "Flags",
-                "Comment",
-                "Offset",
-            ]
-        )
-    )
-    for record in records:
-        print(
-            "\t".join(
-                [
-                    "" if record.user_id is None else str(record.user_id),
-                    record.raw_id_bytes,
-                    record.name,
-                    record.phone,
-                    record.code,
-                    _format_cards(record),
-                    record.rights,
-                    _format_allow_code_change(record),
-                    _format_log_user_actions(record),
-                    _summarize_time_limit(record, snapshot),
-                    _format_section_access(record, snapshot),
-                    _format_pg_access(record, snapshot),
-                    ",".join(record.flags) if record.flags else "-",
-                    record.comment,
-                    str(record.offset),
-                ]
-            )
-        )
-
-
 def emit_records(records: list[UserRecord], fmt: str, snapshot: ExportCatalogSnapshot) -> None:
-    if fmt == "json":
-        print(json.dumps([_record_to_output_dict(record, snapshot) for record in records], indent=2, ensure_ascii=False))
-        return
-    if fmt == "tsv":
-        print_tsv(records, snapshot)
-        return
-    print_table(records, snapshot)
+    emit_user_records(records, fmt, snapshot, show_names=True, include_raw_metadata=True)
 
 
 def emit_catalog(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
@@ -288,7 +95,7 @@ def emit_time_limits(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
         if active_days:
             parts.append(f"days={','.join(active_days)}")
         if active_sections:
-            parts.append(f"sections={_compress_ids(active_sections)}")
+            parts.append(f"sections={compress_numeric_ids(active_sections)}")
         if group.comment:
             parts.append(f"comment={group.comment!r}")
         print(" | ".join(parts))
@@ -500,7 +307,7 @@ def _summarize_catalog(snapshot: ExportCatalogSnapshot) -> list[str]:
         if active_days:
             extras.append(f"days={','.join(active_days)}")
         if active_sections:
-            extras.append(f"sections={_compress_ids(active_sections)}")
+            extras.append(f"sections={compress_numeric_ids(active_sections)}")
         if group.comment:
             extras.append(f"comment={group.comment!r}")
         suffix = f" [{' ; '.join(extras)}]" if extras else ""
@@ -513,19 +320,19 @@ def _summarize_catalog(snapshot: ExportCatalogSnapshot) -> list[str]:
             fields.append(f"rights={user.rights}")
         if user.enabled is not None:
             fields.append(f"enabled={'yes' if user.enabled else 'no'}")
-        fields.append(f"self_code={_format_allow_code_change(user)}")
-        fields.append(f"log={_format_log_user_actions(user)}")
+        fields.append(f"self_code={format_allow_code_change(user)}")
+        fields.append(f"log={format_log_user_actions(user)}")
         if user.flags:
             fields.append(f"flags={','.join(user.flags)}")
         if user.section_ids:
-            fields.append(f"sections={_format_section_access(user, snapshot)}")
+            fields.append(f"sections={format_section_access(user, snapshot)}")
         if user.pg_ids:
-            fields.append(f"pgs={_format_pg_access(user, snapshot)}")
+            fields.append(f"pgs={format_pg_access(user, snapshot)}")
         if user.time_limited_group_raw:
-            fields.append(f"time_limit={_summarize_time_limit(user, snapshot)}")
+            fields.append(f"time_limit={format_time_limit_binding(user, snapshot)}")
         if user.code:
             fields.append(f"code={user.code}")
-        cards = _format_cards(user)
+        cards = format_cards(user)
         if cards != "-":
             fields.append(f"cards={cards}")
         if user.phone:
@@ -633,11 +440,7 @@ def cmd_pull_live(args: argparse.Namespace) -> None:
         cleanup_mode=args.read_cleanup_mode,
         verbose=args.verbose,
     )
-    print(f"wrote {snapshot.path}")
-    print(f"sha256 {snapshot.sha256}")
-    print(f"device {resolve_flexi_cfg_device(args.device)}")
-    print(f"users_raw {len(snapshot.raw_records)}")
-    print(f"users_deduped {len(snapshot.records)}")
+    print_export_snapshot_summary(snapshot, device=args.device, resolver=resolve_flexi_cfg_device)
     if args.extract_users:
         catalog = extract_export_catalog(snapshot.path)
         records = snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records
@@ -679,11 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="Output file to write. Defaults to a timestamped file in /tmp.",
     )
-    pull_parser.add_argument(
-        "--device",
-        default="auto",
-        help="FLEXI_CFG block device or 'auto' to resolve /dev/disk/by-label/FLEXI_CFG.",
-    )
+    add_flexi_cfg_device_argument(pull_parser)
     pull_parser.add_argument("--port", default="auto", help="HID port to use for the trigger session (default: auto).")
     pull_parser.add_argument(
         "--code",

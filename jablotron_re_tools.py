@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from flexi_pcap_tool import IMPORT_START_LBA
 from jablotron_usb_debug import (
@@ -29,6 +31,8 @@ EXPORT_START_LBA = 35
 EXPORT_SECTORS = 2048
 DEFAULT_FLEXI_CFG_LABEL = "FLEXI_CFG"
 DEFAULT_FLEXI_CFG_LINK = Path("/dev/disk/by-label") / DEFAULT_FLEXI_CFG_LABEL
+DEFAULT_FLEXI_LOG_LABEL = "FLEXI_LOG"
+DEFAULT_FLEXI_LOG_LINK = Path("/dev/disk/by-label") / DEFAULT_FLEXI_LOG_LABEL
 DEFAULT_IMPORT_MOUNTPOINT = Path("/mnt/flexi_cfg")
 DEFAULT_IMPORT_PATH = DEFAULT_IMPORT_MOUNTPOINT / "IMPORT.CFG"
 REPO_ROOT = Path(__file__).resolve().parent
@@ -282,6 +286,203 @@ class ExportCatalogSnapshot:
         }
 
 
+def compress_numeric_ids(values: Iterable[int]) -> str:
+    numbers = sorted(set(values))
+    if not numbers:
+        return ""
+    ranges: list[str] = []
+    start = numbers[0]
+    end = numbers[0]
+    for value in numbers[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        ranges.append(f"{start}-{end}" if start != end else str(start))
+        start = end = value
+    ranges.append(f"{start}-{end}" if start != end else str(start))
+    return ",".join(ranges)
+
+
+def format_section_access(
+    record: UserRecord,
+    snapshot: ExportSnapshot | ExportCatalogSnapshot,
+    *,
+    show_names: bool = True,
+) -> str:
+    if not record.section_ids:
+        return "-"
+    if not show_names:
+        return compress_numeric_ids(record.section_ids)
+    parts = []
+    for section_id in record.section_ids:
+        section = snapshot.sections_by_id.get(section_id)
+        parts.append(f"{section_id}:{section.name}" if section is not None else str(section_id))
+    return ",".join(parts)
+
+
+def format_pg_access(
+    record: UserRecord,
+    snapshot: ExportSnapshot | ExportCatalogSnapshot,
+    *,
+    show_names: bool = True,
+) -> str:
+    if not record.pg_ids:
+        return "-"
+    if not show_names or len(record.pg_ids) > 12:
+        return compress_numeric_ids(record.pg_ids)
+    parts = []
+    for pg_id in record.pg_ids:
+        pg = snapshot.pgs_by_id.get(pg_id - 1)
+        parts.append(f"{pg_id}:{pg.name}" if pg is not None else str(pg_id))
+    return ",".join(parts)
+
+
+def summarize_time_limit_group(group: ExportUserTimeLimitGroup) -> str:
+    active_days = [day.day_name for day in group.days if day.section_rules]
+    active_sections = sorted({rule.section_id for day in group.days for rule in day.section_rules})
+    parts = [f"G{group.group_display_id}"]
+    if active_days:
+        parts.append(",".join(active_days))
+    if active_sections:
+        parts.append(f"S{compress_numeric_ids(active_sections)}")
+    if group.comment:
+        parts.append(group.comment)
+    return " ".join(parts)
+
+
+def resolve_time_limit_group(
+    record: UserRecord,
+    snapshot: ExportSnapshot | ExportCatalogSnapshot,
+) -> ExportUserTimeLimitGroup | None:
+    raw_value = record.time_limited_group_raw
+    if raw_value is None or raw_value <= 0:
+        return None
+    group = snapshot.time_limit_groups_by_id.get(raw_value - 1)
+    if group is not None:
+        return group
+    return snapshot.time_limit_groups_by_id.get(raw_value)
+
+
+def format_time_limit_binding(
+    record: UserRecord,
+    snapshot: ExportSnapshot | ExportCatalogSnapshot,
+) -> str:
+    group = resolve_time_limit_group(record, snapshot)
+    if group is not None:
+        return summarize_time_limit_group(group)
+    raw_value = record.time_limited_group_raw
+    if raw_value in (None, 0):
+        return "-"
+    return f"raw:{raw_value}"
+
+
+def format_cards(record: UserRecord) -> str:
+    cards = [card for card in record.cards if card]
+    return ",".join(cards) if cards else "-"
+
+
+def allow_code_change(record: UserRecord) -> bool | None:
+    if record.rights in {"coMaster", "coService"}:
+        return True
+    if record.rights == "coUserNoSelfedit":
+        return False
+    if record.rights in {"coNoAccess", "coPanic", "coPGOnly", "coArmOnly", "coUserGuard", "coPCOGuard", "WPPPhone"}:
+        return None
+    if record.access_raw is None:
+        return None
+    return bool(record.access_raw & (1 << 4))
+
+
+def format_allow_code_change(record: UserRecord) -> str:
+    value = allow_code_change(record)
+    if value is None:
+        return "-"
+    return "yes" if value else "no"
+
+
+def log_user_actions(record: UserRecord) -> bool:
+    return "suppress_control_events" not in record.flags
+
+
+def format_log_user_actions(record: UserRecord) -> str:
+    return "yes" if log_user_actions(record) else "no"
+
+
+def user_record_to_output_dict(
+    record: UserRecord,
+    snapshot: ExportSnapshot | ExportCatalogSnapshot,
+    *,
+    show_names: bool = True,
+) -> dict[str, object]:
+    data = asdict(record)
+    data["cards"] = [card for card in record.cards if card]
+    data["allow_code_change"] = allow_code_change(record)
+    data["allow_code_change_display"] = format_allow_code_change(record)
+    data["log_user_actions"] = log_user_actions(record)
+    data["log_user_actions_display"] = format_log_user_actions(record)
+    data["sections_display"] = format_section_access(record, snapshot, show_names=show_names)
+    data["pgs_display"] = format_pg_access(record, snapshot, show_names=show_names)
+    data["flags_display"] = ",".join(record.flags) if record.flags else "-"
+    data["time_limit_display"] = format_time_limit_binding(record, snapshot)
+    linked_group = resolve_time_limit_group(record, snapshot)
+    if linked_group is not None:
+        data["time_limit_group"] = asdict(linked_group)
+    return data
+
+
+def emit_user_records(
+    records: list[UserRecord],
+    fmt: str,
+    snapshot: ExportSnapshot | ExportCatalogSnapshot,
+    *,
+    show_names: bool = True,
+    include_raw_metadata: bool = False,
+) -> None:
+    if fmt == "json":
+        print(
+            json.dumps(
+                [user_record_to_output_dict(record, snapshot, show_names=show_names) for record in records],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return
+
+    headers = ["ID", "Name", "Phone", "Code", "Cards", "Access", "SelfCode", "Log", "TimeLimit", "Sections", "PGs", "Flags", "Comment"]
+    if include_raw_metadata:
+        headers = ["ID", "RawID", *headers[1:], "Offset"]
+
+    rows = [tuple(headers)]
+    for record in records:
+        row = [
+            "" if record.user_id is None else str(record.user_id),
+            record.name,
+            record.phone,
+            record.code,
+            format_cards(record),
+            record.rights,
+            format_allow_code_change(record),
+            format_log_user_actions(record),
+            format_time_limit_binding(record, snapshot),
+            format_section_access(record, snapshot, show_names=show_names),
+            format_pg_access(record, snapshot, show_names=show_names),
+            ",".join(record.flags) if record.flags else "-",
+            record.comment,
+        ]
+        if include_raw_metadata:
+            row = [row[0], record.raw_id_bytes, *row[1:], str(record.offset)]
+        rows.append(tuple(row))
+
+    if fmt == "tsv":
+        for row in rows:
+            print("\t".join(row))
+        return
+
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+
+
 def invert_blob(data: bytes) -> bytes:
     return bytes(byte ^ 0xFF for byte in data)
 
@@ -295,13 +496,19 @@ def _parse_lsblk_pairs(text: str) -> list[dict[str, str]]:
     return rows
 
 
-def resolve_flexi_cfg_device(device: str | None = None) -> str:
+def resolve_labeled_block_device(
+    device: str | None,
+    *,
+    label: str,
+    by_label_link: Path,
+    option_name: str,
+) -> str:
     if device and device != "auto":
         path = Path(device)
         return str(path.resolve()) if path.exists() else device
 
-    if DEFAULT_FLEXI_CFG_LINK.exists():
-        return str(DEFAULT_FLEXI_CFG_LINK.resolve())
+    if by_label_link.exists():
+        return str(by_label_link.resolve())
 
     result = subprocess.run(
         ["lsblk", "-P", "-o", "PATH,LABEL,TYPE"],
@@ -311,13 +518,61 @@ def resolve_flexi_cfg_device(device: str | None = None) -> str:
     )
     if result.returncode == 0:
         for row in _parse_lsblk_pairs(result.stdout):
-            if row.get("LABEL") == DEFAULT_FLEXI_CFG_LABEL and row.get("TYPE") == "part":
+            if row.get("LABEL") == label and row.get("TYPE") == "part":
                 return row["PATH"]
 
     raise SystemExit(
-        "Unable to resolve the FLEXI_CFG block device. "
-        "Connect the panel or pass --device /dev/sdX1 explicitly."
+        f"Unable to resolve the {label} block device. "
+        f"Connect the panel or pass --{option_name} /dev/sdX1 explicitly."
     )
+
+
+def resolve_flexi_cfg_device(device: str | None = None) -> str:
+    return resolve_labeled_block_device(
+        device,
+        label=DEFAULT_FLEXI_CFG_LABEL,
+        by_label_link=DEFAULT_FLEXI_CFG_LINK,
+        option_name="device",
+    )
+
+
+def resolve_flexi_log_device(device: str | None = None) -> str:
+    return resolve_labeled_block_device(
+        device,
+        label=DEFAULT_FLEXI_LOG_LABEL,
+        by_label_link=DEFAULT_FLEXI_LOG_LINK,
+        option_name="log-device",
+    )
+
+
+def block_device_argument_help(*, label: str) -> str:
+    return (
+        f"{label} block device or 'auto' to prefer /dev/disk/by-label/{label} "
+        "and fall back to lsblk."
+    )
+
+
+def add_flexi_cfg_device_argument(parser: argparse.ArgumentParser, *, option: str = "--device") -> None:
+    parser.add_argument(option, default="auto", help=block_device_argument_help(label=DEFAULT_FLEXI_CFG_LABEL))
+
+
+def add_flexi_log_device_argument(parser: argparse.ArgumentParser, *, option: str = "--log-device") -> None:
+    parser.add_argument(option, default="auto", help=block_device_argument_help(label=DEFAULT_FLEXI_LOG_LABEL))
+
+
+def print_export_snapshot_summary(
+    snapshot: "ExportSnapshot",
+    *,
+    device: str | None = None,
+    resolver: Callable[[str | None], str] | None = None,
+) -> None:
+    print(f"wrote {snapshot.path}")
+    print(f"sha256 {snapshot.sha256}")
+    if device is not None:
+        resolve = resolver or resolve_flexi_cfg_device
+        print(f"device {resolve(device)}")
+    print(f"users_raw {len(snapshot.raw_records)}")
+    print(f"users_deduped {len(snapshot.records)}")
 
 
 def is_device_mounted(device: str) -> bool:
@@ -1398,7 +1653,7 @@ def stage_import(import_path: Path, sector_path: Path) -> None:
 def ensure_import_path_available(*, import_path: Path, device: str, mount_tool: str) -> None:
     if import_path.exists():
         return
-    mount_device(device, import_path.parent, mount_tool=mount_tool)
+    mount_device(device, import_path.parent, mount_tool=mount_tool, expected_path=import_path)
     if not import_path.exists():
         raise SystemExit(f"IMPORT.CFG is still missing after remount: {import_path}")
 
@@ -1407,7 +1662,13 @@ def _user_mount_options() -> str:
     return f"uid={os.getuid()},gid={os.getgid()},umask=022"
 
 
-def mount_device(device: str, mountpoint: Path, *, mount_tool: str) -> None:
+def mount_device(
+    device: str,
+    mountpoint: Path,
+    *,
+    mount_tool: str,
+    expected_path: Path | None = None,
+) -> None:
     resolved_device = resolve_flexi_cfg_device(device)
     suppress_message = False
     if mount_tool == "sudo":
@@ -1439,18 +1700,22 @@ def mount_device(device: str, mountpoint: Path, *, mount_tool: str) -> None:
     if message and not suppress_message:
         print(message)
 
-    expected_file = mountpoint / "IMPORT.CFG"
     for _attempt in range(10):
         actual_mountpoint = get_device_mountpoint(resolved_device)
-        if actual_mountpoint == mountpoint and expected_file.exists():
+        if actual_mountpoint != mountpoint:
+            time.sleep(0.1)
+            continue
+        if expected_path is None or expected_path.exists():
             return
         time.sleep(0.1)
 
     actual_mountpoint = get_device_mountpoint(resolved_device)
+    expected_exists = expected_path.exists() if expected_path is not None else None
     raise SystemExit(
-        "mount completed but FLEXI_CFG was not available at the expected mountpoint: "
+        "mount completed but the requested filesystem was not available at the expected mountpoint: "
         f"device={resolved_device} expected_mountpoint={mountpoint} "
-        f"actual_mountpoint={actual_mountpoint} expected_file_exists={expected_file.exists()}"
+        f"actual_mountpoint={actual_mountpoint} expected_path={expected_path} "
+        f"expected_path_exists={expected_exists}"
     )
 
 
@@ -1715,7 +1980,7 @@ def apply_import_sector(
         if is_device_mounted(resolved_device):
             unmount_device(resolved_device, mount_tool=mount_tool)
             remount_after = True
-        mount_device(resolved_device, mountpoint, mount_tool=mount_tool)
+        mount_device(resolved_device, mountpoint, mount_tool=mount_tool, expected_path=import_path)
         remount_after = True
     else:
         if is_device_mounted(resolved_device):
@@ -1791,4 +2056,4 @@ def apply_import_sector(
         return None
     finally:
         if remount_after:
-            mount_device(resolved_device, mountpoint, mount_tool=mount_tool)
+            mount_device(resolved_device, mountpoint, mount_tool=mount_tool, expected_path=import_path)

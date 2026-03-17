@@ -21,6 +21,7 @@ from typing import TextIO
 from jablotron_re_tools import (
     EXITED_SECTIONS_MODE,
     JablotronUSBClient,
+    add_flexi_log_device_argument,
     cleanup_read_session,
     drain_packets,
     enter_setup_mode,
@@ -29,12 +30,11 @@ from jablotron_re_tools import (
     graceful_exit_session,
     mount_device,
     pull_live_export_snapshot,
+    resolve_flexi_log_device,
     unmount_device,
 )
 from jablotron_usb_debug import ensure_serial_port, perform_login
 
-DEFAULT_FLEXI_LOG_LABEL = "FLEXI_LOG"
-DEFAULT_FLEXI_LOG_LINK = Path("/dev/disk/by-label") / DEFAULT_FLEXI_LOG_LABEL
 DEFAULT_FLEXI_LOG_MOUNTPOINT = Path("/mnt/flexi_log")
 DEFAULT_WINDOW_BYTES = 102400
 DEFAULT_FILES = ("FLEXILOG.OLD", "FLEXILOG.TXT", "LOGINDEX.BIN")
@@ -205,48 +205,6 @@ class AlignedEventRow:
     export_channel: str | None
     export_section: str | None
     status: str
-
-
-def _parse_lsblk_pairs(text: str) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for line in text.splitlines():
-        pairs: dict[str, str] = {}
-        for field in line.split():
-            if "=" not in field:
-                continue
-            key, value = field.split("=", 1)
-            pairs[key] = value.strip('"')
-        if pairs:
-            rows.append(pairs)
-    return rows
-
-
-def resolve_flexi_log_device(device: str | None = None) -> str:
-    if device and device != "auto":
-        path = Path(device)
-        return str(path.resolve()) if path.exists() else device
-
-    if DEFAULT_FLEXI_LOG_LINK.exists():
-        return str(DEFAULT_FLEXI_LOG_LINK.resolve())
-
-    import subprocess
-
-    result = subprocess.run(
-        ["lsblk", "-P", "-o", "PATH,LABEL,TYPE"],
-        check=False,
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        for row in _parse_lsblk_pairs(result.stdout):
-            if row.get("LABEL") == DEFAULT_FLEXI_LOG_LABEL and row.get("TYPE") == "part":
-                return row["PATH"]
-
-    raise SystemExit(
-        "Unable to resolve the FLEXI_LOG block device. "
-        "Connect the panel or pass --log-device /dev/sdX1 explicitly."
-    )
-
 
 def read_log_index_points(path: Path) -> list[LogPoint]:
     blob = path.read_bytes()
@@ -2161,7 +2119,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="jsonl",
         help="Format for --records-output.",
     )
-    pull_live.add_argument("--log-device", default="auto", help="FLEXI_LOG block device or 'auto'.")
+    add_flexi_log_device_argument(pull_live)
     pull_live.add_argument("--mountpoint", default=str(DEFAULT_FLEXI_LOG_MOUNTPOINT), help="Temporary mountpoint.")
     pull_live.add_argument("--port", default="auto", help="HID port (default: auto).")
     pull_live.add_argument("--auth-code", default="1812", help="Authorisation code for the live session.")
@@ -2241,7 +2199,7 @@ def build_parser() -> argparse.ArgumentParser:
     recent.add_argument("--limit", type=int, default=150, help="How many most-recent decoded rows to display.")
     recent.add_argument("--include-raw", action="store_true", help="Include undecoded rows in console output.")
     recent.add_argument("--save-records", action="store_true", help="Also save decoded records next to the raw pull.")
-    recent.add_argument("--log-device", default="auto", help="FLEXI_LOG block device or 'auto'.")
+    add_flexi_log_device_argument(recent)
     recent.add_argument("--mountpoint", default=str(DEFAULT_FLEXI_LOG_MOUNTPOINT), help="Temporary mountpoint.")
     recent.add_argument("--port", default="auto", help="HID port (default: auto).")
     recent.add_argument("--auth-code", default="1812", help="Authorisation code for the live session.")

@@ -17,7 +17,9 @@ from pathlib import Path
 
 from jablotron_re_tools import (
     DEFAULT_IMPORT_PATH,
+    add_flexi_cfg_device_argument,
     apply_import_sector,
+    print_export_snapshot_summary,
     resolve_flexi_cfg_device,
 )
 
@@ -30,11 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_IMPORT_PATH),
         help=f"Mounted IMPORT.CFG path (default: {DEFAULT_IMPORT_PATH}).",
     )
-    parser.add_argument(
-        "--device",
-        default="auto",
-        help="FLEXI_CFG block device or 'auto' to resolve /dev/disk/by-label/FLEXI_CFG.",
-    )
+    add_flexi_cfg_device_argument(parser)
     parser.add_argument("--port", default="auto", help="HID port (default: auto).")
     parser.add_argument("--code", default="1812", help="Authorisation code for the service session.")
     parser.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end packet during login.")
@@ -96,10 +94,7 @@ def main() -> None:
     if snapshot is None:
         return
 
-    print(f"wrote {snapshot.path}")
-    print(f"sha256 {snapshot.sha256}")
-    print(f"users_raw {len(snapshot.raw_records)}")
-    print(f"users_deduped {len(snapshot.records)}")
+    print_export_snapshot_summary(snapshot)
 
     records = snapshot.records if args.verify_mode == "dedupe" else snapshot.raw_records
     if args.verify_user_id:

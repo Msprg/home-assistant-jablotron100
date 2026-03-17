@@ -8,11 +8,13 @@ import argparse
 from jablotron_re_tools import (
     DEFAULT_IMPORT_PATH,
     JablotronUSBClient,
+    add_flexi_cfg_device_argument,
     default_export_output,
     drain_packets,
     enter_setup_mode,
     ensure_serial_port,
     graceful_exit_session,
+    print_export_snapshot_summary,
     perform_login,
     pull_live_export_snapshot,
     resolve_flexi_cfg_device,
@@ -30,11 +32,7 @@ def cmd_read_users(args: argparse.Namespace) -> None:
         cleanup_mode=args.read_cleanup_mode,
         verbose=args.verbose,
     )
-    print(f"wrote {snapshot.path}")
-    print(f"sha256 {snapshot.sha256}")
-    print(f"device {resolve_flexi_cfg_device(args.device)}")
-    print(f"users_raw {len(snapshot.raw_records)}")
-    print(f"users_deduped {len(snapshot.records)}")
+    print_export_snapshot_summary(snapshot, device=args.device, resolver=resolve_flexi_cfg_device)
     for record in snapshot.records[: args.limit]:
         print(
             "\t".join(
@@ -70,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     read_users = subparsers.add_parser("read-users", help="Pull a live export and print a short user summary.")
-    read_users.add_argument("--device", default="auto", help="FLEXI_CFG block device or 'auto'.")
+    add_flexi_cfg_device_argument(read_users)
     read_users.add_argument("--port", default="auto", help="HID port (default: auto).")
     read_users.add_argument("--auth-code", default="1812", help="Authorisation code for the smoke test.")
     read_users.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
@@ -85,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     read_users.set_defaults(func=cmd_read_users)
 
     setup_session = subparsers.add_parser("setup-session", help="Log in and confirm setup-mode entry only.")
-    setup_session.add_argument("--device", default="auto", help="FLEXI_CFG block device or 'auto'.")
+    add_flexi_cfg_device_argument(setup_session)
     setup_session.add_argument("--port", default="auto", help="HID port (default: auto).")
     setup_session.add_argument("--auth-code", default="1812", help="Authorisation code for the smoke test.")
     setup_session.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
