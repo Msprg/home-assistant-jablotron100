@@ -50,12 +50,13 @@ Useful offline analysis commands:
 - `python3 f_link_user_tool.py extract-users research/traces/process_memory/f-link-edit-user-USER91TEST.dmp --format tsv`
 - `python3 f_link_user_tool.py diff-users research/traces/process_memory/f-link-delete-user-USER91TEST.dmp research/traces/process_memory/f-link-edit-user-USER91TEST.dmp`
 - `python3 export_cfg_tool.py extract-users research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format tsv`
+- `python3 export_cfg_tool.py extract-time-limits research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format summary`
 - `python3 export_cfg_tool.py extract-catalog research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format summary`
 - `python3 export_cfg_tool.py pull-live research/exports/live_EXPORT.CFG.bin --extract-users`
 - `python3 jablotron_user_tool.py list`
 - `python3 jablotron_user_tool.py get 88`
 - `python3 jablotron_user_tool.py add 89 --name testuser89`
-- `python3 jablotron_user_tool.py edit 88 --comment 'Renamed from CLI' --use-minimal-template`
+- `python3 jablotron_user_tool.py edit 88 --comment 'Renamed from CLI'`
 - `python3 jablotron_user_tool.py delete 89`
 - `python3 jablotron_event_tool.py recent --auth-code 1812`
 - `python3 jablotron_event_tool.py recent --auth-code 1812 --events-only`
@@ -72,6 +73,7 @@ Useful offline analysis commands:
 - `python3 jablotron_event_tool.py dump-index /tmp/live_events_files/LOGINDEX.BIN`
 - `python3 import_cfg_tool.py decode-frame research/captures/usb/f_link/f-link-edit-user-USER91TEST.pcapng 1787 --format json`
 - `python3 import_cfg_tool.py build-user-upsert /tmp/user91-edit.bin --user-id 91 --name USER91TEST --code 9999 --card1 0000000012200717 --comment 'THIS IS A SAMPLE USER91TEST NOTE' --permissions-raw 811 --sections-mask 63 --pg-masks 65535,0,0,0`
+- `python3 import_cfg_tool.py build-user-upsert /tmp/user90-pg128.bin --user-id 90 --name PG128TEST --pgs 1,32,33,64,65,96,97,128`
 - `python3 import_cfg_tool.py build-user-delete /tmp/user91-delete.bin --user-id 91`
 - `python3 fdb_tool.py info research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb`
 - `python3 fdb_tool.py extract-users research/fdb/after/VO-66_after-edit-user-USER91TEST.fdb --format table`
@@ -86,6 +88,8 @@ Useful offline analysis commands:
 
 Notes:
 
+- On this workstation, with the hidraw udev rule installed, run the Python entrypoints as the normal user. A fresh 2026-03-17 validation confirmed that `python3 jablotron_user_tool.py list` works without `sudo`, writes a live export to `/tmp`, and regenerates repo-local `__pycache__` files owned by `administrator`.
+- Avoid `sudo python3 ...` for the repo tools unless a separate non-Python step truly requires it; older sudo runs left root-owned `__pycache__` files in the workspace. The one-time cleanup was `sudo rm -rf ./__pycache__ ./custom_components/jablotron100/__pycache__`.
 - The memory dumps can contain stale heap fragments. Use `f_link_user_tool.py` to pick a coherent `JA100UsersSetup` / `TJA100AllUsers` snapshot instead of grepping loose strings across the whole dump.
 - The latest complete snapshots in the current edit/delete dumps resolve the authoritative state of user 91 correctly: populated in the edit session, empty/default in the delete session.
 - For live reads, `EXPORT.CFG` on `FLEXI_CFG` can stay all-zero until a F-Link-style HID session refreshes it. A captured service-session replay now exists as `python3 jablotron_usb_debug.py --code 1812 --login-first --no-reset f-link-export-session`.
@@ -102,7 +106,20 @@ Notes:
 - Current user-listing output now also prints:
   - rights label inferred from export field `1` (`0 -> coNoAccess`, `1 -> coPanic`, `2 -> coPGOnly`, `256 -> coArmOnly`, `799 -> coUserGuard`, `811 -> coUserNoSelfedit`, `1851 -> coMaster`, `2875 -> coService`, `4639 -> coPCOGuard`)
   - the remaining live non-user value `827` is now labelled `WPPPhone` for IDs `603-610`, because those records line up with the communicator `WPPPhones` list in the unpacked `.fdb` XML rather than normal keypad users
-  - enabled/disabled state inferred from export field `0`, where the current live/FDB evidence treats `field0 == 1` as disabled/blocked
+  - enabled/disabled state inferred from `cfg_user_t.flags` bit `0` (`CFG_USER_F_OFF` / blocked)
+  - user flags, section access, PG access, and time-limit binding from the full 12-field `cfg_user_t` map (`flags`, `access`, `section_access`, `pg_access`, `name`, `phone`, `code`, `rfid`, `pg_num_if_ring`, `time_limited_group`, `comment`, `parent_user_no`)
+- `EXPORT.CFG` collection `0x08` now decodes as `cfg_data_t.users_time_limit` / `cfg_user_time_limit_week_t`:
+  - four groups (`G1`..`G4`) on the current panel
+  - each group exposes `day[7]` plus `comment`
+  - each day exposes up to two windows per section across sections `1..15`
+  - `export_cfg_tool.py extract-time-limits` prints a compact summary, and `jablotron_user_tool.py get ... --format json` now includes the linked group when a user is bound to one
+- `jablotron_user_tool.py edit` no longer needs a captured template just to preserve existing access rights. It now seeds the upsert payload from the current `EXPORT.CFG` record and only overrides the fields requested on the CLI.
+- `import_cfg_tool.py` / `jablotron_user_tool.py` now treat `pg_access` as four `uint32_t` masks (`CFG_MAX_PGS = 128`), not four 16-bit masks. `--pgs` therefore supports the full range `1..128`, and `--pg-masks` still accepts exact raw integers when deterministic replay is needed.
+- Current confidence boundary for user fields:
+  - safe read/decode: `flags`, `access`, `section_access`, `pg_access`, `name`, `phone`, `code`, `rfid`, `time_limited_group`, `comment`
+  - safe write/update from current evidence: `name`, `phone`, `code`, `rfid`, `comment`, `section_access`, `pg_access`, plus exact raw replay of `flags` / `access`
+  - still read-mostly or raw-only: `pg_num_if_ring` and `parent_user_no`
+  - `time_limited_group` is decoded and preserved on edit, but there is still no dedicated live write proof for intentionally changing it from the CLI
 - On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.
@@ -156,6 +173,14 @@ Notes:
   - known examples from the current live export:
     - user `7` decodes as `coService` and enabled
     - users `13`, `34`, and `39` decode as `coUserNoSelfedit` and disabled
+- A fresh live validation on 2026-03-17 used `/tmp/2026-03-17_live-rights-validation_EXPORT.CFG.bin` (SHA-256 `f80862fa4ba8b004e30482636762560d263a48f068242b4078bd0d77310d5b0d`) to confirm the richer section/PG decoder against purpose-built test users in slots `87-99`:
+  - user `87`: sections `2,4,6`; PGs `2,4,7,10,12,14,16`
+  - user `88`: PGs `6,7,8,9,10,11,12,13,14`
+  - user `89`: sections `3,4,5`
+  - users `90-94`: single-section bindings for sections `1`, `2`, `3`, `5`, and `6`
+  - users `95-99`: single-PG bindings for PGs `1`, `2`, `3`, `13`, and `16`
+  - all of those test users currently decode with `access_raw = 0` / `coNoAccess`, so the new output makes it clear that section and PG rights are independent from the top-level access/competence label
+  - the same live read hit a transport cleanup quirk: the post-read HID cleanup ended on `0x94` instead of `0x90`, but the pulled export itself was valid and decodable
 - A later transport-review validation on 2026-03-10 re-ran the refactored tooling live after low-level changes:
   - add user `89` as `transport89`
   - edit user `89` comment to `cleanup89`
@@ -220,9 +245,11 @@ Notes:
 - `EXPORT.CFG` now exposes a broader panel-derived catalog than just users:
   - collection `0x06`: section names
   - collection `0x07`: users
+  - collection `0x08`: user time-limit groups
   - collection `0x09`: named event objects used by source/channel IDs, including panel/peripherals plus communicator-style IDs such as `233 LAN communicator`, `234 GSM communicator`, `235 Landline communicator`, and `237 Power supply`
   - collection `0x0c`: PG names
   - `export_cfg_tool.py extract-catalog` now prints that catalog directly for inspection
+  - `export_cfg_tool.py dump-readable` now includes time-limit groups plus per-user section/PG/time-limit detail, not just the basic name/code table
 - `jablotron_event_tool.py` now builds its main live decoder catalog from `EXPORT.CFG`, not just the user table:
   - `--source-export-cfg` now resolves user slots, numeric `source_id` object labels, numeric channel IDs, PG on/off event names, and section display IDs from panel-derived config data
   - concrete saved-archive examples without `.fdb` now resolve:
@@ -240,8 +267,45 @@ Notes:
   - the decoder is now good enough to recover timestamps, event IDs, event text, source IDs/names, channel labels, and section labels from archive pulls with much better Slovak diacritic recovery on event rows; the remaining weaknesses are mostly long free-form `INFO(DEVICE,...)` strings where there is no `.fdb`/export structure to snap against
 - `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.
 - That embedded schema confirms a distinct software-only internal privilege tier above normal service access: `ACCESS_SYSTEM` (`def=15`) and `COMP_SYSTEM`.
+- The strongest direct evidence is the root config object itself: `cfg_data_t` carries `r_access=ACCESS_SYSTEM` and `w_access=ACCESS_SYSTEM`, and the normal stored groups (`system`, `communications`, `user`, `periphery`, `calendar`, `thermo`, etc.) selectively override that default down to service/master/user access as needed.
+  - Current evidence does **not** yet show a large list of leaf fields explicitly gated with `+ACCESS_SYSTEM`; the main conclusion is that the internal storage model is a software-only superset and the familiar F-Link groups are overrides inside it.
 - The schema also exposes access gates for stored config groups via `cfg_data_t`, for example:
   - `user`: `r_access=+ACCESS_SERVICE+ACCESS_MASTER+ACCESS_USER`, `w_access=+ACCESS_SERVICE+ACCESS_MASTER`
   - `system`: `r_access=+ACCESS_SERVICE`, `w_access=+ACCESS_SERVICE`
   - `users_time_limit`: `r_access=+ACCESS_SERVICE+ACCESS_MASTER+ACCESS_USER`, `w_access=+ACCESS_SERVICE+ACCESS_MASTER`
 - `cfg_user_t.access` maps directly to `access_t` with F-Link record name `Permissions`, which helps bridge the internal access model to the exported/imported user records.
+- Several persisted classes and fields look internal, hidden, or at least not first-class in the normal F-Link import/export layer because they are marked as software-only, FL-only, special-access, or raw internal blobs:
+  - `cfg_data_t.ytun_rsa_key`: special-access key material with the note `nemelo by se vubec exportovat nejlepe`
+  - `cfg_periphery_setup_t.data`: raw `InternalSetup` blob handled through `prf_setup_internal_hook`
+  - `cfg_flink_scratch_t` / `cfg_flink_registration_t`: F-Link / portal scratch and registration data (`LoginID`, contact name/phone, email, address, GPS coordinates, GSM phone, hotline, attempts)
+  - communicator / ARC `service_access`: FL-only service-tech access control flags (`0=yes / 1=no / 2=read only`)
+- The schema also exposes persisted knobs that may exist in storage without being surfaced as ordinary first-class F-Link fields because they have blank or missing `flrecname`, for example:
+  - `cfg_main_t.wpp_dedicated`, `cfg_main_t.simple_log`
+  - `cfg_system_t.tm_auto_arm`, `cfg_system_t.gps_latit_longit`, `cfg_system_t.sunrise_correction`, `cfg_system_t.sunset_correction`, `cfg_system_t.night_mode_periphery`
+  - `cfg_system_flags_t.weekend_house`, `fault_bypass_selfresetable`, `fault_alarm_ack`, `timezone_unset`, `ant_lost_cause_tamper`, `maintenance_forbidden`
+  - `cfg_comm_flags_t.gsm_autoconfig_disabled`, `send_sms_on_failed_arm`
+- The embedded schema is also a strong indicator that stored config can contain sensitive secrets and backend transport credentials beyond user PINs/cards:
+  - communicator transport fields such as `WPPDomain`, `AESKey`, `YTUNKey`, `RF_Key`, `LocalLANPort`
+  - ARC / reporting encryption keys such as `SIAEncryptionKey`, `JabloIPEncryptionKey`, `JabloIMGEncryptionKey`
+  - the standalone `cfg_ytun_rsa_key_t.key` blob
+- Current confidence boundary:
+  - proven: the internal schema supports a software-only privilege tier and includes FL-only/internal storage objects plus secret-bearing transport fields
+  - not yet proven: which of those fields are always present in `EXPORT.CFG`, which are suppressed from panel exports in practice, and which “hidden” options are reachable in shipping F-Link UI versus only through internal software paths
+- Correlation against the saved `EXPORT.CFG` sample (`research/exports/2026-03-07_live-service_EXPORT.CFG.bin`) shows that at least some crypto-related schema fields do survive into the panel export:
+  - `python3 export_cfg_tool.py extract-arcs research/exports/2026-03-07_live-service_EXPORT.CFG.bin`
+    - decodes the typed ARC/reporting records directly from collection `0x11`
+  - collection `0x11` correlates strongly with `cfg_arc_t`
+    - the top-level field order matches `cfg_arc_t` exactly: `type`, `transfers_on`, `contest_in_fixed_time`, `backup`, `backup_test_reports`, `object_id[]`, `err_wait_time`, `report_time`, `report_time_backup`, `retry_count`, `time_out`, `channel`, `comment`, `specific`, `ats_class`, `service_access`
+    - nested field `13` matches `cfg_arc_specific_t` and its protocol-specific children in order: `sia_ip`, `sia_cid`, `sia_fsk`, `jablo_ip`, `jablo_sms`, `jablo_img`, `device`
+    - `channel=0` follows the schema note `0 == automatic`; in the saved sample the only nonzero observed channel is `234`, which matches communicator object `234 = GSM communicator`
+  - concrete values observed in `0x11` line up with the schema’s crypto-bearing ARC subtypes:
+    - `specific.0.9 = "AES-default-key"` matches `cfg_arc_sia_ip_specific_t.crypt_key` / `SIAEncryptionKey`
+    - `specific.3.5 = "evgo%^TOarc"` matches `cfg_arc_jablo_ip_specific_t.crypt_key` / `JabloIPEncryptionKey`
+    - `specific.5.3 = "ABCD"` matches `cfg_arc_jablo_img_specific_t.crypt_key` / `JabloIMGEncryptionKey`
+    - observed transport endpoints such as `194.169.224.113:10488`, `194.169.224.114:10488`, and `194.169.224.113:10470` line up with the relevant ARC protocol `Domain` / `Domain1` fields
+  - this is direct evidence that `EXPORT.CFG` can carry live ARC/reporting encryption keys and related endpoints, not just high-level labels
+- Negative correlation findings from the same export sample:
+  - no obvious `cfg_communications_t` communicator-side secrets (`AESKey`, `YTUNKey`, `RF_Key`, `WPPDomain`) were recovered as readable values from the current `EXPORT.CFG` dump
+  - no obvious `cfg_data_t.ytun_rsa_key` blob was mapped to a recurring readable collection yet
+  - object / peripheral `43` (`DO MB`, model `JA-154J MS II`) appears in the object/hardware side of the export (`0x09` / `0x0b`) and in a few compact auxiliary tables (`0x0a`, `0x0f`, `0x10`), but none of those currently look like per-device RF crypto material or a rolling-code seed
+  - current best interpretation: the saved export exposes ARC/reporting crypto more readily than per-peripheral RF keys

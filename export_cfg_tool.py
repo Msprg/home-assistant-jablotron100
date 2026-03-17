@@ -32,13 +32,13 @@ from jablotron_re_tools import (
 KNOWN_COLLECTIONS = {
     0x06: "sections",
     0x07: "users",
-    0x08: "unknown",
+    0x08: "users_time_limit",
     0x09: "objects",
     0x0A: "unknown",
     0x0B: "hardware",
     0x0C: "pgs",
     0x0D: "unknown",
-    0x11: "unknown",
+    0x11: "arc_setup",
     0x13: "unknown",
     0x14: "unknown",
     0x17: "unknown",
@@ -46,19 +46,146 @@ KNOWN_COLLECTIONS = {
 }
 
 
-def print_table(records: Iterable[UserRecord]) -> None:
-    rows = [("ID", "RawID", "Rights", "Enabled", "Name", "Code", "Phone", "Card", "Comment", "Offset")]
+def _compress_ids(values: Iterable[int]) -> str:
+    numbers = sorted(set(values))
+    if not numbers:
+        return ""
+    ranges: list[str] = []
+    start = numbers[0]
+    end = numbers[0]
+    for value in numbers[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        ranges.append(f"{start}-{end}" if start != end else str(start))
+        start = end = value
+    ranges.append(f"{start}-{end}" if start != end else str(start))
+    return ",".join(ranges)
+
+
+def _format_section_access(record: UserRecord, snapshot: ExportCatalogSnapshot) -> str:
+    if not record.section_ids:
+        return "-"
+    parts = []
+    for section_id in record.section_ids:
+        section = snapshot.sections_by_id.get(section_id)
+        parts.append(f"{section_id}:{section.name}" if section is not None else str(section_id))
+    return ",".join(parts)
+
+
+def _format_pg_access(record: UserRecord, snapshot: ExportCatalogSnapshot) -> str:
+    if not record.pg_ids:
+        return "-"
+    if len(record.pg_ids) > 12:
+        return _compress_ids(record.pg_ids)
+    parts = []
+    for pg_id in record.pg_ids:
+        pg = snapshot.pgs_by_id.get(pg_id - 1)
+        parts.append(f"{pg_id}:{pg.name}" if pg is not None else str(pg_id))
+    return ",".join(parts)
+
+
+def _format_cards(record: UserRecord) -> str:
+    cards = [card for card in record.cards if card]
+    return ",".join(cards) if cards else "-"
+
+
+def _allow_code_change(record: UserRecord) -> bool | None:
+    if record.rights in {"coMaster", "coService"}:
+        return True
+    if record.rights == "coUserNoSelfedit":
+        return False
+    if record.rights in {"coNoAccess", "coPanic", "coPGOnly", "coArmOnly", "coUserGuard", "coPCOGuard", "WPPPhone"}:
+        return None
+    if record.access_raw is None:
+        return None
+    return bool(record.access_raw & (1 << 4))
+
+
+def _format_allow_code_change(record: UserRecord) -> str:
+    value = _allow_code_change(record)
+    if value is None:
+        return "-"
+    return "yes" if value else "no"
+
+
+def _log_user_actions(record: UserRecord) -> bool:
+    return "suppress_control_events" not in record.flags
+
+
+def _format_log_user_actions(record: UserRecord) -> str:
+    return "yes" if _log_user_actions(record) else "no"
+
+
+def _summarize_time_limit(record: UserRecord, snapshot: ExportCatalogSnapshot) -> str:
+    raw_value = record.time_limited_group_raw
+    if raw_value in (None, 0):
+        return "-"
+    group = snapshot.time_limit_groups_by_id.get(raw_value - 1) or snapshot.time_limit_groups_by_id.get(raw_value)
+    if group is None:
+        return f"raw:{raw_value}"
+    active_days = [day.day_name for day in group.days if day.section_rules]
+    active_sections = sorted({rule.section_id for day in group.days for rule in day.section_rules})
+    parts = [f"G{group.group_display_id}"]
+    if active_days:
+        parts.append(",".join(active_days))
+    if active_sections:
+        parts.append(f"S{_compress_ids(active_sections)}")
+    if group.comment:
+        parts.append(group.comment)
+    return " ".join(parts)
+
+
+def _record_to_output_dict(record: UserRecord, snapshot: ExportCatalogSnapshot) -> dict[str, object]:
+    data = asdict(record)
+    data["cards"] = [card for card in record.cards if card]
+    data["allow_code_change"] = _allow_code_change(record)
+    data["allow_code_change_display"] = _format_allow_code_change(record)
+    data["log_user_actions"] = _log_user_actions(record)
+    data["log_user_actions_display"] = _format_log_user_actions(record)
+    data["sections_display"] = _format_section_access(record, snapshot)
+    data["pgs_display"] = _format_pg_access(record, snapshot)
+    data["flags_display"] = ",".join(record.flags) if record.flags else "-"
+    data["time_limit_display"] = _summarize_time_limit(record, snapshot)
+    return data
+
+
+def print_table(records: Iterable[UserRecord], snapshot: ExportCatalogSnapshot) -> None:
+    rows = [
+        (
+            "ID",
+            "RawID",
+            "Name",
+            "Phone",
+            "Code",
+            "Cards",
+            "Access",
+            "SelfCode",
+            "Log",
+            "TimeLimit",
+            "Sections",
+            "PGs",
+            "Flags",
+            "Comment",
+            "Offset",
+        )
+    ]
     for record in records:
         rows.append(
             (
                 "" if record.user_id is None else str(record.user_id),
                 record.raw_id_bytes,
-                record.rights,
-                "" if record.enabled is None else ("yes" if record.enabled else "no"),
                 record.name,
-                record.code,
                 record.phone,
-                record.card,
+                record.code,
+                _format_cards(record),
+                record.rights,
+                _format_allow_code_change(record),
+                _format_log_user_actions(record),
+                _summarize_time_limit(record, snapshot),
+                _format_section_access(record, snapshot),
+                _format_pg_access(record, snapshot),
+                ",".join(record.flags) if record.flags else "-",
                 record.comment,
                 str(record.offset),
             )
@@ -68,20 +195,45 @@ def print_table(records: Iterable[UserRecord]) -> None:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
 
 
-def print_tsv(records: Iterable[UserRecord]) -> None:
-    print("\t".join(["ID", "RawID", "Rights", "Enabled", "Name", "Code", "Phone", "Card", "Comment", "Offset"]))
+def print_tsv(records: Iterable[UserRecord], snapshot: ExportCatalogSnapshot) -> None:
+    print(
+        "\t".join(
+            [
+                "ID",
+                "RawID",
+                "Name",
+                "Phone",
+                "Code",
+                "Cards",
+                "Access",
+                "SelfCode",
+                "Log",
+                "TimeLimit",
+                "Sections",
+                "PGs",
+                "Flags",
+                "Comment",
+                "Offset",
+            ]
+        )
+    )
     for record in records:
         print(
             "\t".join(
                 [
                     "" if record.user_id is None else str(record.user_id),
                     record.raw_id_bytes,
-                    record.rights,
-                    "" if record.enabled is None else ("yes" if record.enabled else "no"),
                     record.name,
-                    record.code,
                     record.phone,
-                    record.card,
+                    record.code,
+                    _format_cards(record),
+                    record.rights,
+                    _format_allow_code_change(record),
+                    _format_log_user_actions(record),
+                    _summarize_time_limit(record, snapshot),
+                    _format_section_access(record, snapshot),
+                    _format_pg_access(record, snapshot),
+                    ",".join(record.flags) if record.flags else "-",
                     record.comment,
                     str(record.offset),
                 ]
@@ -89,14 +241,14 @@ def print_tsv(records: Iterable[UserRecord]) -> None:
         )
 
 
-def emit_records(records: list[UserRecord], fmt: str) -> None:
+def emit_records(records: list[UserRecord], fmt: str, snapshot: ExportCatalogSnapshot) -> None:
     if fmt == "json":
-        print(json.dumps([asdict(record) for record in records], indent=2, ensure_ascii=False))
+        print(json.dumps([_record_to_output_dict(record, snapshot) for record in records], indent=2, ensure_ascii=False))
         return
     if fmt == "tsv":
-        print_tsv(records)
+        print_tsv(records, snapshot)
         return
-    print_table(records)
+    print_table(records, snapshot)
 
 
 def emit_catalog(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
@@ -107,6 +259,8 @@ def emit_catalog(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
         "objects": {object_id: asdict(record) for object_id, record in snapshot.objects_by_id.items()},
         "hardware": {object_id: asdict(record) for object_id, record in snapshot.hardware_by_id.items()},
         "pgs": {pg_id: asdict(record) for pg_id, record in snapshot.pgs_by_id.items()},
+        "arcs": {arc_id: asdict(record) for arc_id, record in snapshot.arcs_by_id.items()},
+        "time_limit_groups": {group_id: asdict(record) for group_id, record in snapshot.time_limit_groups_by_id.items()},
         "communicators": {object_id: asdict(record) for object_id, record in snapshot.communicators_by_id.items()},
     }
     if fmt == "summary":
@@ -116,8 +270,52 @@ def emit_catalog(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
         print(f"objects {len(snapshot.objects_by_id)}")
         print(f"communicators {len(snapshot.communicators_by_id)}")
         print(f"pgs {len(snapshot.pgs_by_id)}")
+        print(f"arcs {len(snapshot.arcs_by_id)}")
+        print(f"time_limit_groups {len(snapshot.time_limit_groups_by_id)}")
         return
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def emit_time_limits(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
+    groups = [record for _, record in sorted(snapshot.time_limit_groups_by_id.items())]
+    if fmt == "json":
+        print(json.dumps([asdict(record) for record in groups], indent=2, ensure_ascii=False))
+        return
+    for group in groups:
+        active_days = [day.day_name for day in group.days if day.section_rules]
+        active_sections = sorted({rule.section_id for day in group.days for rule in day.section_rules})
+        parts = [f"G{group.group_display_id}"]
+        if active_days:
+            parts.append(f"days={','.join(active_days)}")
+        if active_sections:
+            parts.append(f"sections={_compress_ids(active_sections)}")
+        if group.comment:
+            parts.append(f"comment={group.comment!r}")
+        print(" | ".join(parts))
+
+
+def emit_arcs(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
+    sorted_arcs = [record for _, record in sorted(snapshot.arcs_by_id.items())]
+    records = [asdict(record) for record in sorted_arcs]
+    if fmt == "json":
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+        return
+    for arc in sorted_arcs:
+        parts = [f"ARC {arc.arc_id}", arc.protocol_name or f"type={arc.protocol_type_raw}"]
+        if arc.channel_name:
+            parts.append(f"channel={arc.channel_name}")
+        elif arc.channel_id is not None:
+            parts.append(f"channel_id={arc.channel_id}")
+        if arc.enabled is not None:
+            parts.append(f"enabled={'yes' if arc.enabled else 'no'}")
+        if arc.service_access_name:
+            parts.append(f"service_access={arc.service_access_name}")
+        for specific in arc.specific_by_name.values():
+            if specific.endpoints:
+                parts.append(f"{specific.name}.endpoints={specific.endpoints}")
+            if specific.crypt_key:
+                parts.append(f"{specific.name}.crypt_key={specific.crypt_key!r}")
+        print(" | ".join(parts))
 
 
 def _json_ready(value: object | None) -> object | None:
@@ -190,6 +388,8 @@ def _summarize_catalog(snapshot: ExportCatalogSnapshot) -> list[str]:
     lines.append(f"communicators: {len(snapshot.communicators_by_id)}")
     lines.append(f"hardware records: {len(snapshot.hardware_by_id)}")
     lines.append(f"pgs: {len(snapshot.pgs_by_id)}")
+    lines.append(f"arcs: {len(snapshot.arcs_by_id)}")
+    lines.append(f"time_limit_groups: {len(snapshot.time_limit_groups_by_id)}")
 
     _append_heading(lines, "Sections")
     for section in sorted(snapshot.sections_by_id.values(), key=lambda item: item.display_id):
@@ -251,6 +451,61 @@ def _summarize_catalog(snapshot: ExportCatalogSnapshot) -> list[str]:
         suffix = f" [{' ; '.join(extras)}]" if extras else ""
         lines.append(f"{pg.display_id:>3}: {pg.name}{suffix}")
 
+    _append_heading(lines, "ARCs")
+    for arc in sorted(snapshot.arcs_by_id.values(), key=lambda item: item.arc_id):
+        extras = []
+        if arc.protocol_name:
+            extras.append(f"protocol={arc.protocol_name}")
+        if arc.enabled is not None:
+            extras.append(f"enabled={'yes' if arc.enabled else 'no'}")
+        if arc.backup:
+            extras.append("backup=yes")
+        if arc.channel_id is not None:
+            channel_label = arc.channel_name or str(arc.channel_id)
+            extras.append(f"channel={channel_label}")
+        if arc.report_time_raw is not None:
+            extras.append(f"report_time={arc.report_time_raw}")
+        if arc.retry_count_raw is not None:
+            extras.append(f"retries={arc.retry_count_raw}")
+        if arc.service_access_name:
+            extras.append(f"service_access={arc.service_access_name}")
+        if arc.ats_class_name:
+            extras.append(f"ats={arc.ats_class_name}")
+        if arc.section_object_ids:
+            extras.append(f"section_ids={arc.section_object_ids}")
+        if arc.comment:
+            extras.append(f"comment={arc.comment!r}")
+        for specific in arc.specific_by_name.values():
+            details = []
+            if specific.endpoints:
+                details.append(f"endpoints={specific.endpoints}")
+            if specific.crypt_key:
+                details.append(f"crypt_key={specific.crypt_key!r}")
+            if specific.delivery_timeout_raw is not None:
+                details.append(f"delivery_timeout={specific.delivery_timeout_raw}")
+            if specific.key_type_raw is not None:
+                details.append(f"key_type={specific.key_type_raw}")
+            if specific.proto_version_raw is not None:
+                details.append(f"proto_version={specific.proto_version_raw}")
+            if details:
+                extras.append(f"{specific.name}({', '.join(details)})")
+        suffix = f" [{' ; '.join(extras)}]" if extras else ""
+        lines.append(f"{arc.arc_id:>3}: ARC{suffix}")
+
+    _append_heading(lines, "Time-Limit Groups")
+    for group in sorted(snapshot.time_limit_groups_by_id.values(), key=lambda item: item.group_display_id):
+        active_days = [day.day_name for day in group.days if day.section_rules]
+        active_sections = sorted({rule.section_id for day in group.days for rule in day.section_rules})
+        extras = []
+        if active_days:
+            extras.append(f"days={','.join(active_days)}")
+        if active_sections:
+            extras.append(f"sections={_compress_ids(active_sections)}")
+        if group.comment:
+            extras.append(f"comment={group.comment!r}")
+        suffix = f" [{' ; '.join(extras)}]" if extras else ""
+        lines.append(f"G{group.group_display_id}: time-limit{suffix}")
+
     _append_heading(lines, "Users")
     for user in snapshot.users:
         fields = [f"slot={user.user_id if user.user_id is not None else '?'}"]
@@ -258,10 +513,21 @@ def _summarize_catalog(snapshot: ExportCatalogSnapshot) -> list[str]:
             fields.append(f"rights={user.rights}")
         if user.enabled is not None:
             fields.append(f"enabled={'yes' if user.enabled else 'no'}")
+        fields.append(f"self_code={_format_allow_code_change(user)}")
+        fields.append(f"log={_format_log_user_actions(user)}")
+        if user.flags:
+            fields.append(f"flags={','.join(user.flags)}")
+        if user.section_ids:
+            fields.append(f"sections={_format_section_access(user, snapshot)}")
+        if user.pg_ids:
+            fields.append(f"pgs={_format_pg_access(user, snapshot)}")
+        if user.time_limited_group_raw:
+            fields.append(f"time_limit={_summarize_time_limit(user, snapshot)}")
         if user.code:
             fields.append(f"code={user.code}")
-        if user.card:
-            fields.append(f"card={user.card}")
+        cards = _format_cards(user)
+        if cards != "-":
+            fields.append(f"cards={cards}")
         if user.phone:
             fields.append(f"phone={user.phone}")
         if user.comment:
@@ -333,13 +599,24 @@ def render_readable_export_report(
 
 
 def cmd_extract_users(args: argparse.Namespace) -> None:
-    records = extract_users(Path(args.export_cfg), dedupe=args.user_mode)
-    emit_records(records, args.format)
+    snapshot = extract_export_catalog(Path(args.export_cfg))
+    records = snapshot.users if args.user_mode == "dedupe" else extract_users(Path(args.export_cfg), dedupe="raw")
+    emit_records(records, args.format, snapshot)
 
 
 def cmd_extract_catalog(args: argparse.Namespace) -> None:
     snapshot = extract_export_catalog(Path(args.export_cfg))
     emit_catalog(snapshot, args.format)
+
+
+def cmd_extract_arcs(args: argparse.Namespace) -> None:
+    snapshot = extract_export_catalog(Path(args.export_cfg))
+    emit_arcs(snapshot, args.format)
+
+
+def cmd_extract_time_limits(args: argparse.Namespace) -> None:
+    snapshot = extract_export_catalog(Path(args.export_cfg))
+    emit_time_limits(snapshot, args.format)
 
 
 def cmd_pull_live(args: argparse.Namespace) -> None:
@@ -362,7 +639,9 @@ def cmd_pull_live(args: argparse.Namespace) -> None:
     print(f"users_raw {len(snapshot.raw_records)}")
     print(f"users_deduped {len(snapshot.records)}")
     if args.extract_users:
-        emit_records(snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records, args.format)
+        catalog = extract_export_catalog(snapshot.path)
+        records = snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records
+        emit_records(records, args.format, catalog)
 
 
 def cmd_dump_text(args: argparse.Namespace) -> None:
@@ -450,6 +729,22 @@ def build_parser() -> argparse.ArgumentParser:
     catalog_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
     catalog_parser.add_argument("--format", choices=["json", "summary"], default="summary")
     catalog_parser.set_defaults(func=cmd_extract_catalog)
+
+    arcs_parser = subparsers.add_parser(
+        "extract-arcs",
+        help="Extract ARC/reporting records from an EXPORT.CFG blob.",
+    )
+    arcs_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
+    arcs_parser.add_argument("--format", choices=["summary", "json"], default="summary")
+    arcs_parser.set_defaults(func=cmd_extract_arcs)
+
+    time_limits_parser = subparsers.add_parser(
+        "extract-time-limits",
+        help="Extract user time-limit groups from an EXPORT.CFG blob.",
+    )
+    time_limits_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
+    time_limits_parser.add_argument("--format", choices=["summary", "json"], default="summary")
+    time_limits_parser.set_defaults(func=cmd_extract_time_limits)
 
     dump_text_parser = subparsers.add_parser(
         "dump-text",

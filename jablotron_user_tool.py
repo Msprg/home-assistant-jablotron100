@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Iterable
 
 from import_cfg_tool import (
+    build_user_record,
     build_user_delete_payload,
     build_user_upsert_payload,
     describe_payload,
@@ -20,35 +21,163 @@ from import_cfg_tool import (
     write_output,
 )
 from jablotron_re_tools import (
-    DEFAULT_ADD_TEMPLATE_FRAME,
-    DEFAULT_ADD_TEMPLATE_PCAP,
     DEFAULT_IMPORT_PATH,
     ExportSnapshot,
+    ExportUserTimeLimitGroup,
     UserRecord,
     apply_import_sector,
     default_export_output,
     default_sector_output,
-    dedupe_user_records,
+    extract_export_catalog,
     extract_users,
     pull_live_export_snapshot,
     resolve_flexi_cfg_device,
 )
 
 
-def print_table(records: Iterable[UserRecord]) -> None:
-    rows = [("ID", "Rights", "Enabled", "Name", "Code", "Phone", "Card", "Comment", "Offset")]
+def _compress_ids(values: Iterable[int]) -> str:
+    numbers = sorted(set(values))
+    if not numbers:
+        return ""
+    ranges: list[str] = []
+    start = numbers[0]
+    end = numbers[0]
+    for value in numbers[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        ranges.append(f"{start}-{end}" if start != end else str(start))
+        start = end = value
+    ranges.append(f"{start}-{end}" if start != end else str(start))
+    return ",".join(ranges)
+
+
+def _format_section_access(record: UserRecord, snapshot: ExportSnapshot, *, show_names: bool) -> str:
+    if not record.section_ids:
+        return "-"
+    if not show_names:
+        return _compress_ids(record.section_ids)
+    parts = []
+    for section_id in record.section_ids:
+        section = snapshot.sections_by_id.get(section_id)
+        parts.append(f"{section_id}:{section.name}" if section is not None else str(section_id))
+    return ",".join(parts)
+
+
+def _format_pg_access(record: UserRecord, snapshot: ExportSnapshot, *, show_names: bool) -> str:
+    if not record.pg_ids:
+        return "-"
+    if not show_names or len(record.pg_ids) > 12:
+        return _compress_ids(record.pg_ids)
+    parts = []
+    for pg_id in record.pg_ids:
+        pg = snapshot.pgs_by_id.get(pg_id - 1)
+        parts.append(f"{pg_id}:{pg.name}" if pg is not None else str(pg_id))
+    return ",".join(parts)
+
+
+def _summarize_time_limit_group(group: ExportUserTimeLimitGroup) -> str:
+    active_days = [day.day_name for day in group.days if day.section_rules]
+    active_sections = sorted(
+        {rule.section_id for day in group.days for rule in day.section_rules}
+    )
+    summary_parts = [f"G{group.group_display_id}"]
+    if active_days:
+        summary_parts.append(",".join(active_days))
+    if active_sections:
+        summary_parts.append(f"S{_compress_ids(active_sections)}")
+    if group.comment:
+        summary_parts.append(group.comment)
+    return " ".join(summary_parts)
+
+
+def _resolve_time_limit_group(record: UserRecord, snapshot: ExportSnapshot) -> ExportUserTimeLimitGroup | None:
+    raw_value = record.time_limited_group_raw
+    if raw_value is None or raw_value <= 0:
+        return None
+    group = snapshot.time_limit_groups_by_id.get(raw_value - 1)
+    if group is not None:
+        return group
+    return snapshot.time_limit_groups_by_id.get(raw_value)
+
+
+def _format_time_limit_binding(record: UserRecord, snapshot: ExportSnapshot) -> str:
+    group = _resolve_time_limit_group(record, snapshot)
+    if group is not None:
+        return _summarize_time_limit_group(group)
+    raw_value = record.time_limited_group_raw
+    if raw_value in (None, 0):
+        return "-"
+    return f"raw:{raw_value}"
+
+
+def _format_cards(record: UserRecord) -> str:
+    cards = [card for card in record.cards if card]
+    return ",".join(cards) if cards else "-"
+
+
+def _allow_code_change(record: UserRecord) -> bool | None:
+    if record.rights in {"coMaster", "coService"}:
+        return True
+    if record.rights == "coUserNoSelfedit":
+        return False
+    if record.rights in {"coNoAccess", "coPanic", "coPGOnly", "coArmOnly", "coUserGuard", "coPCOGuard", "WPPPhone"}:
+        return None
+    if record.access_raw is None:
+        return None
+    return bool(record.access_raw & (1 << 4))
+
+
+def _format_allow_code_change(record: UserRecord) -> str:
+    value = _allow_code_change(record)
+    if value is None:
+        return "-"
+    return "yes" if value else "no"
+
+
+def _log_user_actions(record: UserRecord) -> bool:
+    return "suppress_control_events" not in record.flags
+
+
+def _format_log_user_actions(record: UserRecord) -> str:
+    return "yes" if _log_user_actions(record) else "no"
+
+
+def _record_to_output_dict(record: UserRecord, snapshot: ExportSnapshot, *, show_names: bool) -> dict[str, object]:
+    data = asdict(record)
+    data["cards"] = [card for card in record.cards if card]
+    data["allow_code_change"] = _allow_code_change(record)
+    data["allow_code_change_display"] = _format_allow_code_change(record)
+    data["log_user_actions"] = _log_user_actions(record)
+    data["log_user_actions_display"] = _format_log_user_actions(record)
+    data["sections_display"] = _format_section_access(record, snapshot, show_names=show_names)
+    data["pgs_display"] = _format_pg_access(record, snapshot, show_names=show_names)
+    data["flags_display"] = ",".join(record.flags) if record.flags else "-"
+    data["time_limit_display"] = _format_time_limit_binding(record, snapshot)
+    linked_group = _resolve_time_limit_group(record, snapshot)
+    if linked_group is not None:
+        data["time_limit_group"] = asdict(linked_group)
+    return data
+
+
+def print_table(records: Iterable[UserRecord], snapshot: ExportSnapshot, *, show_names: bool) -> None:
+    rows = [("ID", "Name", "Phone", "Code", "Cards", "Access", "SelfCode", "Log", "TimeLimit", "Sections", "PGs", "Flags", "Comment")]
     for record in records:
         rows.append(
             (
                 "" if record.user_id is None else str(record.user_id),
-                record.rights,
-                "" if record.enabled is None else ("yes" if record.enabled else "no"),
                 record.name,
-                record.code,
                 record.phone,
-                record.card,
+                record.code,
+                _format_cards(record),
+                record.rights,
+                _format_allow_code_change(record),
+                _format_log_user_actions(record),
+                _format_time_limit_binding(record, snapshot),
+                _format_section_access(record, snapshot, show_names=show_names),
+                _format_pg_access(record, snapshot, show_names=show_names),
+                ",".join(record.flags) if record.flags else "-",
                 record.comment,
-                str(record.offset),
             )
         )
     widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
@@ -56,44 +185,57 @@ def print_table(records: Iterable[UserRecord]) -> None:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
 
 
-def print_tsv(records: Iterable[UserRecord]) -> None:
-    print("\t".join(["ID", "Rights", "Enabled", "Name", "Code", "Phone", "Card", "Comment", "Offset"]))
+def print_tsv(records: Iterable[UserRecord], snapshot: ExportSnapshot, *, show_names: bool) -> None:
+    print("\t".join(["ID", "Name", "Phone", "Code", "Cards", "Access", "SelfCode", "Log", "TimeLimit", "Sections", "PGs", "Flags", "Comment"]))
     for record in records:
         print(
             "\t".join(
                 [
                     "" if record.user_id is None else str(record.user_id),
-                    record.rights,
-                    "" if record.enabled is None else ("yes" if record.enabled else "no"),
                     record.name,
-                    record.code,
                     record.phone,
-                    record.card,
+                    record.code,
+                    _format_cards(record),
+                    record.rights,
+                    _format_allow_code_change(record),
+                    _format_log_user_actions(record),
+                    _format_time_limit_binding(record, snapshot),
+                    _format_section_access(record, snapshot, show_names=show_names),
+                    _format_pg_access(record, snapshot, show_names=show_names),
+                    ",".join(record.flags) if record.flags else "-",
                     record.comment,
-                    str(record.offset),
                 ]
             )
         )
 
 
-def emit_records(records: list[UserRecord], fmt: str) -> None:
+def emit_records(records: list[UserRecord], fmt: str, snapshot: ExportSnapshot, *, show_names: bool) -> None:
     if fmt == "json":
-        print(json.dumps([asdict(record) for record in records], indent=2, ensure_ascii=False))
+        print(
+            json.dumps(
+                [_record_to_output_dict(record, snapshot, show_names=show_names) for record in records],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return
     if fmt == "tsv":
-        print_tsv(records)
+        print_tsv(records, snapshot, show_names=show_names)
         return
-    print_table(records)
+    print_table(records, snapshot, show_names=show_names)
 
 
 def load_snapshot_from_file(path: Path) -> ExportSnapshot:
     raw_records = extract_users(path, dedupe="raw")
-    records = dedupe_user_records(raw_records)
+    catalog = extract_export_catalog(path)
     return ExportSnapshot(
         path=path,
         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         raw_records=raw_records,
-        records=records,
+        records=catalog.users,
+        sections_by_id=catalog.sections_by_id,
+        pgs_by_id=catalog.pgs_by_id,
+        time_limit_groups_by_id=catalog.time_limit_groups_by_id,
     )
 
 
@@ -131,58 +273,59 @@ def find_user(snapshot: ExportSnapshot, user_id: int) -> UserRecord:
     raise SystemExit(f"User {user_id} not found in {snapshot.path}.")
 
 
-def resolve_template_args(args: argparse.Namespace, *, allow_default_minimal: bool) -> tuple[str | None, str | None, int | None]:
-    template_file = getattr(args, "template_file", None)
-    template_pcap = getattr(args, "template_pcap", None)
-    template_frame = getattr(args, "template_frame", None)
-
-    if template_pcap and template_frame is None:
-        raise SystemExit("--template-frame is required when using --template-pcap.")
-
-    if template_file or template_pcap:
-        return template_file, template_pcap, template_frame
-
-    if allow_default_minimal:
-        return None, str(DEFAULT_ADD_TEMPLATE_PCAP), DEFAULT_ADD_TEMPLATE_FRAME
-
-    raise SystemExit(
-        "Editing requires a template source for unknown fields. "
-        "Pass --template-file, --template-pcap/--template-frame, or --use-minimal-template for minimal users."
-    )
-
-
 def build_upsert_sector(args: argparse.Namespace, *, current: UserRecord | None) -> tuple[Path, dict[str, object], bool]:
-    allow_default_minimal = args.command == "add" or getattr(args, "use_minimal_template", False)
-    template_file, template_pcap, template_frame = resolve_template_args(args, allow_default_minimal=allow_default_minimal)
-
     name = args.name if args.name is not None else (current.name if current else None)
     phone = args.phone if args.phone is not None else (current.phone if current else None)
     pin = args.pin if args.pin is not None else (current.code if current else None)
     card1 = args.card1 if args.card1 is not None else (current.card if current and current.card else None)
+    card2 = args.card2 if args.card2 is not None else (current.card2 if current and current.card2 else None)
     comment = args.comment if args.comment is not None else (current.comment if current else None)
 
     if name is None:
         raise SystemExit("A user name is required for add/edit upserts.")
 
+    base_user_record = None
+    if current is not None:
+        base_user_record = build_user_record(
+            flags_raw=current.flags_raw or 0,
+            access_raw=current.access_raw or 0,
+            section_access_mask=current.section_access_mask_raw or 0,
+            pg_access_masks=current.pg_access_masks_raw or [0, 0, 0, 0],
+            name=current.name,
+            phone=current.phone,
+            code=current.code,
+            cards=current.cards,
+            pg_num_if_ring_raw=current.pg_num_if_ring_raw or 0,
+            time_limited_group_raw=current.time_limited_group_raw or 0,
+            comment=current.comment,
+            parent_user_no_raw=current.parent_user_no_raw if current.parent_user_no_raw is not None else -1,
+        )
+
     payload_args = SimpleNamespace(
-        template_file=template_file,
-        template_pcap=template_pcap,
-        template_frame=template_frame,
+        base_user_record=base_user_record,
+        template_file=getattr(args, "template_file", None),
+        template_pcap=getattr(args, "template_pcap", None),
+        template_frame=getattr(args, "template_frame", None),
         user_id=args.user_id,
         name=name,
         phone=phone,
         code=pin,
         card1=card1,
-        card2=args.card2,
+        card2=card2,
         comment=comment,
+        flags_raw=args.flags_raw,
         field0_raw=args.field0_raw,
+        access_raw=args.access_raw,
         permissions_raw=args.permissions_raw,
         sections_mask=args.sections_mask,
         sections=args.sections,
         pg_masks=args.pg_masks,
         pgs=args.pgs,
+        pg_num_if_ring_raw=args.pg_num_if_ring_raw,
         field8_raw=args.field8_raw,
+        time_limited_group_raw=args.time_limited_group_raw,
         field9_raw=args.field9_raw,
+        parent_user_no_raw=args.parent_user_no_raw,
         field11_raw=args.field11_raw,
     )
     payload = build_user_upsert_payload(payload_args)
@@ -207,7 +350,7 @@ def emit_verify_result(snapshot: ExportSnapshot, *, user_id: int | None, fmt: st
     records = snapshot.records
     if user_id is not None:
         records = [record for record in records if record.user_id == user_id]
-    emit_records(records, fmt)
+    emit_records(records, fmt, snapshot, show_names=False)
 
 
 def maybe_cleanup(path: Path, *, cleanup: bool) -> None:
@@ -232,6 +375,11 @@ def add_live_read_arguments(parser: argparse.ArgumentParser) -> None:
     add_live_session_arguments(parser)
     add_verbose_argument(parser)
     parser.add_argument("--no-trigger", action="store_true", help="Skip the HID export trigger before the block read.")
+    parser.add_argument(
+        "--show-access-names",
+        action="store_true",
+        help="Expand section and PG columns from compact IDs/ranges to ID:name labels.",
+    )
 
 
 def add_live_session_arguments(parser: argparse.ArgumentParser) -> None:
@@ -289,14 +437,19 @@ def add_upsert_field_arguments(parser: argparse.ArgumentParser, *, require_name:
     parser.add_argument("--card1", help="Primary access-card decimal string.")
     parser.add_argument("--card2", help="Secondary access-card decimal string.")
     parser.add_argument("--comment", help="Comment field.")
+    parser.add_argument("--flags-raw", type=int, help="Raw cfg_user_t.flags value.")
     parser.add_argument("--field0-raw", type=int, help="Raw field 0 value.")
+    parser.add_argument("--access-raw", type=int, help="Raw cfg_user_t.access value.")
     parser.add_argument("--permissions-raw", type=int, help="Raw field 1 value.")
-    parser.add_argument("--sections-mask", type=int, help="Raw field 2 bitmask.")
+    parser.add_argument("--sections-mask", type=int, help="Raw cfg_user_t.section_access bitmask.")
     parser.add_argument("--sections", help="Comma-separated 1-based section numbers to encode into field 2.")
     parser.add_argument("--pg-masks", help="Comma-separated raw PG masks for field 3 (exactly four integers).")
-    parser.add_argument("--pgs", help="Comma-separated 1-based PG numbers to encode into the four 16-bit masks.")
+    parser.add_argument("--pgs", help="Comma-separated 1-based PG numbers to encode into the four 32-bit masks.")
+    parser.add_argument("--pg-num-if-ring-raw", type=int, help="Raw cfg_user_t.pg_num_if_ring value.")
     parser.add_argument("--field8-raw", type=int, help="Raw field 8 value.")
+    parser.add_argument("--time-limited-group-raw", type=int, help="Raw cfg_user_t.time_limited_group value.")
     parser.add_argument("--field9-raw", type=int, help="Raw field 9 value.")
+    parser.add_argument("--parent-user-no-raw", type=int, help="Raw cfg_user_t.parent_user_no value.")
     parser.add_argument("--field11-raw", type=int, help="Raw field 11 value.")
     parser.add_argument("--template-file", help="Use an existing encoded sector as the template for unknown fields.")
     parser.add_argument("--template-pcap", help="Use a pcap frame as the template source.")
@@ -319,7 +472,12 @@ def cmd_pull_export(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     snapshot = load_snapshot(args, prefix="user-tool-list")
     print_snapshot_summary(snapshot, device=None if args.export_cfg else args.device)
-    emit_records(snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records, args.format)
+    emit_records(
+        snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records,
+        args.format,
+        snapshot,
+        show_names=args.show_access_names,
+    )
 
 
 def cmd_get(args: argparse.Namespace) -> None:
@@ -329,7 +487,7 @@ def cmd_get(args: argparse.Namespace) -> None:
     records = [record for record in records if record.user_id == args.user_id]
     if not records:
         raise SystemExit(f"User {args.user_id} not found.")
-    emit_records(records, args.format)
+    emit_records(records, args.format, snapshot, show_names=args.show_access_names)
 
 
 def cmd_add(args: argparse.Namespace) -> None:
@@ -421,7 +579,7 @@ def cmd_delete(args: argparse.Namespace) -> None:
         print_snapshot_summary(snapshot, device=args.device)
         records = [record for record in snapshot.records if record.user_id == args.user_id]
         if records:
-            emit_records(records, args.format)
+            emit_records(records, args.format, snapshot, show_names=False)
         else:
             print(f"user {args.user_id} absent after delete")
     finally:
@@ -471,11 +629,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_upsert_field_arguments(edit_parser, require_name=False)
     add_live_read_arguments(edit_parser)
     add_live_apply_arguments(edit_parser)
-    edit_parser.add_argument(
-        "--use-minimal-template",
-        action="store_true",
-        help="Use the known minimal add template when no explicit template source is provided.",
-    )
     edit_parser.add_argument("--format", choices=["table", "tsv", "json"], default="table")
     edit_parser.set_defaults(func=cmd_edit)
 

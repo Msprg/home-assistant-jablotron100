@@ -51,21 +51,117 @@ SETUP_MODE_NUDGE_DELAY = 0.35
 SETUP_MODE_FIRST_KEEPALIVE_DELAY = 0.7
 SETUP_MODE_KEEPALIVE_INTERVAL = 1.0
 
+ARC_PROTOCOL_NAMES = {
+    0: "ARC_PROTO_NONE",
+    1: "ARC_PROTO_SIA_IP",
+    4: "ARC_PROTO_SIA_CID",
+    5: "ARC_PROTO_SIA_FSK",
+    6: "ARC_PROTO_JABLO_IP",
+    7: "ARC_PROTO_JABLO_SMS",
+    9: "ARC_PROTO_IMG",
+    10: "ARC_PROTO_DEVICE",
+}
+
+ARC_SPECIFIC_NAMES = {
+    0: "sia_ip",
+    1: "sia_cid",
+    2: "sia_fsk",
+    3: "jablo_ip",
+    4: "jablo_sms",
+    5: "jablo_img",
+    6: "device",
+}
+
+ARC_SERVICE_ACCESS_NAMES = {
+    0: "ARC_ACCESS_FULL",
+    1: "ARC_ACCESS_OFF",
+    2: "ARC_ACCESS_READ",
+}
+
+ARC_ATS_CLASS_NAMES = {
+    0: "ARC_ATS_NONE",
+    1: "ARC_ATS_SP2",
+    2: "ARC_ATS_SP3",
+    3: "ARC_ATS_SP4",
+    4: "ARC_ATS_SP5",
+    5: "ARC_ATS_DP2",
+    6: "ARC_ATS_DP3",
+}
+
+USER_FLAG_NAMES = {
+    0: "blocked",
+    1: "suppress_control_events",
+    2: "pg_ring_controlled",
+}
+
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
 
 @dataclass(frozen=True)
 class UserRecord:
     offset: int
     user_id: Optional[int]
     raw_id_bytes: str
-    status_raw: Optional[int]
-    permissions_raw: Optional[int]
+    flags_raw: Optional[int]
+    flags: list[str]
+    access_raw: Optional[int]
     rights: str
     enabled: Optional[bool]
+    section_access_mask_raw: Optional[int]
+    section_ids: list[int]
+    pg_access_masks_raw: list[int]
+    pg_ids: list[int]
     name: str
     phone: str
     code: str
-    card: str
+    cards: list[str]
     comment: str
+    pg_num_if_ring_raw: Optional[int]
+    time_limited_group_raw: Optional[int]
+    parent_user_no_raw: Optional[int]
+
+    @property
+    def card(self) -> str:
+        return self.cards[0] if self.cards else ""
+
+    @property
+    def card2(self) -> str:
+        return self.cards[1] if len(self.cards) > 1 else ""
+
+    @property
+    def permissions_raw(self) -> Optional[int]:
+        return self.access_raw
+
+    @property
+    def status_raw(self) -> Optional[int]:
+        return self.flags_raw
+
+
+@dataclass(frozen=True)
+class ExportUserTimeLimitWindow:
+    on: str
+    off: str
+
+
+@dataclass(frozen=True)
+class ExportUserTimeLimitSectionRule:
+    section_id: int
+    windows: list[ExportUserTimeLimitWindow]
+
+
+@dataclass(frozen=True)
+class ExportUserTimeLimitDay:
+    day_index: int
+    day_name: str
+    section_rules: list[ExportUserTimeLimitSectionRule]
+
+
+@dataclass(frozen=True)
+class ExportUserTimeLimitGroup:
+    group_id: int
+    group_display_id: int
+    comment: str
+    days: list[ExportUserTimeLimitDay]
 
 
 @dataclass(frozen=True)
@@ -74,6 +170,9 @@ class ExportSnapshot:
     sha256: str
     raw_records: list[UserRecord]
     records: list[UserRecord]
+    sections_by_id: dict[int, "ExportSectionRecord"]
+    pgs_by_id: dict[int, "ExportPGRecord"]
+    time_limit_groups_by_id: dict[int, ExportUserTimeLimitGroup]
 
 
 @dataclass(frozen=True)
@@ -122,6 +221,48 @@ class ExportPGRecord:
 
 
 @dataclass(frozen=True)
+class ExportArcSpecificRecord:
+    name: str
+    endpoints: list[str]
+    crypt_key: str
+    token_type_raw: int | None
+    key_type_raw: int | None
+    prefix_raw: int | None
+    backward_compatibility: bool | None
+    text_sync_enable: bool | None
+    proto_version_raw: int | None
+    delivery_timeout_raw: int | None
+    disable_sms: bool | None
+    limiter_soft_raw: int | None
+    limiter_hard_raw: int | None
+
+
+@dataclass(frozen=True)
+class ExportARCRecord:
+    arc_id: int
+    protocol_type_raw: int | None
+    protocol_name: str
+    enabled: bool | None
+    contest_in_fixed_time: bool | None
+    backup: bool | None
+    backup_test_reports: bool | None
+    section_object_ids: list[int]
+    err_wait_time_raw: int | None
+    report_time_raw: int | None
+    report_time_backup_raw: int | None
+    retry_count_raw: int | None
+    time_out_raw: int | None
+    channel_id: int | None
+    channel_name: str
+    comment: str
+    ats_class_raw: int | None
+    ats_class_name: str
+    service_access_raw: int | None
+    service_access_name: str
+    specific_by_name: dict[str, ExportArcSpecificRecord]
+
+
+@dataclass(frozen=True)
 class ExportCatalogSnapshot:
     path: Path
     users: list[UserRecord]
@@ -129,6 +270,8 @@ class ExportCatalogSnapshot:
     objects_by_id: dict[int, ExportObjectRecord]
     hardware_by_id: dict[int, ExportHardwareRecord]
     pgs_by_id: dict[int, ExportPGRecord]
+    arcs_by_id: dict[int, ExportARCRecord]
+    time_limit_groups_by_id: dict[int, ExportUserTimeLimitGroup]
 
     @property
     def communicators_by_id(self) -> dict[int, ExportObjectRecord]:
@@ -201,25 +344,24 @@ def default_sector_output(prefix: str) -> Path:
     return Path("/tmp") / f"{timestamp}_{prefix}_IMPORT-sector.bin"
 
 
-def find_record_starts(blob: bytes) -> list[int]:
-    starts: list[int] = []
-    for offset in range(len(blob) - 4):
-        if blob[offset : offset + 2] != b"\x07\x81":
-            continue
-        if b"\x04" not in blob[offset : offset + 96]:
-            continue
-        if starts and offset - starts[-1] <= 32:
-            continue
-        starts.append(offset)
-    return starts
-
-
 def decode_user_id(id_bytes: bytes) -> Optional[int]:
     if len(id_bytes) == 1:
         return id_bytes[0]
     if len(id_bytes) == 3 and id_bytes[:2] == b"\xcd\x02":
         return 0x200 + id_bytes[2]
     return None
+
+
+def encode_msgpack_int_hex(value: int) -> str:
+    if 0 <= value <= 0x7F:
+        return f"{value:02x}"
+    if 0 <= value <= 0xFF:
+        return "cc" + f"{value:02x}"
+    if 0 <= value <= 0xFFFF:
+        return "cd" + value.to_bytes(2, "big").hex()
+    if 0 <= value <= 0xFFFFFFFF:
+        return "ce" + value.to_bytes(4, "big").hex()
+    return f"{value:x}"
 
 
 def decode_msgpack_string(data: bytes, start: int) -> str:
@@ -344,20 +486,108 @@ def value_as_string(value: object | None) -> str:
     return value if isinstance(value, str) else ""
 
 
+def value_as_bool(value: object | None) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
+
+
 def value_as_int(value: object | None) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
     return value if isinstance(value, int) else None
 
 
+def collect_nested_strings(value: object | None) -> list[str]:
+    strings: list[str] = []
+
+    def visit(node: object | None) -> None:
+        if isinstance(node, str):
+            if node:
+                strings.append(node)
+            return
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if isinstance(node, dict):
+            for item in node.values():
+                visit(item)
+
+    visit(value)
+    return strings
+
+
 def parse_card_value(value: object | None) -> str:
+    cards = parse_card_values(value)
+    return cards[0] if cards else ""
+
+
+def parse_card_values(value: object | None) -> list[str]:
     if not isinstance(value, list):
-        return ""
+        return []
+    cards: list[str] = []
     for entry in value:
         if not isinstance(entry, dict):
             continue
         card = entry.get(0)
-        if isinstance(card, str) and card:
-            return card
-    return ""
+        if isinstance(card, str):
+            cards.append(card)
+        else:
+            cards.append("")
+    while cards and not cards[-1]:
+        cards.pop()
+    return cards
+
+
+def decode_bitmask_ids(mask: int | None, *, bits: int, first_id: int = 1) -> list[int]:
+    if mask is None:
+        return []
+    return [first_id + bit for bit in range(bits) if mask & (1 << bit)]
+
+
+def decode_pg_ids(pg_masks: object | None) -> tuple[list[int], list[int]]:
+    if not isinstance(pg_masks, list):
+        return [], []
+    raw_masks = [value_as_int(item) or 0 for item in pg_masks]
+    ids: list[int] = []
+    for group_index, mask in enumerate(raw_masks):
+        for bit in range(32):
+            if mask & (1 << bit):
+                ids.append(group_index * 32 + bit + 1)
+    return raw_masks, ids
+
+
+def decode_user_flags(flags_raw: int | None) -> list[str]:
+    if flags_raw is None:
+        return []
+    names: list[str] = []
+    bit = 0
+    remaining = flags_raw
+    while remaining:
+        if remaining & 1:
+            names.append(USER_FLAG_NAMES.get(bit, f"bit{bit}"))
+        remaining >>= 1
+        bit += 1
+    return names
+
+
+def decode_user_enabled(flags_raw: int | None) -> Optional[bool]:
+    if flags_raw is None:
+        return None
+    return not bool(flags_raw & 0x1)
+
+
+def decode_pg_num(value: object | None) -> Optional[int]:
+    raw_value = value_as_int(value)
+    if raw_value is None or raw_value <= 0 or raw_value > 128:
+        return None
+    return raw_value
+
+
+def decode_parent_user_no(value: object | None) -> Optional[int]:
+    raw_value = value_as_int(value)
+    if raw_value is None or raw_value < 0:
+        return None
+    return raw_value
 
 
 def decode_rights_name(
@@ -403,59 +633,113 @@ def dedupe_user_records(records: Iterable[UserRecord]) -> list[UserRecord]:
     return deduped
 
 
+def _iter_export_collection_hits(
+    blob: bytes,
+    *,
+    collection_id: int,
+    expected_keys: set[int] | None = None,
+) -> list[tuple[int, int, dict[object, object | None]]]:
+    pattern = bytes([collection_id, 0x81])
+    hits: list[tuple[int, int, dict[object, object | None]]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def maybe_store(offset: int, item_id: object | None, fields: object | None) -> None:
+        if not isinstance(item_id, int) or not isinstance(fields, dict):
+            return
+        if expected_keys is not None and set(fields.keys()) != expected_keys:
+            return
+        key = (offset, item_id)
+        if key in seen:
+            return
+        seen.add(key)
+        hits.append((offset, item_id, fields))
+
+    try:
+        leading_value, cursor = decode_msgpack_value(blob, 0)
+        leading_record, _next = decode_msgpack_value(blob, cursor)
+    except Exception:
+        leading_value = None
+        leading_record = None
+    if collection_id == 0x06 and isinstance(leading_value, int):
+        maybe_store(0, leading_value, leading_record)
+    elif isinstance(leading_value, int) and leading_value == collection_id:
+        if isinstance(leading_record, dict) and len(leading_record) == 1:
+            item_id, fields = next(iter(leading_record.items()))
+            maybe_store(0, item_id, fields)
+
+    offset = 0
+    while True:
+        offset = blob.find(pattern, offset)
+        if offset == -1:
+            break
+        try:
+            parsed_collection_id, cursor = decode_msgpack_value(blob, offset)
+            record, _next = decode_msgpack_value(blob, cursor)
+        except Exception:
+            offset += 1
+            continue
+        if parsed_collection_id != collection_id or not isinstance(record, dict) or len(record) != 1:
+            offset += 1
+            continue
+        item_id, fields = next(iter(record.items()))
+        maybe_store(offset, item_id, fields)
+        offset += 1
+
+    return hits
+
+
 def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
     blob = invert_blob(path.read_bytes())
-    starts = find_record_starts(blob)
+    hits = _iter_export_collection_hits(blob, collection_id=0x07, expected_keys=set(range(12)))
     users: list[UserRecord] = []
-    for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else min(len(blob), start + 256)
-        record = blob[start:end]
-
-        cursor = 2
-        id_bytes = bytearray()
-        while cursor < len(record) and record[cursor] != 0x8C and len(id_bytes) < 4:
-            id_bytes.append(record[cursor])
-            cursor += 1
-        if cursor >= len(record) or record[cursor] != 0x8C:
-            continue
-
-        field_map_value, _next = decode_msgpack_value(record, cursor)
-        if not isinstance(field_map_value, dict):
-            continue
-
-        status_raw = value_as_int(field_map_value.get(0))
-        permissions_raw = value_as_int(field_map_value.get(1))
+    for offset, item_id, field_map_value in hits:
         name = value_as_string(field_map_value.get(4))
         if not name:
             continue
 
-        user_id = decode_user_id(bytes(id_bytes))
+        user_id = item_id
         phone = value_as_string(field_map_value.get(5))
         code = value_as_string(field_map_value.get(6))
-        card = parse_card_value(field_map_value.get(7))
+        cards = parse_card_values(field_map_value.get(7))
         comment = value_as_string(field_map_value.get(10))
+        flags_raw = value_as_int(field_map_value.get(0))
+        access_raw = value_as_int(field_map_value.get(1))
+        section_access_mask_raw = value_as_int(field_map_value.get(2))
+        section_ids = decode_bitmask_ids(section_access_mask_raw, bits=15, first_id=1)
+        pg_access_masks_raw, pg_ids = decode_pg_ids(field_map_value.get(3))
+        pg_num_if_ring_raw = value_as_int(field_map_value.get(8))
+        time_limited_group_raw = value_as_int(field_map_value.get(9))
+        parent_user_no_raw = decode_parent_user_no(field_map_value.get(11))
 
         users.append(
             UserRecord(
-                offset=start,
+                offset=offset,
                 user_id=user_id,
-                raw_id_bytes=bytes(id_bytes).hex(),
-                status_raw=status_raw,
-                permissions_raw=permissions_raw,
+                raw_id_bytes=encode_msgpack_int_hex(item_id),
+                flags_raw=flags_raw,
+                flags=decode_user_flags(flags_raw),
+                access_raw=access_raw,
                 rights=decode_rights_name(
-                    permissions_raw,
+                    access_raw,
                     user_id=user_id,
                     name=name,
                     phone=phone,
                     code=code,
-                    card=card,
+                    card=cards[0] if cards else "",
                 ),
-                enabled=None if status_raw is None else status_raw != 1,
+                enabled=decode_user_enabled(flags_raw),
+                section_access_mask_raw=section_access_mask_raw,
+                section_ids=section_ids,
+                pg_access_masks_raw=pg_access_masks_raw,
+                pg_ids=pg_ids,
                 name=name,
                 phone=phone,
                 code=code,
-                card=card,
+                cards=cards,
                 comment=comment,
+                pg_num_if_ring_raw=pg_num_if_ring_raw,
+                time_limited_group_raw=time_limited_group_raw,
+                parent_user_no_raw=parent_user_no_raw,
             )
         )
 
@@ -476,42 +760,155 @@ def _extract_export_collection_records(
     collection_id: int,
     expected_keys: set[int],
 ) -> dict[int, dict[object, object | None]]:
-    pattern = bytes([collection_id, 0x81])
     records: dict[int, dict[object, object | None]] = {}
-
-    try:
-        leading_item_id, cursor = decode_msgpack_value(blob, 0)
-        leading_fields, _next = decode_msgpack_value(blob, cursor)
-    except Exception:
-        leading_item_id = None
-        leading_fields = None
-    if isinstance(leading_item_id, int) and isinstance(leading_fields, dict) and set(leading_fields.keys()) == expected_keys:
-        records[leading_item_id] = leading_fields
-
-    offset = 0
-    while True:
-        offset = blob.find(pattern, offset)
-        if offset == -1:
-            break
-        offset += 1
-        try:
-            record_value, _next = decode_msgpack_value(blob, offset)
-        except Exception:
-            continue
-        if not isinstance(record_value, dict) or len(record_value) != 1:
-            continue
-        item_id, fields = next(iter(record_value.items()))
-        if not isinstance(item_id, int) or not isinstance(fields, dict):
-            continue
-        if set(fields.keys()) != expected_keys or item_id in records:
+    for _offset, item_id, fields in _iter_export_collection_hits(
+        blob,
+        collection_id=collection_id,
+        expected_keys=expected_keys,
+    ):
+        if item_id in records:
             continue
         records[item_id] = fields
     return records
 
 
+def decode_time_value(value: object | None) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    minute = value_as_int(value.get(0))
+    hour = value_as_int(value.get(1))
+    if minute is None or hour is None:
+        return None
+    if hour == 99 and minute == 99:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _decode_time_limit_day(day_index: int, value: object | None) -> ExportUserTimeLimitDay:
+    section_rules: list[ExportUserTimeLimitSectionRule] = []
+    if isinstance(value, dict):
+        on1_values = value.get(0)
+        off1_values = value.get(1)
+        on2_values = value.get(2)
+        off2_values = value.get(3)
+        for section_bit in range(15):
+            windows: list[ExportUserTimeLimitWindow] = []
+            on1 = decode_time_value(on1_values[section_bit] if isinstance(on1_values, list) and section_bit < len(on1_values) else None)
+            off1 = decode_time_value(off1_values[section_bit] if isinstance(off1_values, list) and section_bit < len(off1_values) else None)
+            on2 = decode_time_value(on2_values[section_bit] if isinstance(on2_values, list) and section_bit < len(on2_values) else None)
+            off2 = decode_time_value(off2_values[section_bit] if isinstance(off2_values, list) and section_bit < len(off2_values) else None)
+            if on1 or off1:
+                windows.append(ExportUserTimeLimitWindow(on=on1 or "?", off=off1 or "?"))
+            if on2 or off2:
+                windows.append(ExportUserTimeLimitWindow(on=on2 or "?", off=off2 or "?"))
+            if windows:
+                section_rules.append(ExportUserTimeLimitSectionRule(section_id=section_bit + 1, windows=windows))
+    return ExportUserTimeLimitDay(
+        day_index=day_index,
+        day_name=WEEKDAY_NAMES[day_index],
+        section_rules=section_rules,
+    )
+
+
+def extract_users_time_limits(path: Path) -> dict[int, ExportUserTimeLimitGroup]:
+    blob = read_decoded_export_blob(path)
+    fields_by_group = _extract_export_collection_records(blob, collection_id=0x08, expected_keys={0, 1})
+    groups_by_id: dict[int, ExportUserTimeLimitGroup] = {}
+    for group_id, fields in fields_by_group.items():
+        day_values = fields.get(0)
+        days = [
+            _decode_time_limit_day(day_index, day_values[day_index] if isinstance(day_values, list) and day_index < len(day_values) else None)
+            for day_index in range(7)
+        ]
+        groups_by_id[group_id] = ExportUserTimeLimitGroup(
+            group_id=group_id,
+            group_display_id=group_id + 1,
+            comment=value_as_string(fields.get(1)),
+            days=days,
+        )
+    return groups_by_id
+
+
+def _has_meaningful_arc_specific_data(fields: dict[object, object | None]) -> bool:
+    for value in fields.values():
+        if isinstance(value, str) and value:
+            return True
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, int) and value != 0:
+            return True
+        if collect_nested_strings(value):
+            return True
+    return False
+
+
+def _parse_arc_specific_record(index: int, fields: dict[object, object | None]) -> ExportArcSpecificRecord | None:
+    name = ARC_SPECIFIC_NAMES.get(index, f"specific_{index}")
+    endpoints: list[str] = []
+    crypt_key = ""
+    token_type_raw = None
+    key_type_raw = None
+    prefix_raw = None
+    backward_compatibility = None
+    text_sync_enable = None
+    proto_version_raw = None
+    delivery_timeout_raw = None
+    disable_sms = None
+    limiter_soft_raw = None
+    limiter_hard_raw = None
+
+    if index == 0:
+        endpoints = collect_nested_strings(fields.get(0))
+        token_type_raw = value_as_int(fields.get(1))
+        key_type_raw = value_as_int(fields.get(7))
+        prefix_raw = value_as_int(fields.get(8))
+        crypt_key = value_as_string(fields.get(9)).strip()
+    elif index in {1, 2}:
+        endpoints = collect_nested_strings(fields.get(0)) + collect_nested_strings(fields.get(1))
+    elif index == 3:
+        endpoints = collect_nested_strings(fields.get(0))
+        backward_compatibility = value_as_bool(fields.get(1))
+        text_sync_enable = value_as_bool(fields.get(2))
+        proto_version_raw = value_as_int(fields.get(4))
+        crypt_key = value_as_string(fields.get(5)).strip()
+    elif index == 4:
+        endpoints = collect_nested_strings(fields.get(0))
+        delivery_timeout_raw = value_as_int(fields.get(1))
+    elif index == 5:
+        endpoints = collect_nested_strings(fields.get(0))
+        disable_sms = value_as_bool(fields.get(1))
+        proto_version_raw = value_as_int(fields.get(2))
+        crypt_key = value_as_string(fields.get(3)).strip()
+        limiter_soft_raw = value_as_int(fields.get(4))
+        limiter_hard_raw = value_as_int(fields.get(5))
+    elif index == 6:
+        delivery_timeout_raw = value_as_int(fields.get(0))
+
+    record = ExportArcSpecificRecord(
+        name=name,
+        endpoints=endpoints,
+        crypt_key=crypt_key,
+        token_type_raw=token_type_raw,
+        key_type_raw=key_type_raw,
+        prefix_raw=prefix_raw,
+        backward_compatibility=backward_compatibility,
+        text_sync_enable=text_sync_enable,
+        proto_version_raw=proto_version_raw,
+        delivery_timeout_raw=delivery_timeout_raw,
+        disable_sms=disable_sms,
+        limiter_soft_raw=limiter_soft_raw,
+        limiter_hard_raw=limiter_hard_raw,
+    )
+
+    if _has_meaningful_arc_specific_data(fields):
+        return record
+    return None
+
+
 def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
     blob = read_decoded_export_blob(path)
     users = extract_users(path, dedupe="dedupe")
+    time_limit_groups_by_id = extract_users_time_limits(path)
 
     section_fields = _extract_export_collection_records(blob, collection_id=0x06, expected_keys={0, 1, 2, 3, 4})
     object_fields = _extract_export_collection_records(blob, collection_id=0x09, expected_keys={0, 1, 2, 3, 4, 5, 6, 7})
@@ -521,6 +918,11 @@ def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
         collection_id=0x0C,
         expected_keys=set(range(18)),
     )
+    arc_fields = _extract_export_collection_records(
+        blob,
+        collection_id=0x11,
+        expected_keys=set(range(16)),
+    )
 
     sections_by_id: dict[int, ExportSectionRecord] = {}
     for section_id, fields in section_fields.items():
@@ -529,7 +931,7 @@ def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
             continue
         sections_by_id[section_id] = ExportSectionRecord(
             section_id=section_id,
-            display_id=section_id + 1,
+            display_id=section_id,
             name=name,
             flags_raw=value_as_int(fields.get(1)),
             options_raw=value_as_int(fields.get(2)),
@@ -597,6 +999,65 @@ def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
             comment=value_as_string(fields.get(17)),
         )
 
+    arcs_by_id: dict[int, ExportARCRecord] = {}
+    for arc_id, fields in arc_fields.items():
+        protocol_type_raw = value_as_int(fields.get(0))
+        channel_id = value_as_int(fields.get(11))
+        channel_name = ""
+        if channel_id == 0:
+            channel_name = "automatic"
+        elif channel_id is not None and channel_id in objects_by_id:
+            channel_name = objects_by_id[channel_id].name
+        ats_class_raw = value_as_int(fields.get(14))
+        service_access_raw = value_as_int(fields.get(15))
+
+        specific_by_name: dict[str, ExportArcSpecificRecord] = {}
+        specific_value = fields.get(13)
+        if isinstance(specific_value, dict):
+            for index, specific_fields in specific_value.items():
+                if not isinstance(index, int) or not isinstance(specific_fields, dict):
+                    continue
+                specific_record = _parse_arc_specific_record(index, specific_fields)
+                if specific_record is None:
+                    continue
+                specific_by_name[specific_record.name] = specific_record
+
+        section_object_ids = []
+        object_ids_value = fields.get(5)
+        if isinstance(object_ids_value, list):
+            for item in object_ids_value:
+                object_id = value_as_int(item)
+                if object_id is None:
+                    continue
+                section_object_ids.append(object_id)
+
+        arcs_by_id[arc_id] = ExportARCRecord(
+            arc_id=arc_id,
+            protocol_type_raw=protocol_type_raw,
+            protocol_name=ARC_PROTOCOL_NAMES.get(
+                protocol_type_raw,
+                "" if protocol_type_raw is None else f"ARC_PROTO_{protocol_type_raw}",
+            ),
+            enabled=value_as_bool(fields.get(1)),
+            contest_in_fixed_time=value_as_bool(fields.get(2)),
+            backup=value_as_bool(fields.get(3)),
+            backup_test_reports=value_as_bool(fields.get(4)),
+            section_object_ids=section_object_ids,
+            err_wait_time_raw=value_as_int(fields.get(6)),
+            report_time_raw=value_as_int(fields.get(7)),
+            report_time_backup_raw=value_as_int(fields.get(8)),
+            retry_count_raw=value_as_int(fields.get(9)),
+            time_out_raw=value_as_int(fields.get(10)),
+            channel_id=channel_id,
+            channel_name=channel_name,
+            comment=value_as_string(fields.get(12)),
+            ats_class_raw=ats_class_raw,
+            ats_class_name=ARC_ATS_CLASS_NAMES.get(ats_class_raw, ""),
+            service_access_raw=service_access_raw,
+            service_access_name=ARC_SERVICE_ACCESS_NAMES.get(service_access_raw, ""),
+            specific_by_name=specific_by_name,
+        )
+
     return ExportCatalogSnapshot(
         path=path,
         users=users,
@@ -604,6 +1065,8 @@ def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
         objects_by_id=objects_by_id,
         hardware_by_id=hardware_by_id,
         pgs_by_id=pgs_by_id,
+        arcs_by_id=arcs_by_id,
+        time_limit_groups_by_id=time_limit_groups_by_id,
     )
 
 
@@ -861,8 +1324,17 @@ def pull_live_export_snapshot(
             )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     raw_records = extract_users(output, dedupe="raw")
-    records = dedupe_user_records(raw_records)
-    return ExportSnapshot(path=output, sha256=digest, raw_records=raw_records, records=records)
+    catalog = extract_export_catalog(output)
+    records = catalog.users
+    return ExportSnapshot(
+        path=output,
+        sha256=digest,
+        raw_records=raw_records,
+        records=records,
+        sections_by_id=catalog.sections_by_id,
+        pgs_by_id=catalog.pgs_by_id,
+        time_limit_groups_by_id=catalog.time_limit_groups_by_id,
+    )
 
 
 def run_command(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -95,9 +95,15 @@ EVENT_TEXT_BY_CODE = {
 }
 CHANNEL_ALIAS_MAP = {
     "0": "0: Ústredňa",
+    "arc1": "ARC 1",
     "arc 1": "ARC 1",
     "gsm": "GSM",
     "inet_a": "Server",
+    "inet_b": "Server",
+    "ineta": "Server",
+    "inetb": "Server",
+    "lan": "LAN",
+    "pstn": "PSTN",
     "server": "Server",
     "sms": "SMS",
     "usb": "USB",
@@ -108,41 +114,6 @@ PG_ON_MIN_CODE = 51
 PG_ON_MAX_CODE = 82
 PG_OFF_MIN_CODE = 83
 PG_OFF_MAX_CODE = 114
-
-EXACT_EVENT_TEXT_ALIASES = {
-    "autorizaciaok": "Autorizácia OK",
-    "autorizciaok": "Autorizácia OK",
-    "kontrolnyprenosnapco1": "Kontrolný prenos na PCO 1",
-    "neplatnaautorizace": "Neplatná autorizace",
-    "spojenienadviazane": "Spojenie nadviazané",
-    "spojenieukoncene": "Spojenie ukončené",
-    "vstupdorezimuservis": "Vstup do režimu servis",
-    "zapnutaochrana": "Zapnutá ochrana",
-    "vypnutaochrana": "Vypnutá ochrana",
-}
-EXACT_CHANNEL_ALIASES = {
-    "0": "0: Ústredňa",
-    "arc1": "ARC 1",
-    "gsm": "GSM",
-    "ineta": "Server",
-    "inetb": "Server",
-    "lan": "LAN",
-    "pstn": "PSTN",
-    "server": "Server",
-    "sms": "SMS",
-    "usb": "USB",
-}
-EXACT_SOURCE_ALIASES = {
-    "arc": "ARC",
-    "arc1": "ARC1",
-    "homeassistant": "HomeAssistant",
-    "kalendar": "Kalendár",
-    "kalendr": "Kalendár",
-    "pco1": "PCO 1",
-    "pcoq": "PCO 1",
-    "ustredna": "Ústredňa",
-}
-
 
 @dataclass(frozen=True)
 class LogPoint:
@@ -490,10 +461,6 @@ def titlecase_words(value: str) -> str:
     return " ".join(words)
 
 
-def resolve_exact_alias(value: str, aliases: dict[str, str]) -> str | None:
-    return aliases.get(simplify_match_text(value))
-
-
 def text_quality_key(value: str) -> tuple[int, int, int, int]:
     simplified = simplify_match_text(value)
     return (
@@ -558,6 +525,40 @@ def repair_event_line_structure(text: str) -> str:
     return repaired
 
 
+def normalize_route_suffix(value: str) -> str:
+    return value.upper().translate(COMPACT_NUMERIC_TRANSLATION)
+
+
+def normalize_channel_route_name(value: str) -> str | None:
+    simplified = simplify_match_text(value)
+    if not simplified:
+        return None
+    return CHANNEL_ALIAS_MAP.get(simplified) or CHANNEL_ALIAS_MAP.get(value.lower())
+
+
+def normalize_source_route_name(value: str) -> str | None:
+    simplified = simplify_match_text(value)
+    if not simplified:
+        return None
+    if simplified == "ustredna":
+        return "Ústredňa"
+    if simplified in {"kalendar", "kalendr"}:
+        return "Kalendár"
+    if simplified == "homeassistant":
+        return "HomeAssistant"
+    if simplified == "arc":
+        return "ARC"
+    if simplified.startswith("arc") and len(simplified) > 3:
+        suffix = normalize_route_suffix(simplified[3:])
+        if suffix.isdigit():
+            return f"ARC{suffix}"
+    if simplified.startswith("pco") and len(simplified) > 3:
+        suffix = normalize_route_suffix(simplified[3:])
+        if suffix.isdigit():
+            return f"PCO {suffix}"
+    return None
+
+
 def prettify_value(value: str, *, mode: str) -> str:
     cleaned = re.sub(r"\s+", " ", value).strip().replace("\ufffd", "")
     if not cleaned:
@@ -565,19 +566,14 @@ def prettify_value(value: str, *, mode: str) -> str:
     if mode == "channel":
         if re.fullmatch(r"[0-9P-YZ]+", cleaned):
             cleaned = normalize_numeric_token(cleaned)
-        exact = resolve_exact_alias(cleaned, EXACT_CHANNEL_ALIASES)
-        if exact:
-            return exact
+        normalized_route = normalize_channel_route_name(cleaned)
+        if normalized_route:
+            return normalized_route
         lowered = cleaned.lower()
-        if lowered in CHANNEL_ALIAS_MAP:
-            return CHANNEL_ALIAS_MAP[lowered]
         return cleaned.upper() if lowered in {"lan", "pstn"} else cleaned
     if mode == "source":
-        exact = resolve_exact_alias(cleaned, EXACT_SOURCE_ALIASES)
-        return exact if exact else titlecase_words(cleaned)
-    exact = resolve_exact_alias(cleaned, EXACT_EVENT_TEXT_ALIASES)
-    if exact:
-        return exact
+        normalized_route = normalize_source_route_name(cleaned)
+        return normalized_route if normalized_route else titlecase_words(cleaned)
     lowered = cleaned.lower()
     return lowered[:1].upper() + lowered[1:]
 
