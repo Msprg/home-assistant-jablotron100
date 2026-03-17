@@ -88,6 +88,69 @@ Useful offline analysis commands:
 
 Notes:
 
+- A 2026-03-17 live user-edit campaign against slots `80-99` is now backed by two evidence sets:
+  - the earlier blocker run and reproductions under `/tmp/2026-03-17_173533_live-user-edit-campaign/`
+  - the completed follow-up matrix under `/tmp/2026-03-17_175208_live-user-followup/`
+- The 2026-03-17 tooling fixes that were required to make the campaign reliable:
+  - fixed: mounted `IMPORT.CFG` staging on this host could fail with `PermissionError` after `sudo mount`; the shared helper now falls back to a separate `sudo dd` file-prefix write while keeping the Python tool itself unprivileged
+  - fixed: live export pulls could return an all-zero `EXPORT.CFG` blob after a write session when `FLEXI_CFG` was still mounted; the shared pull helper now unmounts the device before the direct export read
+  - fixed: deduped user views were keeping the earliest raw record for a user ID even when a later record in the same export reflected the newer live state; `dedupe_user_records()` now prefers the latest offset per user ID
+  - fixed: inline write verification could fail with `Export refresh did not reach the reload-complete state.` even though a later fresh export showed the write had landed; `apply_import_sector()` now retries the embedded verification pull before surfacing a hard failure
+- Concrete 2026-03-17 artifacts for the completed campaign:
+  - initial baseline export: `/tmp/2026-03-17_initial_probe_EXPORT.CFG.bin`
+  - baseline read-only views: `/tmp/2026-03-17_175208_live-user-followup/read_only_initial/`
+  - completed live matrix root: `/tmp/2026-03-17_175208_live-user-followup/`
+  - final clean export after restores: `/tmp/2026-03-17_175208_live-user-followup/final_clean_state_pull1.bin`
+  - final read-only views: `/tmp/2026-03-17_175208_live-user-followup/read_only_final/`
+  - slot-`89` rollback blocker payload: `/tmp/2026-03-17_restore89_initial.IMPORT.CFG.bin`
+  - slot-`89` failed rollback verification: `/tmp/2026-03-17_restore89_initial_after_EXPORT.CFG.bin`
+- What the completed follow-up matrix proved live on 2026-03-17:
+  - full update and clean restore on slot `80`: name, phone, code, `card1`, comment, logging flag, access/competence, sections, PGs, and time-limit group all changed together and restored back to the initial baseline
+  - the only non-`ok` entry in `/tmp/2026-03-17_175208_live-user-followup/live_results.json` is `full_update_u80`, but that is a harness expectation bug: the verified export showed every intended field change plus a clean restore, and the runner had only (incorrectly) expected `enabled` to change alongside the logging flag
+  - proven single-field partial edits with unrelated fields preserved:
+    - `name` on slot `90`
+    - `phone` on slot `95`
+    - `code` on slot `96`
+    - `card1` on slot `97`
+    - `comment` on slot `87`
+    - blocked/enabled via `flags_raw=1` on slot `91`
+    - logging suppression via `flags_raw=2` on slot `92`
+    - access/competence via `access_raw=811` on slot `87`
+    - `time_limited_group_raw=2` on slot `93`
+  - proven section-rights edits:
+    - add one section: slot `90` from `{1}` to `{1,2}`
+    - remove one section: slot `87` from `{2,4,6}` to `{2,6}`
+    - sparse set: slot `94` to `{1,8,15}`
+    - contiguous range: slot `90` to `{4,5,6,7}`
+    - clear all: slot `94` to `{}` via `--sections-mask 0`
+  - proven PG-rights edits:
+    - add one PG: slot `95` from `{1}` to `{1,2}`
+    - remove one PG: slot `88` from `{6,7,8,9,10,11,12,13,14}` to `{6,7,8,10,11,12,13,14}`
+    - sparse boundary set across all four masks: slot `99` to `{1,32,33,64,65,96,97,128}`
+    - clear all: slot `98` to `{}` via `--pg-masks 0,0,0,0`
+  - proven preservation behavior:
+    - changing sections on slot `87` preserved PGs `2,4,7,10,12,14,16`
+    - changing PGs on slot `87` preserved sections `2,4,6`
+    - changing `access_raw` on slot `87` preserved both sections and PGs
+    - mixed partial edits (`comment + sections`, `name + sections`, `phone + PGs`, `blocked + comment`) only changed the requested fields
+    - no-op writes for `sections`, `name`, and `PGs` produced no verified field drift
+- Final 2026-03-17 live state boundary:
+  - every slot except `89` was returned to the initial baseline from `/tmp/2026-03-17_initial_probe_EXPORT.CFG.bin`
+  - the only remaining drift in `/tmp/2026-03-17_175208_live-user-followup/final_drift.json` is slot `89`
+  - slot `89` is still the unresolved semantic blocker: a rollback from populated full-update state to the original minimal baseline keeps the old phone/code/card/comment/access/PG/time-limit values while sections remain correct at `3,4,5`
+- Operator-facing reproduction commands from the completed campaign:
+  - baseline pull: `python3 jablotron_user_tool.py pull-export /tmp/live_test_EXPORT.CFG.bin --auth-code 1812`
+  - full update example: `python3 jablotron_user_tool.py edit 80 --auth-code 1812 --export-cfg /tmp/2026-03-17_initial_probe_EXPORT.CFG.bin --name 'User80 Full' --phone +421900000080 --pin 8080 --card1 0000000080000080 --comment 'Full update 80' --flags-raw 2 --access-raw 811 --sections 1,3,5 --pgs 1,32,33,64,65,96,97,128 --time-limited-group-raw 2`
+  - sections-only preservation example: `python3 jablotron_user_tool.py edit 87 --auth-code 1812 --export-cfg /tmp/2026-03-17_initial_probe_EXPORT.CFG.bin --sections 1,5,15`
+  - PG-only preservation example: `python3 jablotron_user_tool.py edit 87 --auth-code 1812 --export-cfg /tmp/2026-03-17_initial_probe_EXPORT.CFG.bin --pgs 1,32,33,64,65,96,97,128`
+  - metadata-only preservation example: `python3 jablotron_user_tool.py edit 87 --auth-code 1812 --export-cfg /tmp/2026-03-17_initial_probe_EXPORT.CFG.bin --comment rights-preserve87`
+  - boundary PG example: `python3 jablotron_user_tool.py edit 99 --auth-code 1812 --export-cfg /tmp/2026-03-17_initial_probe_EXPORT.CFG.bin --pgs 1,32,33,64,65,96,97,128`
+- Current 2026-03-17 operator guidance:
+  - treat slots with duplicated raw records carefully and inspect `--user-mode raw` if a deduped view looks inconsistent with a recent write
+  - `jablotron_user_tool.py add/edit/delete` now do two-step verification by default: the embedded verify export plus an immediate authoritative refetch
+  - `jablotron_user_tool.py add/edit` now run preflight validation before touching the panel: duplicate code, duplicate card, and `time_limited_group_raw > 0` without a code are rejected unless `--no-preflight-validation` is used
+  - `jablotron_user_tool.py get/list` now print built-in raw-record diagnostics so duplicate raw user hits are visible without manually re-running in `--user-mode raw`
+  - slot `89` should be considered unsafe for rollback-to-minimal until the panel behavior is understood from fresh baseline evidence
 - On this workstation, with the hidraw udev rule installed, run the Python entrypoints as the normal user. A fresh 2026-03-17 validation confirmed that `python3 jablotron_user_tool.py list` works without `sudo`, writes a live export to `/tmp`, and regenerates repo-local `__pycache__` files owned by `administrator`.
 - Avoid `sudo python3 ...` for the repo tools unless a separate non-Python step truly requires it; older sudo runs left root-owned `__pycache__` files in the workspace. The one-time cleanup was `sudo rm -rf ./__pycache__ ./custom_components/jablotron100/__pycache__`.
 - The memory dumps can contain stale heap fragments. Use `f_link_user_tool.py` to pick a coherent `JA100UsersSetup` / `TJA100AllUsers` snapshot instead of grepping loose strings across the whole dump.
@@ -115,11 +178,12 @@ Notes:
   - `export_cfg_tool.py extract-time-limits` prints a compact summary, and `jablotron_user_tool.py get ... --format json` now includes the linked group when a user is bound to one
 - `jablotron_user_tool.py edit` no longer needs a captured template just to preserve existing access rights. It now seeds the upsert payload from the current `EXPORT.CFG` record and only overrides the fields requested on the CLI.
 - `import_cfg_tool.py` / `jablotron_user_tool.py` now treat `pg_access` as four `uint32_t` masks (`CFG_MAX_PGS = 128`), not four 16-bit masks. `--pgs` therefore supports the full range `1..128`, and `--pg-masks` still accepts exact raw integers when deterministic replay is needed.
-- Current confidence boundary for user fields:
-  - safe read/decode: `flags`, `access`, `section_access`, `pg_access`, `name`, `phone`, `code`, `rfid`, `time_limited_group`, `comment`
-  - safe write/update from current evidence: `name`, `phone`, `code`, `rfid`, `comment`, `section_access`, `pg_access`, plus exact raw replay of `flags` / `access`
-  - still read-mostly or raw-only: `pg_num_if_ring` and `parent_user_no`
-  - `time_limited_group` is decoded and preserved on edit, but there is still no dedicated live write proof for intentionally changing it from the CLI
+- Current confidence boundary for user fields after the 2026-03-17 live matrix:
+  - proven safe read/write: `name`, `phone`, `code`, `card1` / RFID, `comment`, blocked/enabled via `flags_raw bit0`, logging suppression via `flags_raw bit1`, `access` / competence (`access_raw`), `section_access`, `pg_access`, and `time_limited_group`
+  - proven safe partial-edit preservation: changing any one of the fields above did not reset unrelated fields in the verified cases, including `sections` vs `PGs` and metadata vs rights
+  - proven safe read-only: derived `rights`, derived `allow_code_change`, derived `log_user_actions`
+  - decoded but still unproven for intentional live writes: `card2`, `pg_num_if_ring`, and `parent_user_no`
+  - still ambiguous: rollback from a populated full-update state back to a minimal baseline on slot `89`; this is a live panel behavior question, not yet a generally reproducible CLI encoder bug
 - On this workstation, `udisksctl mount -b ...` / `udisksctl unmount -b ...` can trigger an interactive GNOME polkit prompt and appear to hang until the desktop dialog is approved. For terminal automation, prefer `sudo mount` / `sudo umount` or direct `sudo dd` block reads/writes instead of `udisksctl`.
 - `IMPORT.CFG` sector 0 is also XORed with `0xff`, but after XOR reversal it decodes as MessagePack rather than an ad hoc binary format.
 - Observed user mutations use top-level collection key `7`: add/edit are `{7: {<user_id>: <12-field map>}}`, delete is `{7: {<user_id>: nil}}`.

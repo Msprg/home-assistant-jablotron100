@@ -321,6 +321,10 @@ def resolve_flexi_cfg_device(device: str | None = None) -> str:
 
 
 def is_device_mounted(device: str) -> bool:
+    return get_device_mountpoint(device) is not None
+
+
+def get_device_mountpoint(device: str) -> Path | None:
     resolved_device = resolve_flexi_cfg_device(device)
     result = subprocess.run(
         ["lsblk", "-P", "-o", "PATH,MOUNTPOINT", resolved_device],
@@ -329,9 +333,12 @@ def is_device_mounted(device: str) -> bool:
         capture_output=True,
     )
     if result.returncode != 0:
-        return False
+        return None
     rows = _parse_lsblk_pairs(result.stdout)
-    return any(row.get("PATH") == resolved_device and row.get("MOUNTPOINT") for row in rows)
+    for row in rows:
+        if row.get("PATH") == resolved_device and row.get("MOUNTPOINT"):
+            return Path(row["MOUNTPOINT"])
+    return None
 
 
 def default_export_output(prefix: str) -> Path:
@@ -620,17 +627,14 @@ def decode_rights_name(
 
 
 def dedupe_user_records(records: Iterable[UserRecord]) -> list[UserRecord]:
-    deduped: list[UserRecord] = []
-    seen_ids: set[int] = set()
+    anonymous_records: list[UserRecord] = []
+    latest_by_id: dict[int, UserRecord] = {}
     for record in sorted(records, key=lambda item: item.offset):
         if record.user_id is None:
-            deduped.append(record)
+            anonymous_records.append(record)
             continue
-        if record.user_id in seen_ids:
-            continue
-        seen_ids.add(record.user_id)
-        deduped.append(record)
-    return deduped
+        latest_by_id[record.user_id] = record
+    return [*anonymous_records, *(latest_by_id[user_id] for user_id in sorted(latest_by_id))]
 
 
 def _iter_export_collection_hits(
@@ -1311,16 +1315,21 @@ def pull_live_export_snapshot(
     cleanup_mode: str = "auto",
     verbose: bool = False,
 ) -> ExportSnapshot:
+    resolved_device = resolve_flexi_cfg_device(device)
+    if get_device_mountpoint(resolved_device) is not None:
+        unmount_device(resolved_device, mount_tool="sudo")
+
     cleanup_sections_mode: int | None = None
     if trigger:
         trigger_live_export(port=port, code=code, reset=reset)
-    read_export_direct(device=device, output=output, start_lba=start_lba, sectors=sectors)
+    read_export_direct(device=resolved_device, output=output, start_lba=start_lba, sectors=sectors)
     if trigger and cleanup_mode != "none":
         cleanup_sections_mode = cleanup_read_session(port=port, code=code, cleanup_mode=cleanup_mode, verbose=verbose)
         if cleanup_sections_mode != EXITED_SECTIONS_MODE:
-            raise SystemExit(
-                "Read-session cleanup did not reach the exited state "
-                f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {cleanup_sections_mode!r})."
+            print(
+                "warning: read-session cleanup did not reach the exited state "
+                f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {cleanup_sections_mode!r}); "
+                "continuing because EXPORT.CFG was already read successfully."
             )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     raw_records = extract_users(output, dedupe="raw")
@@ -1341,18 +1350,40 @@ def run_command(command: list[str], *, check: bool = True) -> subprocess.Complet
     return subprocess.run(command, check=check, text=True, capture_output=True)
 
 
+def write_file_prefix_with_sudo(*, source: Path, target: Path, size: int) -> None:
+    subprocess.run(
+        [
+            "sudo",
+            "-n",
+            "dd",
+            f"if={source}",
+            f"of={target}",
+            f"bs={size}",
+            "count=1",
+            "conv=notrunc",
+            "status=none",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
 def stage_import(import_path: Path, sector_path: Path) -> None:
     sector = sector_path.read_bytes()[:SECTOR_SIZE]
     write_error: OSError | None = None
 
-    with import_path.open("r+b", buffering=0) as handle:
-        try:
-            handle.seek(0)
-            handle.write(sector)
-            handle.flush()
-            os.fsync(handle.fileno())
-        except OSError as exc:
-            write_error = exc
+    try:
+        with import_path.open("r+b", buffering=0) as handle:
+            try:
+                handle.seek(0)
+                handle.write(sector)
+                handle.flush()
+                os.fsync(handle.fileno())
+            except OSError as exc:
+                write_error = exc
+    except PermissionError:
+        write_file_prefix_with_sudo(source=sector_path, target=import_path, size=SECTOR_SIZE)
 
     current = import_path.read_bytes()[:SECTOR_SIZE]
     if current != sector:
@@ -1364,12 +1395,34 @@ def stage_import(import_path: Path, sector_path: Path) -> None:
         print(f"warning: write raised {write_error}; continuing because staged bytes verified exactly")
 
 
+def ensure_import_path_available(*, import_path: Path, device: str, mount_tool: str) -> None:
+    if import_path.exists():
+        return
+    mount_device(device, import_path.parent, mount_tool=mount_tool)
+    if not import_path.exists():
+        raise SystemExit(f"IMPORT.CFG is still missing after remount: {import_path}")
+
+
+def _user_mount_options() -> str:
+    return f"uid={os.getuid()},gid={os.getgid()},umask=022"
+
+
 def mount_device(device: str, mountpoint: Path, *, mount_tool: str) -> None:
     resolved_device = resolve_flexi_cfg_device(device)
     suppress_message = False
     if mount_tool == "sudo":
         mountpoint.mkdir(parents=True, exist_ok=True)
-        result = run_command(["sudo", "-n", "mount", resolved_device, str(mountpoint)], check=False)
+        options = _user_mount_options()
+        if is_device_mounted(resolved_device):
+            result = run_command(
+                ["sudo", "-n", "mount", "-o", f"remount,{options}", resolved_device, str(mountpoint)],
+                check=False,
+            )
+        else:
+            result = run_command(
+                ["sudo", "-n", "mount", "-o", options, resolved_device, str(mountpoint)],
+                check=False,
+            )
         stderr = result.stderr.lower()
         suppress_message = result.returncode != 0 and "already mounted" in stderr
         if result.returncode != 0 and not suppress_message:
@@ -1385,6 +1438,20 @@ def mount_device(device: str, mountpoint: Path, *, mount_tool: str) -> None:
     message = result.stdout.strip() or result.stderr.strip()
     if message and not suppress_message:
         print(message)
+
+    expected_file = mountpoint / "IMPORT.CFG"
+    for _attempt in range(10):
+        actual_mountpoint = get_device_mountpoint(resolved_device)
+        if actual_mountpoint == mountpoint and expected_file.exists():
+            return
+        time.sleep(0.1)
+
+    actual_mountpoint = get_device_mountpoint(resolved_device)
+    raise SystemExit(
+        "mount completed but FLEXI_CFG was not available at the expected mountpoint: "
+        f"device={resolved_device} expected_mountpoint={mountpoint} "
+        f"actual_mountpoint={actual_mountpoint} expected_file_exists={expected_file.exists()}"
+    )
 
 
 def unmount_device(device: str, *, mount_tool: str) -> None:
@@ -1645,6 +1712,9 @@ def apply_import_sector(
     if stage_mode not in {"direct", "filesystem"}:
         raise SystemExit(f"Unsupported stage mode: {stage_mode}")
     if stage_mode == "filesystem":
+        if is_device_mounted(resolved_device):
+            unmount_device(resolved_device, mount_tool=mount_tool)
+            remount_after = True
         mount_device(resolved_device, mountpoint, mount_tool=mount_tool)
         remount_after = True
     else:
@@ -1661,6 +1731,7 @@ def apply_import_sector(
             pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=verbose)
             enter_setup_mode(client, verbose=verbose, initial_packets=pre_packets)
             if stage_mode == "filesystem":
+                ensure_import_path_available(import_path=import_path, device=resolved_device, mount_tool=mount_tool)
                 stage_import(import_path, sector_path)
                 unmount_device(resolved_device, mount_tool=mount_tool)
                 if verbose:
@@ -1694,13 +1765,30 @@ def apply_import_sector(
 
         if verify_output is None:
             return None
-        return pull_live_export_snapshot(
-            output=verify_output,
-            device=resolved_device,
-            port=port,
-            code=code,
-            reset=reset,
-        )
+        last_error: SystemExit | None = None
+        for attempt in range(1, 4):
+            try:
+                return pull_live_export_snapshot(
+                    output=verify_output,
+                    device=resolved_device,
+                    port=port,
+                    code=code,
+                    reset=reset,
+                )
+            except SystemExit as exc:
+                if "reload-complete state" not in str(exc):
+                    raise
+                last_error = exc
+                if attempt == 3:
+                    raise
+                print(
+                    "warning: embedded verification export did not reach the reload-complete state; "
+                    f"retrying ({attempt}/3)"
+                )
+                time.sleep(2.0)
+        if last_error is not None:
+            raise last_error
+        return None
     finally:
         if remount_after:
             mount_device(resolved_device, mountpoint, mount_tool=mount_tool)

@@ -10,7 +10,7 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Any, Iterable
 
 from import_cfg_tool import (
     build_user_record,
@@ -33,6 +33,36 @@ from jablotron_re_tools import (
     pull_live_export_snapshot,
     resolve_flexi_cfg_device,
 )
+
+COMPARE_FIELDS = (
+    "name",
+    "phone",
+    "code",
+    "cards",
+    "comment",
+    "flags_raw",
+    "access_raw",
+    "section_access_mask_raw",
+    "pg_access_masks_raw",
+    "pg_num_if_ring_raw",
+    "time_limited_group_raw",
+    "parent_user_no_raw",
+)
+
+FIELD_LABELS = {
+    "name": "name",
+    "phone": "phone",
+    "code": "code",
+    "cards": "cards",
+    "comment": "comment",
+    "flags_raw": "flags",
+    "access_raw": "access",
+    "section_access_mask_raw": "sections",
+    "pg_access_masks_raw": "pgs",
+    "pg_num_if_ring_raw": "pg_num_if_ring",
+    "time_limited_group_raw": "time_limit",
+    "parent_user_no_raw": "parent_user_no",
+}
 
 
 def _compress_ids(values: Iterable[int]) -> str:
@@ -257,6 +287,91 @@ def load_snapshot(args: argparse.Namespace, *, prefix: str) -> ExportSnapshot:
     )
 
 
+def _lookup_user(snapshot: ExportSnapshot, user_id: int) -> UserRecord | None:
+    for record in snapshot.records:
+        if record.user_id == user_id:
+            return record
+    return None
+
+
+def _compare_state(record: UserRecord | None) -> dict[str, Any]:
+    if record is None:
+        return {field: None for field in COMPARE_FIELDS}
+    return {
+        "name": record.name,
+        "phone": record.phone,
+        "code": record.code,
+        "cards": [card for card in record.cards if card],
+        "comment": record.comment,
+        "flags_raw": record.flags_raw,
+        "access_raw": record.access_raw,
+        "section_access_mask_raw": record.section_access_mask_raw,
+        "pg_access_masks_raw": list(record.pg_access_masks_raw),
+        "pg_num_if_ring_raw": record.pg_num_if_ring_raw,
+        "time_limited_group_raw": record.time_limited_group_raw,
+        "parent_user_no_raw": record.parent_user_no_raw,
+    }
+
+
+def _diff_states(before: dict[str, Any], after: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+    return {field: (before[field], after[field]) for field in COMPARE_FIELDS if before[field] != after[field]}
+
+
+def _format_field_names(fields: Iterable[str]) -> str:
+    labels = [FIELD_LABELS.get(field, field) for field in fields]
+    return ", ".join(labels) if labels else "-"
+
+
+def _derive_refetch_output(path: Path) -> Path:
+    if path.name.endswith(".bin"):
+        return path.with_name(path.name[:-4] + "_refetch.bin")
+    return path.with_name(path.name + "_refetch")
+
+
+def _collect_raw_record_diagnostics(snapshot: ExportSnapshot, *, user_id: int | None = None) -> dict[str, Any]:
+    counts: dict[int, int] = {}
+    offsets: dict[int, list[int]] = {}
+    for record in snapshot.raw_records:
+        if record.user_id is None:
+            continue
+        counts[record.user_id] = counts.get(record.user_id, 0) + 1
+        offsets.setdefault(record.user_id, []).append(record.offset)
+
+    duplicates = {uid: counts[uid] for uid in sorted(counts) if counts[uid] > 1}
+    if user_id is not None:
+        return {
+            "user_id": user_id,
+            "raw_match_count": counts.get(user_id, 0),
+            "raw_match_offsets": offsets.get(user_id, []),
+            "duplicate_user_ids": duplicates,
+        }
+    return {
+        "duplicate_user_ids": duplicates,
+        "duplicate_raw_record_total": sum(count - 1 for count in duplicates.values()),
+    }
+
+
+def print_raw_record_diagnostics(snapshot: ExportSnapshot, *, user_id: int | None = None) -> None:
+    diagnostics = _collect_raw_record_diagnostics(snapshot, user_id=user_id)
+    if user_id is not None:
+        print(f"raw_matches_user{user_id} {diagnostics['raw_match_count']}")
+        offsets = diagnostics["raw_match_offsets"]
+        print(
+            "raw_match_offsets "
+            + (",".join(str(offset) for offset in offsets) if offsets else "-")
+        )
+        return
+
+    duplicates = diagnostics["duplicate_user_ids"]
+    print(f"raw_duplicate_user_ids {len(duplicates)}")
+    print(f"raw_duplicate_record_overhang {diagnostics['duplicate_raw_record_total']}")
+    if duplicates:
+        rendered = ", ".join(f"{user_id}x{count}" for user_id, count in list(duplicates.items())[:12])
+        if len(duplicates) > 12:
+            rendered += ", ..."
+        print(f"raw_duplicate_examples {rendered}")
+
+
 def print_snapshot_summary(snapshot: ExportSnapshot, *, device: str | None = None) -> None:
     print(f"wrote {snapshot.path}")
     print(f"sha256 {snapshot.sha256}")
@@ -267,10 +382,10 @@ def print_snapshot_summary(snapshot: ExportSnapshot, *, device: str | None = Non
 
 
 def find_user(snapshot: ExportSnapshot, user_id: int) -> UserRecord:
-    for record in snapshot.records:
-        if record.user_id == user_id:
-            return record
-    raise SystemExit(f"User {user_id} not found in {snapshot.path}.")
+    record = _lookup_user(snapshot, user_id)
+    if record is None:
+        raise SystemExit(f"User {user_id} not found in {snapshot.path}.")
+    return record
 
 
 def build_upsert_sector(args: argparse.Namespace, *, current: UserRecord | None) -> tuple[Path, dict[str, object], bool]:
@@ -344,6 +459,156 @@ def build_delete_sector(args: argparse.Namespace) -> tuple[Path, dict[str, objec
     write_output(sector_path, sector)
     ephemeral = args.sector_output is None and not args.keep_sector
     return sector_path, describe_payload(payload), ephemeral
+
+
+def _preflight_target(summary: dict[str, object]) -> dict[str, Any]:
+    cards = [str(card) for card in summary.get("cards", []) if str(card)]
+    return {
+        "name": str(summary.get("name", "")),
+        "phone": str(summary.get("phone", "")),
+        "code": str(summary.get("code", "")),
+        "cards": cards,
+        "comment": str(summary.get("comment", "")),
+        "flags_raw": summary.get("flags_raw"),
+        "access_raw": summary.get("access_raw"),
+        "section_access_mask_raw": summary.get("section_access_mask"),
+        "pg_access_masks_raw": list(summary.get("pg_access_masks", [])),
+        "pg_num_if_ring_raw": summary.get("pg_num_if_ring_raw"),
+        "time_limited_group_raw": summary.get("time_limited_group_raw"),
+        "parent_user_no_raw": summary.get("parent_user_no_raw"),
+    }
+
+
+def _requested_fields_from_args(args: argparse.Namespace) -> set[str]:
+    requested: set[str] = set()
+    if getattr(args, "name", None) is not None:
+        requested.add("name")
+    if getattr(args, "phone", None) is not None:
+        requested.add("phone")
+    if getattr(args, "pin", None) is not None:
+        requested.add("code")
+    if getattr(args, "card1", None) is not None or getattr(args, "card2", None) is not None:
+        requested.add("cards")
+    if getattr(args, "comment", None) is not None:
+        requested.add("comment")
+    if getattr(args, "flags_raw", None) is not None or getattr(args, "field0_raw", None) is not None:
+        requested.add("flags_raw")
+    if getattr(args, "access_raw", None) is not None or getattr(args, "permissions_raw", None) is not None:
+        requested.add("access_raw")
+    if getattr(args, "sections_mask", None) is not None or getattr(args, "sections", None) is not None:
+        requested.add("section_access_mask_raw")
+    if getattr(args, "pg_masks", None) is not None or getattr(args, "pgs", None) is not None:
+        requested.add("pg_access_masks_raw")
+    if getattr(args, "pg_num_if_ring_raw", None) is not None or getattr(args, "field8_raw", None) is not None:
+        requested.add("pg_num_if_ring_raw")
+    if getattr(args, "time_limited_group_raw", None) is not None or getattr(args, "field9_raw", None) is not None:
+        requested.add("time_limited_group_raw")
+    if getattr(args, "parent_user_no_raw", None) is not None or getattr(args, "field11_raw", None) is not None:
+        requested.add("parent_user_no_raw")
+    return requested
+
+
+def validate_preflight(
+    *,
+    snapshot: ExportSnapshot,
+    user_id: int,
+    current: UserRecord | None,
+    target: dict[str, Any],
+) -> None:
+    current_state = _compare_state(current)
+    current_cards = current_state["cards"] if isinstance(current_state["cards"], list) else []
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    code = target["code"] or ""
+    if code:
+        conflicts = sorted(
+            record.user_id
+            for record in snapshot.records
+            if record.user_id not in {None, user_id} and record.code == code
+        )
+        if conflicts:
+            message = f"duplicate code {code!r} already assigned to user(s): {', '.join(str(item) for item in conflicts)}"
+            if current_state["code"] == code:
+                warnings.append(message)
+            else:
+                errors.append(message)
+
+    cards = [card for card in target["cards"] if card]
+    if len(cards) != len(set(cards)):
+        errors.append("card1/card2 would contain the same card ID.")
+    for card in cards:
+        conflicts = sorted(
+            record.user_id
+            for record in snapshot.records
+            if record.user_id not in {None, user_id} and card in [value for value in record.cards if value]
+        )
+        if conflicts:
+            message = f"duplicate card {card!r} already assigned to user(s): {', '.join(str(item) for item in conflicts)}"
+            if card in current_cards:
+                warnings.append(message)
+            else:
+                errors.append(message)
+
+    time_limit_group = int(target["time_limited_group_raw"] or 0)
+    current_time_limit = int(current_state["time_limited_group_raw"] or 0) if current is not None else 0
+    current_code = current_state["code"] or "" if current is not None else ""
+    if time_limit_group > 0 and not code:
+        message = f"time-limited group {time_limit_group} requires a code."
+        if current_time_limit > 0 and not current_code:
+            warnings.append(message)
+        else:
+            errors.append(message)
+
+    for message in warnings:
+        print(f"warning: preflight {message}")
+    if errors:
+        raise SystemExit("Preflight validation failed:\n- " + "\n- ".join(errors))
+
+
+def verify_authoritatively(
+    args: argparse.Namespace,
+    *,
+    verify_output: Path,
+) -> ExportSnapshot:
+    refetch_output = _derive_refetch_output(verify_output)
+    print("authoritative_refetch", refetch_output)
+    return pull_live_export_snapshot(
+        output=refetch_output,
+        device=args.device,
+        port=args.port,
+        code=args.auth_code,
+        reset=not args.no_reset,
+        cleanup_mode=getattr(args, "read_cleanup_mode", "auto"),
+        verbose=args.verbose,
+    )
+
+
+def print_requested_field_summary(
+    *,
+    before: UserRecord,
+    inline_after: UserRecord | None,
+    fresh_after: UserRecord | None,
+    requested_fields: set[str],
+) -> None:
+    before_state = _compare_state(before)
+    inline_state = _compare_state(inline_after)
+    fresh_state = _compare_state(fresh_after)
+    inline_changes = set(_diff_states(before_state, inline_state))
+    fresh_changes = set(_diff_states(before_state, fresh_state))
+    requested_changed = sorted(field for field in requested_fields if field in fresh_changes)
+    requested_unchanged = sorted(field for field in requested_fields if field not in fresh_changes)
+    unexpected_changes = sorted(field for field in fresh_changes if field not in requested_fields)
+    preserved_unrequested = sorted(field for field in COMPARE_FIELDS if field not in requested_fields and field not in fresh_changes)
+
+    print(f"requested_fields {_format_field_names(sorted(requested_fields))}")
+    print(f"requested_changed {_format_field_names(requested_changed)}")
+    print(f"requested_unchanged {_format_field_names(requested_unchanged)}")
+    print(f"preserved_unrequested {_format_field_names(preserved_unrequested)}")
+    print(f"unexpected_changes {_format_field_names(unexpected_changes)}")
+    if inline_state != fresh_state:
+        inline_vs_fresh = sorted(_diff_states(inline_state, fresh_state))
+        print(f"warning: inline verify differed from authoritative refetch in {_format_field_names(inline_vs_fresh)}")
 
 
 def emit_verify_result(snapshot: ExportSnapshot, *, user_id: int | None, fmt: str) -> None:
@@ -472,6 +737,7 @@ def cmd_pull_export(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     snapshot = load_snapshot(args, prefix="user-tool-list")
     print_snapshot_summary(snapshot, device=None if args.export_cfg else args.device)
+    print_raw_record_diagnostics(snapshot)
     emit_records(
         snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records,
         args.format,
@@ -483,6 +749,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 def cmd_get(args: argparse.Namespace) -> None:
     snapshot = load_snapshot(args, prefix=f"user-tool-get{args.user_id}")
     print_snapshot_summary(snapshot, device=None if args.export_cfg else args.device)
+    print_raw_record_diagnostics(snapshot, user_id=args.user_id)
     records = snapshot.records if args.user_mode == "dedupe" else snapshot.raw_records
     records = [record for record in records if record.user_id == args.user_id]
     if not records:
@@ -495,11 +762,21 @@ def cmd_add(args: argparse.Namespace) -> None:
     try:
         print(f"sector {sector_path}")
         print(json.dumps(summary, indent=2, ensure_ascii=False))
+        if not getattr(args, "no_preflight_validation", False):
+            snapshot_before = load_snapshot(args, prefix=f"pre-add-user{args.user_id}")
+            if _lookup_user(snapshot_before, args.user_id) is not None:
+                raise SystemExit(f"User {args.user_id} already exists in {snapshot_before.path}.")
+            validate_preflight(
+                snapshot=snapshot_before,
+                user_id=args.user_id,
+                current=None,
+                target=_preflight_target(summary),
+            )
         if args.no_apply:
             return
 
         verify_output = Path(args.verify_output) if args.verify_output else default_export_output(f"post-add-user{args.user_id}")
-        snapshot = apply_import_sector(
+        inline_snapshot = apply_import_sector(
             sector_path=sector_path,
             import_path=Path(args.import_path),
             device=args.device,
@@ -512,10 +789,14 @@ def cmd_add(args: argparse.Namespace) -> None:
             verbose=args.verbose,
             verify_output=verify_output,
         )
-        if snapshot is None:
+        if inline_snapshot is None:
             return
-        print_snapshot_summary(snapshot, device=args.device)
-        emit_verify_result(snapshot, user_id=args.user_id, fmt=args.format)
+        print("inline_verify")
+        print_snapshot_summary(inline_snapshot, device=args.device)
+        fresh_snapshot = verify_authoritatively(args, verify_output=verify_output)
+        print("authoritative_verify")
+        print_snapshot_summary(fresh_snapshot, device=args.device)
+        emit_verify_result(fresh_snapshot, user_id=args.user_id, fmt=args.format)
     finally:
         maybe_cleanup(sector_path, cleanup=cleanup_sector)
 
@@ -523,15 +804,23 @@ def cmd_add(args: argparse.Namespace) -> None:
 def cmd_edit(args: argparse.Namespace) -> None:
     snapshot_before = load_snapshot(args, prefix=f"pre-edit-user{args.user_id}")
     current = find_user(snapshot_before, args.user_id)
+    requested_fields = _requested_fields_from_args(args)
     sector_path, summary, cleanup_sector = build_upsert_sector(args, current=current)
     try:
         print(f"sector {sector_path}")
         print(json.dumps(summary, indent=2, ensure_ascii=False))
+        if not getattr(args, "no_preflight_validation", False):
+            validate_preflight(
+                snapshot=snapshot_before,
+                user_id=args.user_id,
+                current=current,
+                target=_preflight_target(summary),
+            )
         if args.no_apply:
             return
 
         verify_output = Path(args.verify_output) if args.verify_output else default_export_output(f"post-edit-user{args.user_id}")
-        snapshot = apply_import_sector(
+        inline_snapshot = apply_import_sector(
             sector_path=sector_path,
             import_path=Path(args.import_path),
             device=args.device,
@@ -544,10 +833,20 @@ def cmd_edit(args: argparse.Namespace) -> None:
             verbose=args.verbose,
             verify_output=verify_output,
         )
-        if snapshot is None:
+        if inline_snapshot is None:
             return
-        print_snapshot_summary(snapshot, device=args.device)
-        emit_verify_result(snapshot, user_id=args.user_id, fmt=args.format)
+        print("inline_verify")
+        print_snapshot_summary(inline_snapshot, device=args.device)
+        fresh_snapshot = verify_authoritatively(args, verify_output=verify_output)
+        print("authoritative_verify")
+        print_snapshot_summary(fresh_snapshot, device=args.device)
+        print_requested_field_summary(
+            before=current,
+            inline_after=_lookup_user(inline_snapshot, args.user_id),
+            fresh_after=_lookup_user(fresh_snapshot, args.user_id),
+            requested_fields=requested_fields,
+        )
+        emit_verify_result(fresh_snapshot, user_id=args.user_id, fmt=args.format)
     finally:
         maybe_cleanup(sector_path, cleanup=cleanup_sector)
 
@@ -561,7 +860,7 @@ def cmd_delete(args: argparse.Namespace) -> None:
             return
 
         verify_output = Path(args.verify_output) if args.verify_output else default_export_output(f"post-delete-user{args.user_id}")
-        snapshot = apply_import_sector(
+        inline_snapshot = apply_import_sector(
             sector_path=sector_path,
             import_path=Path(args.import_path),
             device=args.device,
@@ -574,12 +873,16 @@ def cmd_delete(args: argparse.Namespace) -> None:
             verbose=args.verbose,
             verify_output=verify_output,
         )
-        if snapshot is None:
+        if inline_snapshot is None:
             return
-        print_snapshot_summary(snapshot, device=args.device)
-        records = [record for record in snapshot.records if record.user_id == args.user_id]
+        print("inline_verify")
+        print_snapshot_summary(inline_snapshot, device=args.device)
+        fresh_snapshot = verify_authoritatively(args, verify_output=verify_output)
+        print("authoritative_verify")
+        print_snapshot_summary(fresh_snapshot, device=args.device)
+        records = [record for record in fresh_snapshot.records if record.user_id == args.user_id]
         if records:
-            emit_records(records, args.format, snapshot, show_names=False)
+            emit_records(records, args.format, fresh_snapshot, show_names=False)
         else:
             print(f"user {args.user_id} absent after delete")
     finally:
@@ -621,6 +924,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_upsert_field_arguments(add_parser, require_name=True)
     add_live_session_arguments(add_parser)
     add_live_apply_arguments(add_parser)
+    add_parser.add_argument(
+        "--no-preflight-validation",
+        action="store_true",
+        help="Skip duplicate/consistency checks before building and applying the upsert.",
+    )
     add_parser.add_argument("--format", choices=["table", "tsv", "json"], default="table")
     add_parser.set_defaults(func=cmd_add)
 
@@ -629,6 +937,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_upsert_field_arguments(edit_parser, require_name=False)
     add_live_read_arguments(edit_parser)
     add_live_apply_arguments(edit_parser)
+    edit_parser.add_argument(
+        "--no-preflight-validation",
+        action="store_true",
+        help="Skip duplicate/consistency checks before building and applying the upsert.",
+    )
     edit_parser.add_argument("--format", choices=["table", "tsv", "json"], default="table")
     edit_parser.set_defaults(func=cmd_edit)
 
