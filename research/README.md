@@ -50,6 +50,7 @@ Useful offline analysis commands:
 - `python3 f_link_user_tool.py extract-users research/traces/process_memory/f-link-edit-user-USER91TEST.dmp --format tsv`
 - `python3 f_link_user_tool.py diff-users research/traces/process_memory/f-link-delete-user-USER91TEST.dmp research/traces/process_memory/f-link-edit-user-USER91TEST.dmp`
 - `python3 export_cfg_tool.py extract-users research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format tsv`
+- `python3 export_cfg_tool.py extract-catalog research/exports/2026-03-07_live-service_EXPORT.CFG.bin --format summary`
 - `python3 export_cfg_tool.py pull-live research/exports/live_EXPORT.CFG.bin --extract-users`
 - `python3 jablotron_user_tool.py list`
 - `python3 jablotron_user_tool.py get 88`
@@ -64,8 +65,10 @@ Useful offline analysis commands:
 - `python3 jablotron_event_tool.py recent --transport archive --format tsv --limit 30`
 - `python3 jablotron_event_tool.py pull-live /tmp/live_events_archive.bin --records-output /tmp/live_events_records.jsonl`
 - `python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json --source-export-cfg /tmp/2026-03-11_230311_user-tool-list_EXPORT.CFG.bin --decode`
+- `python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json --source-export-cfg research/exports/2026-03-07_live-service_EXPORT.CFG.bin --decode --display-format tsv`
 - `python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb' --decode`
-- `python3 jablotron_event_tool.py align-export --export 'research/data ingest/events/aligning test events pull.xml' --archive /tmp/flink_match_aligning_test1.bin --metadata /tmp/flink_match_aligning_test1.json --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb' --only-diffs`
+- `python3 jablotron_event_tool.py align-export --export 'research/data ingest/events/aligning test events pull.xml' --archive /tmp/flink_match_aligning_test1.bin --metadata /tmp/flink_match_aligning_test1.json --source-export-cfg research/exports/2026-03-07_live-service_EXPORT.CFG.bin --only-diffs`
+- `python3 jablotron_event_tool.py align-export --export 'research/data ingest/events/aligning test events pull.xml' --archive /tmp/flink_match_aligning_test1.bin --metadata /tmp/flink_match_aligning_test1.json --source-export-cfg /tmp/2026-03-12_163538_event_catalog_EXPORT.CFG.bin --source-fdb 'research/data ingest/events/aligning test events pull VO 66.fdb' --only-diffs`
 - `python3 jablotron_event_tool.py dump-index /tmp/live_events_files/LOGINDEX.BIN`
 - `python3 import_cfg_tool.py decode-frame research/captures/usb/f_link/f-link-edit-user-USER91TEST.pcapng 1787 --format json`
 - `python3 import_cfg_tool.py build-user-upsert /tmp/user91-edit.bin --user-id 91 --name USER91TEST --code 9999 --card1 0000000012200717 --comment 'THIS IS A SAMPLE USER91TEST NOTE' --permissions-raw 811 --sections-mask 63 --pg-masks 65535,0,0,0`
@@ -213,10 +216,26 @@ Notes:
     - then apply the mixed compact alphabet where `P..Y` act as compact digits only in standalone numeric tokens, not inside words (`Src`, `Spojenie`, etc.)
     - then resolve ambiguous `0x41..0x5A` bytes with a token-aware case rule: tokens with explicit lowercase later should generally decode lowercase except for the first letter after title separators like `:`, `(`, `-`, `\`, or `,`; tokens without lowercase evidence stay uppercase
   - that token-aware case rule is what cleaned up rows like `Info(0):-MF-LInk... BRAINROT-IT\\MSprg`, `SPojenie`, and `ARC1L698464` into readable `Info(...)`, `Spojenie`, `EVENT DELIVERED`, and `BRAINROT-IT\\Msprg`
-  - the later decoder passes are now less heuristic than before: event texts come from exact code maps or `.fdb` dictionaries first, and source/channel cleanup prefers exact normalized aliases plus ID-based `.fdb` resolution instead of global fuzzy matching
-  - `jablotron_event_tool.py` can now also build a decoder catalog from `EXPORT.CFG`: `--source-export-cfg` feeds the already reversed user-table parser into the event decoder so user labels come from slot IDs instead of hardcoded name aliases
-  - `jablotron_event_tool.py recent` now auto-pulls a fresh `EXPORT.CFG` after the event snapshot when no explicit `--source-export-cfg` is given, then rewrites the saved decoded JSONL/TSV using that export-derived user catalog
-  - the decoder now normalizes the common communicator channel alias `INET_A` to the user-facing F-Link label `Server`; when you also pass `--source-fdb`, it can also resolve section labels (`1: SUTEREN`), keypad/peripheral channels (`44: RFID čítačka VO`), PG on/off event texts (`PG 6: VSTUP HLAVNY Zap.`), and user/peripheral source labels such as `Užívateľ 7: Matúš Prančík` and `Periféria 31: Magnet rack`
+- the later decoder passes are now less heuristic than before: event texts come from exact code maps or `.fdb` dictionaries first, and source/channel cleanup prefers exact normalized aliases plus ID-based `.fdb` resolution instead of global fuzzy matching
+- `EXPORT.CFG` now exposes a broader panel-derived catalog than just users:
+  - collection `0x06`: section names
+  - collection `0x07`: users
+  - collection `0x09`: named event objects used by source/channel IDs, including panel/peripherals plus communicator-style IDs such as `233 LAN communicator`, `234 GSM communicator`, `235 Landline communicator`, and `237 Power supply`
+  - collection `0x0c`: PG names
+  - `export_cfg_tool.py extract-catalog` now prints that catalog directly for inspection
+- `jablotron_event_tool.py` now builds its main live decoder catalog from `EXPORT.CFG`, not just the user table:
+  - `--source-export-cfg` now resolves user slots, numeric `source_id` object labels, numeric channel IDs, PG on/off event names, and section display IDs from panel-derived config data
+  - concrete saved-archive examples without `.fdb` now resolve:
+    - `Src:259 -> LAN communicator`
+    - `Chnl:44 -> 44: RFID čítačka VO`
+    - `Src:69 / Chnl:43 -> Periféria 43: DO MB / 43: DO MB`
+    - PG events such as `59 -> PG 9: BRANKA VO Zap.` and `61 -> PG 11: Oneskorenie VST VO Zap.`
+    - with a full export snapshot, section labels such as `Sect:1 -> 1: SUTEREN`
+- `jablotron_event_tool.py recent` now auto-pulls a fresh `EXPORT.CFG` after the event snapshot when no explicit `--source-export-cfg` is given, then rewrites the saved decoded JSONL/TSV using that broader export-derived catalog
+- `.fdb` is now optional enrichment instead of the main path for common labels:
+  - merge order is `.fdb` first, then `EXPORT.CFG`, so current live panel labels from the export win on collisions
+  - `.fdb` still fills gaps that the current export parser cannot see, especially when a newer auto-pulled `EXPORT.CFG` blob is missing the earliest section records; in that case `.fdb` can still restore labels like `1: SUTEREN`
+- the decoder now normalizes the common communicator channel alias `INET_A` to the user-facing F-Link label `Server`; with `EXPORT.CFG` alone it now also resolves keypad/peripheral channels (`44: RFID čítačka VO`), PG on/off event texts (`PG 6: VSTUP HLAVNY Zap.`), communicator/object sources (`LAN communicator`, `DO MB`, `Termostat 2NP radio`), and user/object source labels such as `Užívateľ 7: Matúš Prančík` and `Periféria 31: Magnet rack`
   - `jablotron_event_tool.py align-export` aligns a F-Link XML/CSV event export with a decoded raw pull by `event_id` and reports field-level diffs; on the March 12 aligning test bundle, the remaining mismatches were reduced mostly to expected `export-only` / `decoded-only` rows caused by the two sessions not covering the exact same window
   - the decoder is now good enough to recover timestamps, event IDs, event text, source IDs/names, channel labels, and section labels from archive pulls with much better Slovak diacritic recovery on event rows; the remaining weaknesses are mostly long free-form `INFO(DEVICE,...)` strings where there is no `.fdb`/export structure to snap against
 - `f-link-schema-access-system-minidump.dmp` contains an embedded JSON schema blob with internal type and field definitions. `f_link_schema_tool.py` can extract it and generate an access-focused report.

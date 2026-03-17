@@ -76,6 +76,69 @@ class ExportSnapshot:
     records: list[UserRecord]
 
 
+@dataclass(frozen=True)
+class ExportSectionRecord:
+    section_id: int
+    display_id: int
+    name: str
+    flags_raw: int | None
+    options_raw: int | None
+    state_raw: int | None
+    comment: str
+
+
+@dataclass(frozen=True)
+class ExportObjectRecord:
+    object_id: int
+    name: str
+    kind_raw: int | None
+    section_id: int | None
+    type_raw: int | None
+    subtype_raw: int | None
+    pg_masks: list[int]
+    comment: str
+
+
+@dataclass(frozen=True)
+class ExportHardwareRecord:
+    object_id: int
+    model: str
+    hardware_code: str
+    firmware: str
+    field3_raw: int | None
+    field4_raw: int | None
+    field5_raw: int | None
+
+
+@dataclass(frozen=True)
+class ExportPGRecord:
+    pg_id: int
+    display_id: int
+    name: str
+    type_raw: int | None
+    section_id: int | None
+    field6_raw: int | None
+    comment: str
+
+
+@dataclass(frozen=True)
+class ExportCatalogSnapshot:
+    path: Path
+    users: list[UserRecord]
+    sections_by_id: dict[int, ExportSectionRecord]
+    objects_by_id: dict[int, ExportObjectRecord]
+    hardware_by_id: dict[int, ExportHardwareRecord]
+    pgs_by_id: dict[int, ExportPGRecord]
+
+    @property
+    def communicators_by_id(self) -> dict[int, ExportObjectRecord]:
+        return {
+            object_id: record
+            for object_id, record in self.objects_by_id.items()
+            if object_id >= 233 or record.name.lower().endswith("communicator")
+        }
+
+
 def invert_blob(data: bytes) -> bytes:
     return bytes(byte ^ 0xFF for byte in data)
 
@@ -401,6 +464,147 @@ def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
     if dedupe == "dedupe":
         return dedupe_user_records(users)
     raise ValueError(f"Unsupported dedupe mode: {dedupe}")
+
+
+def read_decoded_export_blob(path: Path) -> bytes:
+    return invert_blob(path.read_bytes())
+
+
+def _extract_export_collection_records(
+    blob: bytes,
+    *,
+    collection_id: int,
+    expected_keys: set[int],
+) -> dict[int, dict[object, object | None]]:
+    pattern = bytes([collection_id, 0x81])
+    records: dict[int, dict[object, object | None]] = {}
+
+    try:
+        leading_item_id, cursor = decode_msgpack_value(blob, 0)
+        leading_fields, _next = decode_msgpack_value(blob, cursor)
+    except Exception:
+        leading_item_id = None
+        leading_fields = None
+    if isinstance(leading_item_id, int) and isinstance(leading_fields, dict) and set(leading_fields.keys()) == expected_keys:
+        records[leading_item_id] = leading_fields
+
+    offset = 0
+    while True:
+        offset = blob.find(pattern, offset)
+        if offset == -1:
+            break
+        offset += 1
+        try:
+            record_value, _next = decode_msgpack_value(blob, offset)
+        except Exception:
+            continue
+        if not isinstance(record_value, dict) or len(record_value) != 1:
+            continue
+        item_id, fields = next(iter(record_value.items()))
+        if not isinstance(item_id, int) or not isinstance(fields, dict):
+            continue
+        if set(fields.keys()) != expected_keys or item_id in records:
+            continue
+        records[item_id] = fields
+    return records
+
+
+def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
+    blob = read_decoded_export_blob(path)
+    users = extract_users(path, dedupe="dedupe")
+
+    section_fields = _extract_export_collection_records(blob, collection_id=0x06, expected_keys={0, 1, 2, 3, 4})
+    object_fields = _extract_export_collection_records(blob, collection_id=0x09, expected_keys={0, 1, 2, 3, 4, 5, 6, 7})
+    hardware_fields = _extract_export_collection_records(blob, collection_id=0x0B, expected_keys={0, 1, 2, 3, 4, 5, 6})
+    pg_fields = _extract_export_collection_records(
+        blob,
+        collection_id=0x0C,
+        expected_keys=set(range(18)),
+    )
+
+    sections_by_id: dict[int, ExportSectionRecord] = {}
+    for section_id, fields in section_fields.items():
+        name = value_as_string(fields.get(0)).strip()
+        if not name:
+            continue
+        sections_by_id[section_id] = ExportSectionRecord(
+            section_id=section_id,
+            display_id=section_id + 1,
+            name=name,
+            flags_raw=value_as_int(fields.get(1)),
+            options_raw=value_as_int(fields.get(2)),
+            state_raw=value_as_int(fields.get(3)),
+            comment=value_as_string(fields.get(4)),
+        )
+
+    objects_by_id: dict[int, ExportObjectRecord] = {}
+    for object_id, fields in object_fields.items():
+        name = value_as_string(fields.get(6)).strip()
+        if not name:
+            continue
+        pg_masks_value = fields.get(5)
+        pg_masks = [value_as_int(item) or 0 for item in pg_masks_value] if isinstance(pg_masks_value, list) else []
+        sections_count = len(sections_by_id)
+        section_id = value_as_int(fields.get(2))
+        if section_id is not None and section_id < 0:
+            section_id = None
+        if section_id is not None and sections_count and section_id >= sections_count:
+            section_id = None
+        objects_by_id[object_id] = ExportObjectRecord(
+            object_id=object_id,
+            name=name,
+            kind_raw=value_as_int(fields.get(1)),
+            section_id=section_id,
+            type_raw=value_as_int(fields.get(3)),
+            subtype_raw=value_as_int(fields.get(4)),
+            pg_masks=pg_masks,
+            comment=value_as_string(fields.get(7)),
+        )
+
+    hardware_by_id: dict[int, ExportHardwareRecord] = {}
+    for object_id, fields in hardware_fields.items():
+        model = value_as_string(fields.get(0)).strip()
+        if not model:
+            continue
+        hardware_by_id[object_id] = ExportHardwareRecord(
+            object_id=object_id,
+            model=model,
+            hardware_code=value_as_string(fields.get(1)).strip(),
+            firmware=value_as_string(fields.get(2)).strip(),
+            field3_raw=value_as_int(fields.get(3)),
+            field4_raw=value_as_int(fields.get(4)),
+            field5_raw=value_as_int(fields.get(5)),
+        )
+
+    pgs_by_id: dict[int, ExportPGRecord] = {}
+    for pg_id, fields in pg_fields.items():
+        name = value_as_string(fields.get(16)).strip()
+        if not name:
+            continue
+        section_id = value_as_int(fields.get(5))
+        sections_count = len(sections_by_id)
+        if section_id is not None and section_id < 0:
+            section_id = None
+        if section_id is not None and sections_count and section_id >= sections_count:
+            section_id = None
+        pgs_by_id[pg_id] = ExportPGRecord(
+            pg_id=pg_id,
+            display_id=pg_id + 1,
+            name=name,
+            type_raw=value_as_int(fields.get(0)),
+            section_id=section_id,
+            field6_raw=value_as_int(fields.get(6)),
+            comment=value_as_string(fields.get(17)),
+        )
+
+    return ExportCatalogSnapshot(
+        path=path,
+        users=users,
+        sections_by_id=sections_by_id,
+        objects_by_id=objects_by_id,
+        hardware_by_id=hardware_by_id,
+        pgs_by_id=pgs_by_id,
+    )
 
 
 def iter_printable_strings(blob: bytes, *, min_length: int) -> Iterable[str]:

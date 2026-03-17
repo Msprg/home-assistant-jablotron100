@@ -24,7 +24,7 @@ from jablotron_re_tools import (
     cleanup_read_session,
     drain_packets,
     enter_setup_mode,
-    extract_users,
+    extract_export_catalog,
     extract_sections_state_mode,
     graceful_exit_session,
     mount_device,
@@ -135,15 +135,11 @@ EXACT_CHANNEL_ALIASES = {
 EXACT_SOURCE_ALIASES = {
     "arc": "ARC",
     "arc1": "ARC1",
-    "domb": "DO MB",
     "homeassistant": "HomeAssistant",
     "kalendar": "Kalendár",
     "kalendr": "Kalendár",
-    "lancommunicator": "LAN communicator",
     "pco1": "PCO 1",
     "pcoq": "PCO 1",
-    "termostat1npoffice": "termostat 1NP office",
-    "termostat2npradio": "Termostat 2NP radio",
     "ustredna": "Ústredňa",
 }
 
@@ -205,11 +201,12 @@ class DecodedEventRecord:
 class DecoderCatalog:
     user_labels_by_name_key: dict[str, str]
     event_text_by_code: dict[str, str]
-    peripheral_labels_by_id: dict[int, str]
+    object_name_by_id: dict[int, str]
+    source_labels_by_object_id: dict[int, str]
+    channel_labels_by_id: dict[int, str]
     pg_names_by_id: dict[int, str]
     section_names_by_display_id: dict[int, str]
     user_labels_by_slot: dict[int, str]
-    user_name_by_slot: dict[int, str]
 
 
 @dataclass(frozen=True)
@@ -623,7 +620,6 @@ def load_decoder_catalog(fdb_path: str) -> DecoderCatalog:
     labels: dict[str, str] = {}
     ambiguous: set[str] = set()
     user_labels_by_slot: dict[int, str] = {}
-    user_name_by_slot: dict[int, str] = {}
 
     for record in iter_user_rows(snapshot, include_null=False):
         if record.slot_index != record.user_id:
@@ -636,7 +632,6 @@ def load_decoder_catalog(fdb_path: str) -> DecoderCatalog:
             continue
         label = f"Užívateľ {record.slot_index}: {name}"
         user_labels_by_slot[record.slot_index] = label
-        user_name_by_slot[record.slot_index] = name
         existing = labels.get(key)
         if existing and existing != label:
             ambiguous.add(key)
@@ -673,33 +668,36 @@ def load_decoder_catalog(fdb_path: str) -> DecoderCatalog:
 
     event_text_by_code = {str(key): value for key, value in build_map("TJA100AllTexts", "Text").items()}
     peripheral_names = build_map("TJA100AllPeripherals", "Name")
+    object_name_by_id = {0: "Ústredňa", **peripheral_names}
+    source_labels_by_object_id = {0: "Ústredňa"}
+    channel_labels_by_id = {0: "0: Ústredňa"}
+    for object_id, name in peripheral_names.items():
+        source_labels_by_object_id[object_id] = f"Periféria {object_id}: {name}"
+        channel_labels_by_id[object_id] = f"{object_id}: {name}"
     pg_names_by_id = build_map("TJA100AllPGs", "Name")
     section_names_raw = build_map("TJA100AllSections", "Name")
     section_names_by_display_id = {section_id + 1: name for section_id, name in section_names_raw.items()}
-    peripheral_labels_by_id = {
-        peripheral_id: f"Periféria {peripheral_id}: {name}"
-        for peripheral_id, name in peripheral_names.items()
-    }
 
     return DecoderCatalog(
         user_labels_by_name_key=labels,
         event_text_by_code=event_text_by_code,
-        peripheral_labels_by_id=peripheral_labels_by_id,
+        object_name_by_id=object_name_by_id,
+        source_labels_by_object_id=source_labels_by_object_id,
+        channel_labels_by_id=channel_labels_by_id,
         pg_names_by_id=pg_names_by_id,
         section_names_by_display_id=section_names_by_display_id,
         user_labels_by_slot=user_labels_by_slot,
-        user_name_by_slot=user_name_by_slot,
     )
 
 
 @lru_cache(maxsize=16)
 def load_export_decoder_catalog(export_cfg_path: str) -> DecoderCatalog:
+    snapshot = extract_export_catalog(Path(export_cfg_path))
     labels: dict[str, str] = {}
     ambiguous: set[str] = set()
     user_labels_by_slot: dict[int, str] = {}
-    user_name_by_slot: dict[int, str] = {}
 
-    for record in extract_users(Path(export_cfg_path), dedupe="dedupe"):
+    for record in snapshot.users:
         if record.user_id is None or record.user_id <= 0:
             continue
         name = record.name.strip()
@@ -707,7 +705,6 @@ def load_export_decoder_catalog(export_cfg_path: str) -> DecoderCatalog:
             continue
         label = f"Užívateľ {record.user_id}: {name}"
         user_labels_by_slot[record.user_id] = label
-        user_name_by_slot[record.user_id] = name
         key = simplify_match_text(name)
         if not key:
             continue
@@ -720,14 +717,34 @@ def load_export_decoder_catalog(export_cfg_path: str) -> DecoderCatalog:
     for key in ambiguous:
         labels.pop(key, None)
 
+    object_name_by_id = {record.object_id: record.name for record in snapshot.objects_by_id.values()}
+    source_labels_by_object_id: dict[int, str] = {0: "Ústredňa"}
+    channel_labels_by_id: dict[int, str] = {0: "0: Ústredňa"}
+
+    for object_id, record in snapshot.objects_by_id.items():
+        object_name_by_id[object_id] = record.name
+        if object_id == 0:
+            continue
+        if object_id >= 233 or record.name.lower().endswith("communicator"):
+            source_labels_by_object_id[object_id] = record.name
+        else:
+            source_labels_by_object_id[object_id] = f"Periféria {object_id}: {record.name}"
+        channel_labels_by_id[object_id] = f"{object_id}: {record.name}"
+
+    pg_names_by_id = {record.pg_id: record.name for record in snapshot.pgs_by_id.values()}
+    section_names_by_display_id = {
+        record.display_id: record.name for record in snapshot.sections_by_id.values()
+    }
+
     return DecoderCatalog(
         user_labels_by_name_key=labels,
         event_text_by_code={},
-        peripheral_labels_by_id={},
-        pg_names_by_id={},
-        section_names_by_display_id={},
+        object_name_by_id=object_name_by_id,
+        source_labels_by_object_id=source_labels_by_object_id,
+        channel_labels_by_id=channel_labels_by_id,
+        pg_names_by_id=pg_names_by_id,
+        section_names_by_display_id=section_names_by_display_id,
         user_labels_by_slot=user_labels_by_slot,
-        user_name_by_slot=user_name_by_slot,
     )
 
 
@@ -739,11 +756,12 @@ def merge_decoder_catalogs(primary: DecoderCatalog | None, secondary: DecoderCat
     return DecoderCatalog(
         user_labels_by_name_key={**primary.user_labels_by_name_key, **secondary.user_labels_by_name_key},
         event_text_by_code={**primary.event_text_by_code, **secondary.event_text_by_code},
-        peripheral_labels_by_id={**primary.peripheral_labels_by_id, **secondary.peripheral_labels_by_id},
+        object_name_by_id={**primary.object_name_by_id, **secondary.object_name_by_id},
+        source_labels_by_object_id={**primary.source_labels_by_object_id, **secondary.source_labels_by_object_id},
+        channel_labels_by_id={**primary.channel_labels_by_id, **secondary.channel_labels_by_id},
         pg_names_by_id={**primary.pg_names_by_id, **secondary.pg_names_by_id},
         section_names_by_display_id={**primary.section_names_by_display_id, **secondary.section_names_by_display_id},
         user_labels_by_slot={**primary.user_labels_by_slot, **secondary.user_labels_by_slot},
-        user_name_by_slot={**primary.user_name_by_slot, **secondary.user_name_by_slot},
     )
 
 
@@ -817,12 +835,9 @@ def normalize_channel_label(channel: str | None, catalog: DecoderCatalog | None)
         return channel
     if channel.isdigit():
         channel_id = int(channel)
-        if channel_id == 0:
-            return "0: Ústredňa"
-        label = catalog.peripheral_labels_by_id.get(channel_id)
-        if label and ": " in label:
-            _, name = label.split(": ", 1)
-            return f"{channel_id}: {name}"
+        label = catalog.channel_labels_by_id.get(channel_id)
+        if label:
+            return label
     return channel
 
 
@@ -833,34 +848,19 @@ def normalize_source_label(
     event_code: str | None,
     catalog: DecoderCatalog | None,
 ) -> str | None:
-    if not source_name:
-        if source_id and catalog:
-            try:
-                raw_source_id = int(source_id)
-            except ValueError:
-                return source_name
-            if raw_source_id >= USER_SOURCE_BASE:
-                slot = raw_source_id - USER_SOURCE_BASE
-                return catalog.user_labels_by_slot.get(slot)
-            peripheral_id = raw_source_id - PERIPHERAL_SOURCE_BASE
-            if peripheral_id in catalog.peripheral_labels_by_id:
-                name = catalog.peripheral_labels_by_id[peripheral_id].split(": ", 1)[1]
-                return f"Periféria {peripheral_id}: {name}"
-        return source_name
     if catalog and source_id:
-        try:
-            raw_source_id = int(source_id)
-        except ValueError:
-            raw_source_id = -1
-        if raw_source_id >= USER_SOURCE_BASE:
-            slot = raw_source_id - USER_SOURCE_BASE
+        slot = source_id_to_user_slot(source_id)
+        if slot is not None:
             label = catalog.user_labels_by_slot.get(slot)
             if label:
                 return label
-        peripheral_id = raw_source_id - PERIPHERAL_SOURCE_BASE
-        if peripheral_id in catalog.peripheral_labels_by_id:
-            name = catalog.peripheral_labels_by_id[peripheral_id].split(": ", 1)[1]
-            return f"Periféria {peripheral_id}: {name}"
+        object_id = source_id_to_object_id(source_id)
+        if object_id is not None:
+            label = catalog.source_labels_by_object_id.get(object_id)
+            if label:
+                return label
+    if not source_name:
+        return source_name
     if event_code in {"150", "40", "41"} and catalog:
         label = catalog.user_labels_by_name_key.get(simplify_match_text(source_name))
         if label:
@@ -889,20 +889,16 @@ def source_id_to_user_slot(source_id: str | None) -> int | None:
     raw_source_id = int(source_id)
     if raw_source_id < USER_SOURCE_BASE:
         return None
-    slot = raw_source_id - USER_SOURCE_BASE
-    if slot < 0 or slot > 128:
-        return None
-    return slot
+    return raw_source_id - USER_SOURCE_BASE
 
 
-def source_id_to_peripheral_id(source_id: str | None) -> int | None:
+def source_id_to_object_id(source_id: str | None) -> int | None:
     if not source_id or not source_id.isdigit():
         return None
     raw_source_id = int(source_id)
-    peripheral_id = raw_source_id - PERIPHERAL_SOURCE_BASE
-    if raw_source_id >= USER_SOURCE_BASE or peripheral_id < 0 or peripheral_id > 128:
+    if raw_source_id >= USER_SOURCE_BASE or raw_source_id < PERIPHERAL_SOURCE_BASE:
         return None
-    return peripheral_id
+    return raw_source_id - PERIPHERAL_SOURCE_BASE
 
 
 def rebuild_decoded_event_text(record: DecodedEventRecord) -> str:
@@ -931,20 +927,20 @@ def canonicalize_decoded_records(
 
     best_source_name_by_id: dict[str, str] = {}
     best_event_text_by_code: dict[str, str] = {}
-    peripheral_name_by_id: dict[int, str] = {}
+    object_name_by_id: dict[int, str] = {}
 
     for record in records:
         if record.kind != "EVENT":
             continue
-        if record.source_id and record.source_name:
+        if not catalog and record.source_id and record.source_name:
             best_source_name_by_id[record.source_id] = choose_better_text(
                 best_source_name_by_id.get(record.source_id),
                 record.source_name,
             ) or record.source_name
-            peripheral_id = source_id_to_peripheral_id(record.source_id)
-            if peripheral_id is not None:
-                peripheral_name_by_id[peripheral_id] = choose_better_text(
-                    peripheral_name_by_id.get(peripheral_id),
+            object_id = source_id_to_object_id(record.source_id)
+            if object_id is not None:
+                object_name_by_id[object_id] = choose_better_text(
+                    object_name_by_id.get(object_id),
                     record.source_name,
                 ) or record.source_name
         if record.event_code and record.event_text and record.event_text != "No text":
@@ -960,7 +956,7 @@ def canonicalize_decoded_records(
             output.append(record)
             continue
 
-        source_name = best_source_name_by_id.get(record.source_id or "", record.source_name)
+        source_name = record.source_name if catalog else best_source_name_by_id.get(record.source_id or "", record.source_name)
         channel = record.channel
         section = record.section
         event_text = record.event_text
@@ -974,20 +970,29 @@ def canonicalize_decoded_records(
         elif record.event_code and record.event_code in best_event_text_by_code:
             event_text = best_event_text_by_code[record.event_code]
 
-        if not catalog:
+        if catalog:
+            source_name = normalize_source_label(
+                source_id=record.source_id,
+                source_name=source_name,
+                event_code=record.event_code,
+                catalog=catalog,
+            )
+            channel = normalize_channel_label(channel, catalog)
+            section = normalize_section_label(section, catalog)
+        else:
             user_slot = source_id_to_user_slot(record.source_id)
-            peripheral_id = source_id_to_peripheral_id(record.source_id)
+            object_id = source_id_to_object_id(record.source_id)
             if user_slot is not None and source_name and not source_name.startswith("Užívateľ "):
                 source_name = f"Užívateľ {user_slot}: {source_name}"
-            elif peripheral_id is not None and source_name and not source_name.startswith("Periféria "):
-                source_name = f"Periféria {peripheral_id}: {source_name}"
+            elif object_id is not None and source_name and not source_name.startswith("Periféria "):
+                source_name = f"Periféria {object_id}: {source_name}"
 
             if channel and channel.isdigit():
                 channel_id = int(channel)
                 if channel_id == 0:
                     channel = "0: Ústredňa"
-                elif channel_id in peripheral_name_by_id:
-                    channel = f"{channel_id}: {peripheral_name_by_id[channel_id]}"
+                elif channel_id in object_name_by_id:
+                    channel = f"{channel_id}: {object_name_by_id[channel_id]}"
 
         updated = replace(
             record,
