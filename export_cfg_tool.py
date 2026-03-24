@@ -69,6 +69,8 @@ def emit_catalog(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
         "arcs": {arc_id: asdict(record) for arc_id, record in snapshot.arcs_by_id.items()},
         "time_limit_groups": {group_id: asdict(record) for group_id, record in snapshot.time_limit_groups_by_id.items()},
         "communicators": {object_id: asdict(record) for object_id, record in snapshot.communicators_by_id.items()},
+        "main_config": asdict(snapshot.main_config) if snapshot.main_config is not None else None,
+        "communications": asdict(snapshot.communications) if snapshot.communications is not None else None,
     }
     if fmt == "summary":
         print(f"path {snapshot.path}")
@@ -79,6 +81,8 @@ def emit_catalog(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
         print(f"pgs {len(snapshot.pgs_by_id)}")
         print(f"arcs {len(snapshot.arcs_by_id)}")
         print(f"time_limit_groups {len(snapshot.time_limit_groups_by_id)}")
+        print(f"main_config {'yes' if snapshot.main_config is not None else 'no'}")
+        print(f"communications {'yes' if snapshot.communications is not None else 'no'}")
         return
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
@@ -122,6 +126,48 @@ def emit_arcs(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
                 parts.append(f"{specific.name}.endpoints={specific.endpoints}")
             if specific.crypt_key:
                 parts.append(f"{specific.name}.crypt_key={specific.crypt_key!r}")
+        print(" | ".join(parts))
+
+
+def emit_communications(snapshot: ExportCatalogSnapshot, fmt: str) -> None:
+    payload = {
+        "main_config": asdict(snapshot.main_config) if snapshot.main_config is not None else None,
+        "communications": asdict(snapshot.communications) if snapshot.communications is not None else None,
+    }
+    if fmt == "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    if snapshot.main_config is not None:
+        main = snapshot.main_config
+        print(
+            "main"
+            f" | name={main.name!r}"
+            f" | language_id={main.language_id!r}"
+            f" | code_len={main.code_len_raw}"
+            f" | code_prefix={main.code_prefix}"
+            f" | wpp_dedicated={main.wpp_dedicated}"
+            f" | default_config={main.default_config}"
+        )
+    if snapshot.communications is not None:
+        comm = snapshot.communications
+        flags = comm.flags
+        parts = [
+            "communications",
+            f"service_access={comm.service_access_name or comm.service_access_raw}",
+            f"ytun_url={comm.ytun_url!r}",
+            f"local_listen_port={comm.local_listen_port_raw}",
+            f"data_channels={comm.data_channels}",
+            f"sms_channels={comm.sms_channels}",
+            f"voice_channels={comm.voice_channels}",
+            f"wpp_lock={flags.wpp_lock}",
+            f"ytun_enable={flags.ytun_enable}",
+            f"ytun_persistent={flags.ytun_persistent}",
+            f"comm_configured={flags.comm_configured}",
+        ]
+        if comm.sdc is not None:
+            parts.append(f"sdc_position={comm.sdc.sdc_position_name or comm.sdc.sdc_position}")
+            parts.append(f"sdc_flags={comm.sdc.flags_raw}")
         print(" | ".join(parts))
 
 
@@ -197,6 +243,47 @@ def _summarize_catalog(snapshot: ExportCatalogSnapshot) -> list[str]:
     lines.append(f"pgs: {len(snapshot.pgs_by_id)}")
     lines.append(f"arcs: {len(snapshot.arcs_by_id)}")
     lines.append(f"time_limit_groups: {len(snapshot.time_limit_groups_by_id)}")
+
+    if snapshot.main_config is not None:
+        main = snapshot.main_config
+        _append_heading(lines, "Main Config")
+        lines.append(f"name: {main.name!r}")
+        lines.append(f"language_id: {main.language_id!r}")
+        lines.append(f"language_raw: {main.language_raw}")
+        lines.append(f"code_len_raw: {main.code_len_raw}")
+        lines.append(f"code_prefix: {main.code_prefix}")
+        lines.append(f"wpp_dedicated: {main.wpp_dedicated}")
+        lines.append(f"default_config: {main.default_config}")
+        lines.append(f"language_unlock_code: {main.language_unlock_code!r}")
+
+    if snapshot.communications is not None:
+        comm = snapshot.communications
+        flags = comm.flags
+        _append_heading(lines, "Communications")
+        lines.append(f"service_access: {comm.service_access_name or comm.service_access_raw}")
+        lines.append(f"ytun_url: {comm.ytun_url!r}")
+        lines.append(f"sms_resend_to_user: {comm.sms_resend_to_user}")
+        lines.append(f"y0_hb_time_raw: {comm.y0_hb_time_raw}")
+        lines.append(f"data_channels: {comm.data_channels}")
+        lines.append(f"sms_channels: {comm.sms_channels}")
+        lines.append(f"voice_channels: {comm.voice_channels}")
+        lines.append(f"local_listen_port_raw: {comm.local_listen_port_raw}")
+        lines.append(f"aes_key_ascii: {comm.aes_key_ascii!r}")
+        lines.append(f"ytun_key: {comm.ytun_key!r}")
+        lines.append(f"rf_key_ascii: {comm.rf_key_ascii!r}")
+        lines.append(
+            "flags: "
+            f"wpp_lock={flags.wpp_lock}, ytun_enable={flags.ytun_enable}, "
+            f"ytun_persistent={flags.ytun_persistent}, comm_configured={flags.comm_configured}, "
+            f"gsm_autoconfig_disabled={flags.gsm_autoconfig_disabled}"
+        )
+        if comm.sdc is not None:
+            lines.append(
+                "sdc: "
+                f"flags_raw={comm.sdc.flags_raw}, "
+                f"allow_reports_alarm_voice={comm.sdc.allow_reports_alarm_voice}, "
+                f"sdc_position={comm.sdc.sdc_position_name or comm.sdc.sdc_position}"
+            )
 
     _append_heading(lines, "Sections")
     for section in sorted(snapshot.sections_by_id.values(), key=lambda item: item.display_id):
@@ -421,6 +508,11 @@ def cmd_extract_arcs(args: argparse.Namespace) -> None:
     emit_arcs(snapshot, args.format)
 
 
+def cmd_extract_communications(args: argparse.Namespace) -> None:
+    snapshot = extract_export_catalog(Path(args.export_cfg))
+    emit_communications(snapshot, args.format)
+
+
 def cmd_extract_time_limits(args: argparse.Namespace) -> None:
     snapshot = extract_export_catalog(Path(args.export_cfg))
     emit_time_limits(snapshot, args.format)
@@ -536,6 +628,14 @@ def build_parser() -> argparse.ArgumentParser:
     arcs_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
     arcs_parser.add_argument("--format", choices=["summary", "json"], default="summary")
     arcs_parser.set_defaults(func=cmd_extract_arcs)
+
+    comm_parser = subparsers.add_parser(
+        "extract-communications",
+        help="Extract the top-level main/communications config blocks from an EXPORT.CFG blob.",
+    )
+    comm_parser.add_argument("export_cfg", help="Path to EXPORT.CFG or an equivalent 1 MiB export blob.")
+    comm_parser.add_argument("--format", choices=["summary", "json"], default="summary")
+    comm_parser.set_defaults(func=cmd_extract_communications)
 
     time_limits_parser = subparsers.add_parser(
         "extract-time-limits",

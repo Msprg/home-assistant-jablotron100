@@ -344,6 +344,12 @@ Notes:
   - `cfg_periphery_setup_t.data`: raw `InternalSetup` blob handled through `prf_setup_internal_hook`
   - `cfg_flink_scratch_t` / `cfg_flink_registration_t`: F-Link / portal scratch and registration data (`LoginID`, contact name/phone, email, address, GPS coordinates, GSM phone, hotline, attempts)
   - communicator / ARC `service_access`: FL-only service-tech access control flags (`0=yes / 1=no / 2=read only`)
+  - a live test on 2026-03-21 confirmed that changing communicator `service_access` alone can unlock ARC/PCO editing in F-Link for a normal service session
+    - the proven safe write shape was the sparse top-level payload `{5: {12: 0}}`
+    - `5` matches `cfg_communications_t`, `12` matches `cfg_communications_t.service_access`, and `0` means `ARC_ACCESS_FULL`
+    - unlike user edits, this test did not replay a full communicator object; it only wrote the single gate field
+    - the panel remained healthy after the write and F-Link immediately exposed a new editable PCO page
+    - the current live `EXPORT.CFG` format does not always expose the full top-level `cfg_communications_t` object, so the final confirmation came from F-Link behavior rather than a direct post-write export decode of field `12`
 - The schema also exposes persisted knobs that may exist in storage without being surfaced as ordinary first-class F-Link fields because they have blank or missing `flrecname`, for example:
   - `cfg_main_t.wpp_dedicated`, `cfg_main_t.simple_log`
   - `cfg_system_t.tm_auto_arm`, `cfg_system_t.gps_latit_longit`, `cfg_system_t.sunrise_correction`, `cfg_system_t.sunset_correction`, `cfg_system_t.night_mode_periphery`
@@ -374,3 +380,7 @@ Notes:
   - no obvious `cfg_data_t.ytun_rsa_key` blob was mapped to a recurring readable collection yet
   - object / peripheral `43` (`DO MB`, model `JA-154J MS II`) appears in the object/hardware side of the export (`0x09` / `0x0b`) and in a few compact auxiliary tables (`0x0a`, `0x0f`, `0x10`), but none of those currently look like per-device RF crypto material or a rolling-code seed
   - current best interpretation: the saved export exposes ARC/reporting crypto more readily than per-peripheral RF keys
+- `jablotron_arc_tool.py` is now the dedicated operator utility for this communicator-side gate:
+  - `build-sector` emits the sparse `{5: {12: <mode>}}` IMPORT.CFG sector
+  - `set-live` builds that same sparse sector, applies it through the shared setup-mode import flow, and pulls a fresh verification export
+  - supported modes follow `cfg_comm_service_access_e`: `full=0`, `off=1`, `read=2`

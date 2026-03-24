@@ -1,0 +1,95 @@
+Source:
+- local schema notes in `research/README.md`
+- live service-session tooling in `jablotron_re_tools.py`, `live_import_apply.py`
+- controlled live test against the panel on 2026-03-21
+
+Question:
+- can the ARC/PCO communication-page restriction in F-Link be dropped for a normal service login without first involving an ARC technician?
+
+Relevant schema finding:
+- `cfg_communications_t.service_access` uses `cfg_comm_service_access_e`
+  - `0 = ARC_ACCESS_FULL`
+  - `1 = ARC_ACCESS_OFF`
+  - `2 = ARC_ACCESS_READ`
+- embedded schema access report still marks `communications` as writable by `+ACCESS_SERVICE`
+- working hypothesis before the live test:
+  - the restriction is a stored F-Link policy bit, not a transport-side privilege barrier
+
+Important role-model clarification before the live test:
+- `coPCOGuard` / `ACCESS_ARC` did not behave like an F-Link ARC-technician login
+- a real panel user with code `4565` and rights label `coPCOGuard` could not log into F-Link as a technician
+- current interpretation:
+  - `coPCOGuard` is a narrow alarm/PCO user role
+  - the F-Link ARC-service restriction is a separate stored communicator policy gate
+
+Live test plan:
+- do not replay the full old communicator object from the March 7 export sample
+- instead, use the sparsest possible IMPORT.CFG payload that only changes the gate field:
+  - `{5: {12: 0}}`
+- rationale:
+  - top-level key `5` matched `cfg_communications_t` in the earlier root-object sample
+  - nested field `12` matched `cfg_communications_t.service_access`
+  - current live exports on 2026-03-21 no longer exposed the same full root object at offset 0, so replaying a stale full communicator object would have been riskier than a single-field sparse patch
+
+Pre-change state:
+- fresh export pulled with:
+  - `python3 export_cfg_tool.py pull-live /tmp/2026-03-21_pre-arc-unlock_EXPORT.CFG.bin`
+- result:
+  - SHA-256 `9db1860e27197f284339ad832a9d741a23c199e2d1418e0c5f163eead861b6b8`
+  - `users_raw 101`
+  - `users_deduped 101`
+- current live export format caveat:
+  - unlike the earlier March 7 sample, this blob started directly with collection-shaped records (`0x06` sections etc.) and did not decode as a single root map carrying top-level `main` / `communications`
+  - `extract-catalog` still decoded normal collections, but reported `main_config no` / `communications no`
+
+Exact payload used:
+- sparse decoded payload:
+  - `{5: {12: 0}}`
+- encoded sector:
+  - `/tmp/2026-03-21_comm-unlock-sparse_IMPORT.bin`
+- this was later wrapped into a reusable helper:
+  - `jablotron_arc_tool.py build-sector --mode full`
+
+Live apply:
+- command used:
+  - `python3 live_import_apply.py /tmp/2026-03-21_comm-unlock-sparse_IMPORT.bin --verify-output /tmp/2026-03-21_post-arc-unlock_EXPORT.CFG.bin`
+- result:
+  - apply completed successfully
+  - fresh post-write export was pulled successfully
+
+Post-change export:
+- file:
+  - `/tmp/2026-03-21_post-arc-unlock_EXPORT.CFG.bin`
+- SHA-256:
+  - `8bbced0a1e45bbcf9c8390c73b7ca396282bb5c8f704a31a5bf12047b3eb3da3`
+- summary:
+  - `users_raw 101`
+  - `users_deduped 101`
+  - no obvious damage to parsed users, sections, objects, PGs, or ARC collection count
+- ARC-specific sanity check:
+  - `extract-arcs` produced no diff before vs after
+  - visible ARC endpoint strings (`194.169.224.113:10488`, `194.169.224.114:10488`, `194.169.224.113:10470`) remained present
+
+Functional confirmation:
+- after the live write, F-Link exposed a new editable PCO page to the service user
+- this is the key practical confirmation that the sparse `service_access` patch worked
+
+Verification boundary:
+- the March 21 post-write export did not expose a directly decodable top-level `cfg_communications_t` object, so the test did not re-read field `12` from the fresh export in the same neat way the earlier March 7 sample allowed offline
+- the strongest post-write evidence is therefore:
+  - clean live apply
+  - healthy fresh export
+  - unchanged ARC/reporting records/endpoints
+  - immediate F-Link UI unlock of the PCO page
+
+Operator workflow going forward:
+- safest unlock path:
+  - `python3 jablotron_arc_tool.py set-live --mode full`
+- safe relock path if needed:
+  - `python3 jablotron_arc_tool.py set-live --mode off`
+- read-only mode if needed:
+  - `python3 jablotron_arc_tool.py set-live --mode read`
+
+Current recommendation:
+- keep using the sparse communicator `service_access` patch as the first-line ARC unlock workflow
+- do not touch `wpp_lock` / `wpp_dedicated` unless a future panel still keeps specific GSM pages locked after `service_access = 0`

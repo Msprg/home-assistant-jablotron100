@@ -267,6 +267,69 @@ class ExportARCRecord:
 
 
 @dataclass(frozen=True)
+class ExportMainConfig:
+    users_raw: int | None
+    peripheries_raw: int | None
+    sections_raw: int | None
+    pgs_raw: int | None
+    language_id: str
+    language_raw: int | None
+    code_len_raw: int | None
+    code_prefix: bool | None
+    wpp_dedicated: bool | None
+    rfid_restrict: bool | None
+    simple_log: bool | None
+    default_config: bool | None
+    language_unlock_code: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ExportCommunicationFlags:
+    pcos_on: bool | None
+    ytun_persistent: bool | None
+    voice_menu_without_code: bool | None
+    ytun_log_disable: bool | None
+    wpp_lock: bool | None
+    ytun_device_info_disable: bool | None
+    ytun_enable: bool | None
+    comm_configured: bool | None
+    gsm_autoconfig_disabled: bool | None
+    send_sms_on_failed_arm: bool | None
+
+
+@dataclass(frozen=True)
+class ExportCommunicationSDCConfig:
+    flags_raw: int | None
+    allow_reports_alarm_voice: bool | None
+    sdc_position: int | None
+    sdc_position_name: str
+
+
+@dataclass(frozen=True)
+class ExportCommunicationsConfig:
+    flags: ExportCommunicationFlags
+    ytun_url: str
+    sms_resend_to_user: int | None
+    aes_key_ascii: str
+    aes_key_hex: str
+    ytun_key: str
+    rf_key_ascii: str
+    rf_key_hex: str
+    y0_hb_time_raw: int | None
+    data_channels_raw: list[int]
+    data_channels: list[str]
+    sms_channels_raw: list[int]
+    sms_channels: list[str]
+    voice_channels_raw: list[int]
+    voice_channels: list[str]
+    local_listen_port_raw: int | None
+    sdc: ExportCommunicationSDCConfig | None
+    service_access_raw: int | None
+    service_access_name: str
+
+
+@dataclass(frozen=True)
 class ExportCatalogSnapshot:
     path: Path
     users: list[UserRecord]
@@ -276,6 +339,8 @@ class ExportCatalogSnapshot:
     pgs_by_id: dict[int, ExportPGRecord]
     arcs_by_id: dict[int, ExportARCRecord]
     time_limit_groups_by_id: dict[int, ExportUserTimeLimitGroup]
+    main_config: ExportMainConfig | None
+    communications: ExportCommunicationsConfig | None
 
     @property
     def communicators_by_id(self) -> dict[int, ExportObjectRecord]:
@@ -647,6 +712,24 @@ def decode_msgpack_string(data: bytes, start: int) -> str:
     return data[offset : offset + length].decode("utf-8", "replace")
 
 
+def decode_msgpack_bin(data: bytes, start: int) -> tuple[bytes | None, int]:
+    if start >= len(data):
+        return None, start
+    marker = data[start]
+    if marker == 0xC4 and start + 1 < len(data):
+        length = data[start + 1]
+        offset = start + 2
+    elif marker == 0xC5 and start + 2 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 3], "big")
+        offset = start + 3
+    elif marker == 0xC6 and start + 4 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 5], "big")
+        offset = start + 5
+    else:
+        return None, start
+    return data[offset : offset + length], offset + length
+
+
 def decode_msgpack_int(data: bytes, start: int) -> tuple[Optional[int], int]:
     if start >= len(data):
         return None, start
@@ -661,12 +744,16 @@ def decode_msgpack_int(data: bytes, start: int) -> tuple[Optional[int], int]:
         return int.from_bytes(data[start + 1 : start + 3], "big"), start + 3
     if marker == 0xCE and start + 4 < len(data):
         return int.from_bytes(data[start + 1 : start + 5], "big"), start + 5
+    if marker == 0xCF and start + 8 < len(data):
+        return int.from_bytes(data[start + 1 : start + 9], "big"), start + 9
     if marker == 0xD0 and start + 1 < len(data):
         return int.from_bytes(data[start + 1 : start + 2], "big", signed=True), start + 2
     if marker == 0xD1 and start + 2 < len(data):
         return int.from_bytes(data[start + 1 : start + 3], "big", signed=True), start + 3
     if marker == 0xD2 and start + 4 < len(data):
         return int.from_bytes(data[start + 1 : start + 5], "big", signed=True), start + 5
+    if marker == 0xD3 and start + 8 < len(data):
+        return int.from_bytes(data[start + 1 : start + 9], "big", signed=True), start + 9
     return None, start
 
 
@@ -682,16 +769,30 @@ def decode_msgpack_value(data: bytes, start: int) -> tuple[object | None, int]:
         return False, start + 1
     if marker == 0xC3:
         return True, start + 1
-    if marker <= 0x7F or marker >= 0xE0 or marker in {0xCC, 0xCD, 0xCE, 0xD0, 0xD1, 0xD2}:
-        return decode_msgpack_int(data, start)
+    if marker <= 0x7F or marker >= 0xE0 or marker in {0xCC, 0xCD, 0xCE, 0xCF, 0xD0, 0xD1, 0xD2, 0xD3}:
+        value, end = decode_msgpack_int(data, start)
+        if end <= start:
+            raise ValueError(f"Invalid MessagePack integer at offset 0x{start:04x}")
+        return value, end
+    if marker in {0xC4, 0xC5, 0xC6}:
+        value, end = decode_msgpack_bin(data, start)
+        if end <= start:
+            raise ValueError(f"Invalid MessagePack binary blob at offset 0x{start:04x}")
+        return value, end
     if 0xA0 <= marker <= 0xBF or marker in {0xD9, 0xDA, 0xDB}:
-        return decode_msgpack_string(data, start), _skip_msgpack_string(data, start)
+        end = _skip_msgpack_string(data, start)
+        if end <= start:
+            raise ValueError(f"Invalid MessagePack string at offset 0x{start:04x}")
+        return decode_msgpack_string(data, start), end
     if 0x90 <= marker <= 0x9F:
         length = marker - 0x90
         cursor = start + 1
         items: list[object | None] = []
         for _ in range(length):
-            item, cursor = decode_msgpack_value(data, cursor)
+            item, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack array item at offset 0x{cursor:04x}")
+            cursor = next_cursor
             items.append(item)
         return items, cursor
     if 0x80 <= marker <= 0x8F:
@@ -699,8 +800,14 @@ def decode_msgpack_value(data: bytes, start: int) -> tuple[object | None, int]:
         cursor = start + 1
         mapping: dict[object, object | None] = {}
         for _ in range(length):
-            key, cursor = decode_msgpack_value(data, cursor)
-            value, cursor = decode_msgpack_value(data, cursor)
+            key, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack map key at offset 0x{cursor:04x}")
+            cursor = next_cursor
+            value, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack map value at offset 0x{cursor:04x}")
+            cursor = next_cursor
             mapping[normalize_msgpack_key(key)] = value
         return mapping, cursor
     if marker == 0xDC and start + 2 < len(data):
@@ -708,7 +815,10 @@ def decode_msgpack_value(data: bytes, start: int) -> tuple[object | None, int]:
         cursor = start + 3
         items: list[object | None] = []
         for _ in range(length):
-            item, cursor = decode_msgpack_value(data, cursor)
+            item, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack array16 item at offset 0x{cursor:04x}")
+            cursor = next_cursor
             items.append(item)
         return items, cursor
     if marker == 0xDE and start + 2 < len(data):
@@ -716,11 +826,32 @@ def decode_msgpack_value(data: bytes, start: int) -> tuple[object | None, int]:
         cursor = start + 3
         mapping: dict[object, object | None] = {}
         for _ in range(length):
-            key, cursor = decode_msgpack_value(data, cursor)
-            value, cursor = decode_msgpack_value(data, cursor)
+            key, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack map16 key at offset 0x{cursor:04x}")
+            cursor = next_cursor
+            value, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack map16 value at offset 0x{cursor:04x}")
+            cursor = next_cursor
             mapping[normalize_msgpack_key(key)] = value
         return mapping, cursor
-    return None, start
+    if marker == 0xDF and start + 4 < len(data):
+        length = int.from_bytes(data[start + 1 : start + 5], "big")
+        cursor = start + 5
+        mapping: dict[object, object | None] = {}
+        for _ in range(length):
+            key, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack map32 key at offset 0x{cursor:04x}")
+            cursor = next_cursor
+            value, next_cursor = decode_msgpack_value(data, cursor)
+            if next_cursor <= cursor:
+                raise ValueError(f"Invalid MessagePack map32 value at offset 0x{cursor:04x}")
+            cursor = next_cursor
+            mapping[normalize_msgpack_key(key)] = value
+        return mapping, cursor
+    raise ValueError(f"Unsupported MessagePack marker 0x{marker:02x} at offset 0x{start:04x}")
 
 
 def _skip_msgpack_string(data: bytes, start: int) -> int:
@@ -734,6 +865,13 @@ def _skip_msgpack_string(data: bytes, start: int) -> int:
     if marker == 0xDB and start + 4 < len(data):
         return start + 5 + int.from_bytes(data[start + 1 : start + 5], "big")
     return start
+
+
+def _extract_export_root_fields(blob: bytes) -> dict[int, object | None]:
+    root, _cursor = decode_msgpack_value(blob, 0)
+    if not isinstance(root, dict):
+        return {}
+    return {key: value for key, value in root.items() if isinstance(key, int)}
 
 
 def normalize_msgpack_key(key: object | None) -> object:
@@ -758,6 +896,14 @@ def value_as_int(value: object | None) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
+def value_as_flag_bool(value: object | None) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    return None
+
+
 def collect_nested_strings(value: object | None) -> list[str]:
     strings: list[str] = []
 
@@ -776,6 +922,137 @@ def collect_nested_strings(value: object | None) -> list[str]:
 
     visit(value)
     return strings
+
+
+def value_as_bytes(value: object | None) -> bytes | None:
+    return bytes(value) if isinstance(value, (bytes, bytearray)) else None
+
+
+def _decode_ascii_blob(value: object | None) -> str:
+    if isinstance(value, str):
+        return value
+    data = value_as_bytes(value)
+    if data is None:
+        return ""
+    return data.rstrip(b"\x00").decode("ascii", "replace")
+
+
+def _format_comm_channel_label(channel_id: int | None, objects_by_id: dict[int, ExportObjectRecord]) -> str:
+    if channel_id is None:
+        return ""
+    if channel_id == 0:
+        return "none"
+    object_record = objects_by_id.get(channel_id)
+    if object_record is not None:
+        return f"{channel_id}:{object_record.name}"
+    return str(channel_id)
+
+
+def _extract_export_main_config(root_fields: dict[int, object | None]) -> ExportMainConfig | None:
+    fields = root_fields.get(2)
+    if not isinstance(fields, dict):
+        return None
+    return ExportMainConfig(
+        users_raw=value_as_int(fields.get(0)),
+        peripheries_raw=value_as_int(fields.get(1)),
+        sections_raw=value_as_int(fields.get(2)),
+        pgs_raw=value_as_int(fields.get(3)),
+        language_id=value_as_string(fields.get(4)),
+        language_raw=value_as_int(fields.get(5)),
+        code_len_raw=value_as_int(fields.get(6)),
+        code_prefix=value_as_bool(fields.get(7)),
+        wpp_dedicated=value_as_bool(fields.get(8)),
+        rfid_restrict=value_as_bool(fields.get(9)),
+        simple_log=value_as_bool(fields.get(10)),
+        default_config=value_as_bool(fields.get(11)),
+        language_unlock_code=value_as_string(fields.get(12)),
+        name=value_as_string(fields.get(13)),
+    )
+
+
+def _extract_export_comm_flags(value: object | None) -> ExportCommunicationFlags:
+    fields = value if isinstance(value, dict) else {}
+    return ExportCommunicationFlags(
+        pcos_on=value_as_flag_bool(fields.get(0)),
+        ytun_persistent=value_as_flag_bool(fields.get(1)),
+        voice_menu_without_code=value_as_flag_bool(fields.get(2)),
+        ytun_log_disable=value_as_flag_bool(fields.get(3)),
+        wpp_lock=value_as_flag_bool(fields.get(4)),
+        ytun_device_info_disable=value_as_flag_bool(fields.get(5)),
+        ytun_enable=value_as_flag_bool(fields.get(6)),
+        comm_configured=value_as_flag_bool(fields.get(7)),
+        gsm_autoconfig_disabled=value_as_flag_bool(fields.get(8)),
+        send_sms_on_failed_arm=value_as_flag_bool(fields.get(9)),
+    )
+
+
+def _extract_export_comm_sdc(
+    value: object | None,
+    *,
+    objects_by_id: dict[int, ExportObjectRecord],
+) -> ExportCommunicationSDCConfig | None:
+    fields = value if isinstance(value, dict) else None
+    if fields is None:
+        return None
+    flags_raw = value_as_int(fields.get(0))
+    sdc_position = value_as_int(fields.get(1))
+    return ExportCommunicationSDCConfig(
+        flags_raw=flags_raw,
+        allow_reports_alarm_voice=None if flags_raw is None else bool(flags_raw & 0x1),
+        sdc_position=sdc_position,
+        sdc_position_name=_format_comm_channel_label(sdc_position, objects_by_id),
+    )
+
+
+def _extract_export_communications(
+    root_fields: dict[int, object | None],
+    *,
+    objects_by_id: dict[int, ExportObjectRecord],
+) -> ExportCommunicationsConfig | None:
+    fields = root_fields.get(5)
+    if not isinstance(fields, dict):
+        return None
+
+    def decode_channel_list(value: object | None) -> tuple[list[int], list[str]]:
+        raw_values: list[int] = []
+        labels: list[str] = []
+        if isinstance(value, list):
+            for item in value:
+                channel_id = value_as_int(item)
+                if channel_id is None:
+                    continue
+                raw_values.append(channel_id)
+                labels.append(_format_comm_channel_label(channel_id, objects_by_id))
+        return raw_values, labels
+
+    data_channels_raw, data_channels = decode_channel_list(fields.get(7))
+    sms_channels_raw, sms_channels = decode_channel_list(fields.get(8))
+    voice_channels_raw, voice_channels = decode_channel_list(fields.get(9))
+    aes_key = value_as_bytes(fields.get(3)) or b""
+    rf_key = value_as_bytes(fields.get(5)) or b""
+    service_access_raw = value_as_int(fields.get(12))
+
+    return ExportCommunicationsConfig(
+        flags=_extract_export_comm_flags(fields.get(0)),
+        ytun_url=value_as_string(fields.get(1)),
+        sms_resend_to_user=value_as_int(fields.get(2)),
+        aes_key_ascii=_decode_ascii_blob(aes_key),
+        aes_key_hex=aes_key.hex(),
+        ytun_key=value_as_string(fields.get(4)),
+        rf_key_ascii=_decode_ascii_blob(rf_key),
+        rf_key_hex=rf_key.hex(),
+        y0_hb_time_raw=value_as_int(fields.get(6)),
+        data_channels_raw=data_channels_raw,
+        data_channels=data_channels,
+        sms_channels_raw=sms_channels_raw,
+        sms_channels=sms_channels,
+        voice_channels_raw=voice_channels_raw,
+        voice_channels=voice_channels,
+        local_listen_port_raw=value_as_int(fields.get(10)),
+        sdc=_extract_export_comm_sdc(fields.get(11), objects_by_id=objects_by_id),
+        service_access_raw=service_access_raw,
+        service_access_name=ARC_SERVICE_ACCESS_NAMES.get(service_access_raw, ""),
+    )
 
 
 def parse_card_value(value: object | None) -> str:
@@ -1166,6 +1443,7 @@ def _parse_arc_specific_record(index: int, fields: dict[object, object | None]) 
 
 def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
     blob = read_decoded_export_blob(path)
+    root_fields = _extract_export_root_fields(blob)
     users = extract_users(path, dedupe="dedupe")
     time_limit_groups_by_id = extract_users_time_limits(path)
 
@@ -1317,6 +1595,9 @@ def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
             specific_by_name=specific_by_name,
         )
 
+    main_config = _extract_export_main_config(root_fields)
+    communications = _extract_export_communications(root_fields, objects_by_id=objects_by_id)
+
     return ExportCatalogSnapshot(
         path=path,
         users=users,
@@ -1326,6 +1607,8 @@ def extract_export_catalog(path: Path) -> ExportCatalogSnapshot:
         pgs_by_id=pgs_by_id,
         arcs_by_id=arcs_by_id,
         time_limit_groups_by_id=time_limit_groups_by_id,
+        main_config=main_config,
+        communications=communications,
     )
 
 

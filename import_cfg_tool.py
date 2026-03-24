@@ -21,15 +21,28 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Optional, Sequence
 
 from flexi_pcap_tool import USBPCAP_HEADER_LEN, get_frame_bytes
+from jablotron_re_tools import decode_msgpack_value as decode_export_msgpack_value
+from jablotron_re_tools import read_decoded_export_blob
 
 SECTOR_SIZE = 512
 IMPORT_COLLECTION_KEY = 7
+MAIN_CONFIG_KEY = 2
+COMMUNICATIONS_KEY = 5
+COMMUNICATIONS_FLAGS_FIELD = 0
+COMMUNICATIONS_WPP_LOCK_FIELD = 4
+COMMUNICATIONS_SERVICE_ACCESS_FIELD = 12
+MAIN_WPP_DEDICATED_FIELD = 8
 ENCODING_XOR = 0xFF
 PADDING_MARKER = b"\xC1" * 4
 PADDING_FILL = 0xFF
 MAX_SECTIONS = 15
 MAX_PG_GROUPS = 4
 MAX_PGS = 128
+SERVICE_ACCESS_MODES = {
+    "full": 0,
+    "off": 1,
+    "read": 2,
+}
 
 
 class MessagePackError(ValueError):
@@ -80,6 +93,24 @@ def unpack_msgpack(data: bytes, offset: int = 0) -> tuple[Any, int]:
             item, offset = unpack_msgpack(data, offset)
             value.append(item)
         return value, offset
+    if marker == 0xDC:
+        end = offset + 2
+        size = int.from_bytes(data[offset:end], "big")
+        offset = end
+        value = []
+        for _ in range(size):
+            item, offset = unpack_msgpack(data, offset)
+            value.append(item)
+        return value, offset
+    if marker == 0xDD:
+        end = offset + 4
+        size = int.from_bytes(data[offset:end], "big")
+        offset = end
+        value = []
+        for _ in range(size):
+            item, offset = unpack_msgpack(data, offset)
+            value.append(item)
+        return value, offset
     if 0xA0 <= marker <= 0xBF:
         size = marker & 0x1F
         end = offset + size
@@ -90,6 +121,21 @@ def unpack_msgpack(data: bytes, offset: int = 0) -> tuple[Any, int]:
         return False, offset
     if marker == 0xC3:
         return True, offset
+    if marker == 0xC4:
+        size = data[offset]
+        start = offset + 1
+        end = start + size
+        return data[start:end], end
+    if marker == 0xC5:
+        start = offset + 2
+        size = int.from_bytes(data[offset:start], "big")
+        end = start + size
+        return data[start:end], end
+    if marker == 0xC6:
+        start = offset + 4
+        size = int.from_bytes(data[offset:start], "big")
+        end = start + size
+        return data[start:end], end
     if marker == 0xCC:
         return data[offset], offset + 1
     if marker == 0xCD:
@@ -98,17 +144,52 @@ def unpack_msgpack(data: bytes, offset: int = 0) -> tuple[Any, int]:
     if marker == 0xCE:
         end = offset + 4
         return int.from_bytes(data[offset:end], "big"), end
+    if marker == 0xCF:
+        end = offset + 8
+        return int.from_bytes(data[offset:end], "big"), end
     if marker == 0xD0:
         return int.from_bytes(data[offset : offset + 1], "big", signed=True), offset + 1
     if marker == 0xD1:
         return int.from_bytes(data[offset : offset + 2], "big", signed=True), offset + 2
     if marker == 0xD2:
         return int.from_bytes(data[offset : offset + 4], "big", signed=True), offset + 4
+    if marker == 0xD3:
+        return int.from_bytes(data[offset : offset + 8], "big", signed=True), offset + 8
     if marker == 0xD9:
         size = data[offset]
         start = offset + 1
         end = start + size
         return data[start:end].decode("utf-8", "replace"), end
+    if marker == 0xDA:
+        size = int.from_bytes(data[offset : offset + 2], "big")
+        start = offset + 2
+        end = start + size
+        return data[start:end].decode("utf-8", "replace"), end
+    if marker == 0xDB:
+        size = int.from_bytes(data[offset : offset + 4], "big")
+        start = offset + 4
+        end = start + size
+        return data[start:end].decode("utf-8", "replace"), end
+    if marker == 0xDE:
+        end = offset + 2
+        size = int.from_bytes(data[offset:end], "big")
+        offset = end
+        value: MutableMapping[Any, Any] = OrderedDict()
+        for _ in range(size):
+            key, offset = unpack_msgpack(data, offset)
+            item, offset = unpack_msgpack(data, offset)
+            value[key] = item
+        return value, offset
+    if marker == 0xDF:
+        end = offset + 4
+        size = int.from_bytes(data[offset:end], "big")
+        offset = end
+        value: MutableMapping[Any, Any] = OrderedDict()
+        for _ in range(size):
+            key, offset = unpack_msgpack(data, offset)
+            item, offset = unpack_msgpack(data, offset)
+            value[key] = item
+        return value, offset
 
     raise MessagePackError(f"Unsupported MessagePack marker 0x{marker:02x} at offset 0x{offset - 1:04x}.")
 
@@ -144,15 +225,37 @@ def pack_msgpack(value: Any) -> bytes:
             return bytes([0xA0 | len(data)]) + data
         if len(data) <= 0xFF:
             return b"\xD9" + bytes([len(data)]) + data
-        raise MessagePackError("Only fixstr and str8 are supported.")
+        if len(data) <= 0xFFFF:
+            return b"\xDA" + len(data).to_bytes(2, "big") + data
+        if len(data) <= 0xFFFFFFFF:
+            return b"\xDB" + len(data).to_bytes(4, "big") + data
+        raise MessagePackError("String is too long for supported MessagePack encodings.")
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+        if len(data) <= 0xFF:
+            return b"\xC4" + bytes([len(data)]) + data
+        if len(data) <= 0xFFFF:
+            return b"\xC5" + len(data).to_bytes(2, "big") + data
+        if len(data) <= 0xFFFFFFFF:
+            return b"\xC6" + len(data).to_bytes(4, "big") + data
+        raise MessagePackError("Binary blob is too long for supported MessagePack encodings.")
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        if len(value) > 15:
-            raise MessagePackError("Only fixarray values up to length 15 are supported.")
-        return bytes([0x90 | len(value)]) + b"".join(pack_msgpack(item) for item in value)
+        if len(value) <= 15:
+            return bytes([0x90 | len(value)]) + b"".join(pack_msgpack(item) for item in value)
+        if len(value) <= 0xFFFF:
+            return b"\xDC" + len(value).to_bytes(2, "big") + b"".join(pack_msgpack(item) for item in value)
+        if len(value) <= 0xFFFFFFFF:
+            return b"\xDD" + len(value).to_bytes(4, "big") + b"".join(pack_msgpack(item) for item in value)
+        raise MessagePackError("Array is too large for supported MessagePack encodings.")
     if isinstance(value, Mapping):
-        if len(value) > 15:
-            raise MessagePackError("Only fixmap values up to length 15 are supported.")
-        payload = bytearray([0x80 | len(value)])
+        if len(value) <= 15:
+            payload = bytearray([0x80 | len(value)])
+        elif len(value) <= 0xFFFF:
+            payload = bytearray(b"\xDE" + len(value).to_bytes(2, "big"))
+        elif len(value) <= 0xFFFFFFFF:
+            payload = bytearray(b"\xDF" + len(value).to_bytes(4, "big"))
+        else:
+            raise MessagePackError("Map is too large for supported MessagePack encodings.")
         for key, item in value.items():
             payload.extend(pack_msgpack(key))
             payload.extend(pack_msgpack(item))
@@ -192,11 +295,14 @@ def describe_payload(payload: Any) -> dict[str, Any]:
     }
 
     if not isinstance(payload, Mapping) or len(payload) != 1:
+        if isinstance(payload, Mapping):
+            summary["top_level_keys"] = list(payload.keys())
         return summary
 
     collection_key, collection_value = next(iter(payload.items()))
     summary["collection"] = collection_key
     if not isinstance(collection_value, Mapping) or len(collection_value) != 1:
+        summary["top_level_keys"] = list(payload.keys())
         return summary
 
     user_id, user_value = next(iter(collection_value.items()))
@@ -466,19 +572,68 @@ def build_user_delete_payload(user_id: int) -> OrderedDict[Any, Any]:
     return OrderedDict({IMPORT_COLLECTION_KEY: OrderedDict({int(user_id): None})})
 
 
+def clone_msgpack_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return OrderedDict((key, clone_msgpack_value(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return [clone_msgpack_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [clone_msgpack_value(item) for item in value]
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return value
+
+
+def load_export_root(path: Path) -> OrderedDict[Any, Any]:
+    root, _cursor = decode_export_msgpack_value(read_decoded_export_blob(path), 0)
+    if not isinstance(root, Mapping):
+        raise SystemExit(f"{path} did not decode to a top-level MessagePack map.")
+    return clone_msgpack_value(root)
+
+
+def json_ready(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        return OrderedDict(
+            {
+                "__type__": "bytes",
+                "hex": raw.hex(),
+                "ascii": raw.rstrip(b"\x00").decode("ascii", "replace"),
+            }
+        )
+    if isinstance(value, list):
+        return [json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_ready(item) for item in value]
+    if isinstance(value, Mapping):
+        normalized: OrderedDict[str, Any] = OrderedDict()
+        for key, item in value.items():
+            normalized[str(key)] = json_ready(item)
+        return normalized
+    return value
+
+
 def print_summary(summary: Mapping[str, Any]) -> None:
     for key, value in summary.items():
         print(f"{key}: {value}")
 
 
 def print_json(data: Any) -> None:
-    print(json.dumps(data, indent=2, ensure_ascii=False))
+    print(json.dumps(json_ready(data), indent=2, ensure_ascii=False))
 
 
 def normalize_json_value(value: Any) -> Any:
     if isinstance(value, list):
         return [normalize_json_value(item) for item in value]
     if isinstance(value, dict):
+        if value.get("__type__") == "bytes":
+            hex_value = value.get("hex")
+            if isinstance(hex_value, str):
+                return bytes.fromhex(hex_value)
+            ascii_value = value.get("ascii")
+            if isinstance(ascii_value, str):
+                return ascii_value.encode("ascii")
+            raise SystemExit("JSON bytes object requires either a string 'hex' or 'ascii' field.")
         normalized: OrderedDict[Any, Any] = OrderedDict()
         for key, item in value.items():
             normalized_key: Any = key
@@ -487,6 +642,68 @@ def normalize_json_value(value: Any) -> Any:
             normalized[normalized_key] = normalize_json_value(item)
         return normalized
     return value
+
+
+def parse_service_access_mode(spec: str) -> int:
+    lowered = spec.strip().lower()
+    if lowered in SERVICE_ACCESS_MODES:
+        return SERVICE_ACCESS_MODES[lowered]
+    return int(spec, 0)
+
+
+def apply_toggle(spec: str) -> bool | None:
+    if spec == "preserve":
+        return None
+    return spec == "on"
+
+
+def build_communications_patch_payload(args: argparse.Namespace) -> tuple[OrderedDict[Any, Any], OrderedDict[str, Any]]:
+    export_root = load_export_root(Path(args.export_cfg))
+    communications = export_root.get(COMMUNICATIONS_KEY)
+    if not isinstance(communications, Mapping):
+        raise SystemExit(f"{args.export_cfg} does not contain top-level key {COMMUNICATIONS_KEY}.")
+    communications_patch = clone_msgpack_value(communications)
+    if not isinstance(communications_patch, MutableMapping):
+        raise SystemExit("Decoded communications block is not mutable.")
+
+    changes: OrderedDict[str, Any] = OrderedDict()
+    service_access_raw = parse_service_access_mode(args.service_access)
+    changes["communications.service_access"] = {
+        "from": communications_patch.get(COMMUNICATIONS_SERVICE_ACCESS_FIELD),
+        "to": service_access_raw,
+    }
+    communications_patch[COMMUNICATIONS_SERVICE_ACCESS_FIELD] = service_access_raw
+
+    wpp_lock_value = apply_toggle(args.wpp_lock)
+    if wpp_lock_value is not None:
+        flags = communications_patch.get(COMMUNICATIONS_FLAGS_FIELD)
+        if not isinstance(flags, MutableMapping):
+            raise SystemExit("Communications.flags is not a mutable map in the saved export.")
+        changes["communications.flags.wpp_lock"] = {
+            "from": flags.get(COMMUNICATIONS_WPP_LOCK_FIELD),
+            "to": wpp_lock_value,
+        }
+        flags[COMMUNICATIONS_WPP_LOCK_FIELD] = wpp_lock_value
+
+    payload: OrderedDict[Any, Any] = OrderedDict()
+
+    wpp_dedicated_value = apply_toggle(args.wpp_dedicated)
+    if wpp_dedicated_value is not None:
+        main_config = export_root.get(MAIN_CONFIG_KEY)
+        if not isinstance(main_config, Mapping):
+            raise SystemExit(f"{args.export_cfg} does not contain top-level key {MAIN_CONFIG_KEY}.")
+        main_patch = clone_msgpack_value(main_config)
+        if not isinstance(main_patch, MutableMapping):
+            raise SystemExit("Decoded main config block is not mutable.")
+        changes["main.wpp_dedicated"] = {
+            "from": main_patch.get(MAIN_WPP_DEDICATED_FIELD),
+            "to": wpp_dedicated_value,
+        }
+        main_patch[MAIN_WPP_DEDICATED_FIELD] = wpp_dedicated_value
+        payload[MAIN_CONFIG_KEY] = main_patch
+
+    payload[COMMUNICATIONS_KEY] = communications_patch
+    return payload, changes
 
 
 def write_output(path: Path, encoded_sector: bytes) -> None:
@@ -536,6 +753,24 @@ def cmd_build_user_delete(args: argparse.Namespace) -> None:
     write_output(Path(args.output), encoded_sector)
     print(f"wrote {args.output}")
     print_json({"summary": describe_payload(payload), "payload": payload})
+
+
+def cmd_build_communications_patch(args: argparse.Namespace) -> None:
+    payload, changes = build_communications_patch_payload(args)
+    encoded_sector = encode_sector(payload)
+    write_output(Path(args.output), encoded_sector)
+    print(f"wrote {args.output}")
+    print_json(
+        {
+            "summary": {
+                "operation": "communications_patch",
+                "base_export_cfg": args.export_cfg,
+                "top_level_keys": list(payload.keys()),
+                "changes": changes,
+            },
+            "payload": payload,
+        }
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -596,6 +831,35 @@ def build_parser() -> argparse.ArgumentParser:
     delete.add_argument("output", help="Output file for the encoded 512-byte sector.")
     delete.add_argument("--user-id", required=True, type=int, help="Target user ID.")
     delete.set_defaults(func=cmd_build_user_delete)
+
+    comm_patch = subparsers.add_parser(
+        "build-communications-patch",
+        help="Build an encoded top-level communications patch sector from a saved EXPORT.CFG base.",
+    )
+    comm_patch.add_argument("output", help="Output file for the encoded 512-byte sector.")
+    comm_patch.add_argument(
+        "--export-cfg",
+        required=True,
+        help="Saved EXPORT.CFG blob used as the base object for the patch.",
+    )
+    comm_patch.add_argument(
+        "--service-access",
+        default="full",
+        help="Target cfg_communications_t.service_access mode: full/off/read or a raw integer (default: full).",
+    )
+    comm_patch.add_argument(
+        "--wpp-lock",
+        choices=["preserve", "on", "off"],
+        default="preserve",
+        help="Optionally override cfg_comm_flags_t.wpp_lock.",
+    )
+    comm_patch.add_argument(
+        "--wpp-dedicated",
+        choices=["preserve", "on", "off"],
+        default="preserve",
+        help="Optionally override cfg_main_t.wpp_dedicated.",
+    )
+    comm_patch.set_defaults(func=cmd_build_communications_patch)
 
     return parser
 
