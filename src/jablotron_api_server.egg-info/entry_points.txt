@@ -1,0 +1,2 @@
+[console_scripts]
+jablotron-api-server = jablotron_api.cli.main:main

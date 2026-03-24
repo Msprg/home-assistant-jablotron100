@@ -14,7 +14,7 @@ from homeassistant.const import (
 from typing import Dict
 from . import JablotronConfigEntry
 from .const import EntityType
-from .jablotron import Jablotron, JablotronControl, JablotronEntity
+from .api_runtime import Jablotron, JablotronControl, JablotronEntity
 
 BINARY_SENSOR_TYPES: Dict[EntityType, BinarySensorEntityDescription] = {
 	EntityType.BATTERY_PROBLEM: BinarySensorEntityDescription(

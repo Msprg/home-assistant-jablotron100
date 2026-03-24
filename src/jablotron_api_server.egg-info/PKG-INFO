@@ -1,3 +1,22 @@
+Metadata-Version: 2.4
+Name: jablotron-api-server
+Version: 0.1.0
+Summary: Jablotron API server and Home Assistant client integration
+Author: OpenAI Codex
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE.md
+Requires-Dist: fastapi<1,>=0.115.0
+Requires-Dist: uvicorn<1,>=0.32.0
+Requires-Dist: pydantic<3,>=2.9.0
+Requires-Dist: httpx<1,>=0.27.0
+Requires-Dist: websockets<16,>=13.0
+Requires-Dist: msgpack<2,>=1.1.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Dynamic: license-file
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/hacs/default)
 
 # Jablotron 100+
@@ -18,17 +37,7 @@ This repository now also contains a Python `jablotron-api-server` that owns the 
 docker build -t jablotron-api-server:latest .
 ```
 
-2. Create a CA, server certificate, and client certificate. The server expects mTLS, so the client must present a certificate signed by the configured CA. For development and alpha testing, the repo now includes a helper that generates a local development CA and matching server/client certs:
-
-```bash
-chmod +x scripts/generate-dev-certs.sh
-scripts/generate-dev-certs.sh .dev-certs \
-  --ip 127.0.0.1 \
-  --dns jablotron-api-server.brainit.tech
-mkdir -p .dev-data
-```
-
-If you will connect from Home Assistant by LAN IP, add that IP with another `--ip` flag. See [docs/dev-mtls.md](docs/dev-mtls.md).
+2. Create a CA, server certificate, and client certificate. The server expects mTLS, so the client must present a certificate signed by the configured CA.
 
 3. Run the server in demo mode for a full smoke test without panel hardware:
 
@@ -73,87 +82,6 @@ python3 jablotron_api_client_tool.py status \
 - The integration now connects to the API server instead of direct USB/HID access.
 - Section names, PG names, and discovered peripheral metadata are pulled from `/v1/export/catalog`; they no longer need to be counted and named manually in the config flow.
 - The integration config flow now asks for `server_url`, `api_token`, and optional CA/client certificate paths.
-- The HACS-installable API integration now lives in the `jablotron100-api-HASS` git submodule under the non-conflicting domain `jablotron100_api_hass`, so it can be installed alongside the original `jablotron100` integration.
-
-### Home Assistant install, test, and debug
-
-The best current workflow is:
-
-1. Run the API server from this checkout on the machine that has the panel attached.
-
-```bash
-python3 -m jablotron_api.cli.main server \
-  --host 0.0.0.0 \
-  --port 8443 \
-  --tls-certfile /path/to/server.crt \
-  --tls-keyfile /path/to/server.key \
-  --tls-ca-certs /path/to/ca.crt \
-  --panel-port auto \
-  --panel-auth-code 1812
-```
-
-2. Generate development certs if you have not already:
-
-```bash
-scripts/generate-dev-certs.sh .dev-certs \
-  --ip YOUR_SERVER_LAN_IP \
-  --dns jablotron-api-server.brainit.tech
-```
-
-3. Create a client certificate and token for Home Assistant. Use scopes at least `system:read`, `status:read`, `config:read`, `events:read`, `sections:control`, and `pgs:control`.
-
-4. Install the custom component into the Home Assistant config directory as a symlink or copy. During active development, a symlink is the fastest option:
-
-```bash
-ln -s /home/administrator/home-assistant-jablotron100/custom_components/jablotron100 \
-  /path/to/home-assistant-config/custom_components/jablotron100
-```
-
-5. Put the CA certificate, Home Assistant client certificate, and Home Assistant client key somewhere the Home Assistant process can read them.
-
-6. Restart Home Assistant, add the `Jablotron 100+` integration, and enter:
-   - `server_url`: `https://HOST:8443`
-   - `api_token`
-   - `tls_ca_cert`
-   - `tls_client_cert`
-   - `tls_client_key`
-
-7. Test the parity-critical paths first:
-   - arm and disarm each section
-   - toggle PG outputs
-   - confirm device binary sensors update
-   - confirm temperature sensors, wireless battery levels, and wireless signal strengths appear
-   - confirm LAN and GSM entities appear where the panel model supports them
-   - if `require_code_to_arm` or `require_code_to_disarm` is enabled, intentionally enter a bad code once and confirm the `jablotron100_wrong_code` event fires
-
-8. Turn on debug logging in Home Assistant while testing:
-
-```yaml
-logger:
-  logs:
-    custom_components.jablotron100: debug
-```
-
-9. Attach your debugger to the Home Assistant `debugpy` port you already enabled in `configuration.yaml`. The most useful breakpoints are usually in:
-   - `custom_components/jablotron100/api_runtime.py`
-   - `custom_components/jablotron100/api_client.py`
-   - `custom_components/jablotron100/alarm_control_panel.py`
-   - `custom_components/jablotron100/binary_sensor.py`
-   - `custom_components/jablotron100/sensor.py`
-   - `custom_components/jablotron100/switch.py`
-
-10. If you also want to debug the server side, run the server under `debugpy` separately from Home Assistant:
-
-```bash
-python3 -m debugpy --listen 127.0.0.1:5679 -m jablotron_api.cli.main server \
-  --host 0.0.0.0 \
-  --port 8443 \
-  --tls-certfile /path/to/server.crt \
-  --tls-keyfile /path/to/server.key \
-  --tls-ca-certs /path/to/ca.crt \
-  --panel-port auto \
-  --panel-auth-code 1812
-```
 
 
 ## Features

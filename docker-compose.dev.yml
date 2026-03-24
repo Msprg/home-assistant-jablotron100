@@ -1,0 +1,28 @@
+services:
+  jablotron-api:
+    build: .
+    image: jablotron-api-server:latest
+    restart: unless-stopped
+    environment:
+      JABLOTRON_API_DB_PATH: /data/jablotron-api.db
+      JABLOTRON_API_PORT: "8443"
+      JABLOTRON_API_TLS_CERTFILE: /data/certs/server.crt
+      JABLOTRON_API_TLS_KEYFILE: /data/certs/server.key
+      JABLOTRON_API_TLS_CA_CERTS: /data/certs/ca.crt
+      JABLOTRON_API_RUNTIME_MODE: "${JABLOTRON_API_RUNTIME_MODE:-live}"
+      JABLOTRON_PANEL_AUTH_CODE: "${JABLOTRON_PANEL_AUTH_CODE:-1812}"
+      JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-/dev/hidraw0}"
+      JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-/dev/sdb1}"
+      JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-/dev/sdd1}"
+    volumes:
+      - ./.dev-data:/data
+      - ./.dev-certs:/data/certs:ro
+    device_cgroup_rules:
+      - "c 13:* rmw"
+      - "b *:* rmw"
+    devices:
+      - /dev/hidraw0:/dev/hidraw0
+      - /dev/sdb1:/dev/sdb1
+      - /dev/sdd1:/dev/sdd1
+    ports:
+      - "8443:8443"

@@ -3,12 +3,13 @@
 		"step": {
 			"user": {
 				"title": "Jablotron 100",
-				"description": "To enable devices support insert administrator's code and total number of devices",
+				"description": "Connect Home Assistant to the Jablotron API server",
 				"data": {
-					"serial_port": "Serial port",
-					"password": "Code",
-					"number_of_devices": "Number of devices",
-					"number_of_pg_outputs": "Number of programmable PG outputs"
+					"server_url": "Server URL",
+					"api_token": "API token",
+					"tls_ca_cert": "CA certificate path",
+					"tls_client_cert": "Client certificate path",
+					"tls_client_key": "Client key path"
 				}
 			},
 			"devices": {
@@ -493,6 +494,7 @@
 			}
 		},
 		"error": {
+			"cannot_connect": "Cannot connect to the Jablotron API server",
 			"service_unavailable": "Jablotron is not available",
 			"model_not_detected": "Model of Jablotron not detected",
 			"model_not_supported": "Model of Jablotron not supported"

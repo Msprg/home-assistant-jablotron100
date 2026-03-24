@@ -1,0 +1,266 @@
+# Jablotron API Server Refactor Status
+
+## Objective
+- Merge the current Home Assistant integration and reverse-engineering work into a maintainable Python API server with a server-backed Home Assistant client integration.
+
+## Architectural Decisions In Force
+- Single server process owns one USB-connected panel.
+- API transport is `HTTPS` + `WebSocket`.
+- mTLS is required at transport startup; app-layer token binding supports an optional certificate fingerprint input for authorization binding.
+- REST uses scoped bearer tokens.
+- WebSocket topic subscriptions are scope-filtered using the same token scopes as REST routes.
+- Panel writes remain serialized through one runtime lock.
+- Fresh `EXPORT.CFG` pulls remain the authoritative verification source after writes.
+- A `demo` runtime mode exists for container/client/integration smoke tests without panel hardware.
+
+## Workstreams
+- [x] Add installable Python package and package layout under `src/jablotron_api/`
+- [x] Add SQLite-backed token store and audit log
+- [x] Add FastAPI app with `/v1` REST surface and `/v1/ws`
+- [x] Add reference Python client
+- [x] Add initial `PanelRuntime` built on current RE helpers
+- [x] Add demo runtime for container/client smoke tests without hardware
+- [ ] Move remaining repo-root business logic fully into package modules
+- [x] Complete Home Assistant migration to API-backed runtime with legacy entity/state parity
+- [x] Fill out communicator/time-limit export endpoints with full decoded payloads
+- [x] Harden client certificate fingerprint extraction for direct ASGI transport instead of header-assisted binding
+- [x] Add container files and initial deployment artifacts
+- [x] Add initial API/auth/WebSocket tests
+
+## Current File / Module Layout
+- `src/jablotron_api/domain/models.py`: stable Pydantic API models
+- `src/jablotron_api/protocol/legacy.py`: live HID query/control adapter using existing helpers
+- `src/jablotron_api/panel/runtime.py`: cached panel runtime, background polling, export/user/event access
+- `src/jablotron_api/panel/demo.py`: in-memory runtime for demo-mode smoke tests
+- `src/jablotron_api/services/storage.py`: SQLite token/audit/snapshot store
+- `src/jablotron_api/services/auth.py`: scope enforcement helpers
+- `src/jablotron_api/server/app.py`: FastAPI application factory and routes
+- `src/jablotron_api/server/ws.py`: WebSocket connection manager
+- `src/jablotron_api/client/api.py`: reference async client
+- `src/jablotron_api/cli/main.py`: server/bootstrap/reference client CLI
+- `custom_components/jablotron100/api_runtime.py`: Home Assistant runtime backed by the API server
+- `custom_components/jablotron100/api_client.py`: Home Assistant HTTP/WebSocket client
+- `jablotron100-api-HASS/custom_components/jablotron100_api_hass/`: HACS-installable API-backed Home Assistant integration under a non-conflicting domain
+- `Dockerfile`, `docker-compose.yml`: container-first deployment artifacts
+
+## Implemented Endpoints / Features
+- `GET /v1/health`
+- `GET /v1/system`
+- `GET /v1/status`
+- `GET /v1/sections`
+- `GET /v1/pgs`
+- `GET /v1/devices`
+- `POST /v1/sections/{id}/arm`
+- `POST /v1/sections/{id}/disarm`
+- `POST /v1/pgs/{id}/on`
+- `POST /v1/pgs/{id}/off`
+- `GET /v1/users`
+- `GET /v1/users/{id}`
+- `POST /v1/users`
+- `PATCH /v1/users/{id}`
+- `DELETE /v1/users/{id}`
+- `GET /v1/events`
+- `GET /v1/events/recent`
+- `GET /v1/export/users`
+- `GET /v1/export/catalog`
+- `GET /v1/export/time-limits`
+- `GET /v1/export/communications`
+- `POST /v1/tokens`
+- `GET /v1/tokens`
+- `DELETE /v1/tokens/{id}`
+- `GET /v1/ws`
+- Client-facing status/control/user surfaces now enforce usable initial-setup ranges while raw export endpoints remain unrestricted:
+  - `/v1/status`, `/v1/sections`, `/v1/pgs`, `/v1/devices`
+  - `/v1/users`, `/v1/users/{id}`, and user CRUD writes
+  - section arm/disarm and PG on/off control routes
+- `GET /v1/export/catalog` now exposes both:
+  - `initial_setup`: exact export-derived limits when available, otherwise documented inferred limits
+  - `raw_counts`: full raw catalog breadth for reverse-engineering and low-level tooling
+
+## Remaining Gaps / Known Blockers
+- Repo-root reverse-engineering tools are not yet reduced to thin wrappers.
+- The remaining major validation task is real Home Assistant alpha testing against a live server and panel, not a known missing parity feature in the integration code.
+- The HACS-facing API integration now lives in the `jablotron100-api-HASS` git submodule and still needs the usual downstream release/tag flow in that repo once the first alpha packaging round is accepted.
+- Development/deployment docs now cover a low-friction local mTLS path, but the first real Home Assistant alpha installation against that path still needs to be exercised end to end.
+
+## Testing Status
+- Legacy repo tests still existed before the refactor and passed at the start of this implementation pass.
+- Added initial API server tests for:
+  - health + system routes
+  - token-authenticated user CRUD routes
+  - WebSocket subscription handshake + snapshot delivery
+- Added auth tests for scope denial, token revocation, and certificate-bound tokens.
+- Added tests for:
+  - export-catalog `initial_setup` and `raw_counts` exposure
+  - client-facing range rejection for out-of-range sections, PGs, and users
+  - ASGI-scope TLS fingerprint binding on HTTP requests
+- Added tests for:
+  - exact root-map extraction from `EXPORT.CFG` blobs with trailing data
+  - FAT16 export-file discovery and cluster-chain walking for direct live pulls
+- Added Home Assistant parity tests for:
+  - legacy control ID recreation
+  - dynamic central/device diagnostic entity creation
+  - wrong-code event forwarding in the API-backed runtime
+- Current local result after the latest implementation pass: `16 passed` via `venv/bin/pytest -q`
+- Remaining test gaps:
+  - runtime integration against mocked RE helper failures
+  - Home Assistant integration behavior
+  - full live hardware validation on a real panel
+
+## Hardware Validation Status
+- Demo-mode validation is now an explicit part of the smoke-test path and does not replace live panel validation.
+- Verified the dockerized demo path on 2026-03-24:
+  - built `jablotron-api-server:test`
+  - generated a local CA, server cert, and client cert
+  - ran the container with `JABLOTRON_API_RUNTIME_MODE=demo`
+  - created an admin token in the mounted SQLite DB with `jablotron_api_admin_tool.py`
+  - confirmed `jablotron_api_client_tool.py system` and `status` over mTLS
+  - confirmed control commands `arm 1 --mode away` and `pg-off 2`
+  - confirmed `jablotron_api_client_tool.py ws --topic status --topic catalog --count 3`
+  - confirmed a request without a client cert failed at the TLS/connection layer
+  - confirmed a cert-bound token now succeeds over direct mTLS transport without any manual fingerprint query/header override
+- Verified live read-only panel access on 2026-03-24 with the panel connected to `/dev/hidraw0`, `FLEXI_CFG` on `/dev/sdb1`, and `FLEXI_LOG` on `/dev/sdd1`:
+  - low-level HID system-info read returned panel model `JA-107K`, hardware `MD6112.09.1`, firmware `MD12007`
+  - runtime status read returned 6 section states over USB
+  - export refresh + extraction returned a non-empty catalog with 14 sections, 128 PGs, 55 objects/devices, and 102 deduped users
+  - runtime recent-events read returned decoded archive records after fixing the event-field mapping bug
+  - runtime status now applies export-catalog names to live section and PG state rows, so `/v1/status` and `/v1/export/catalog` agree on names
+  - initial-setup usable limits are now exposed and enforced on the live path with inferred values matching the known F-Link export for this panel:
+    - sections `6`
+    - devices `50`
+    - users `100`
+    - PG outputs `20`
+  - live runtime status is now filtered to those client-facing limits, returning `6` sections, `20` PGs, and `50` device rows while raw export catalog still reports the full `14` / `128` / `55` breadth
+  - local live API server run on `https://127.0.0.1:9444` served `system`, `status`, `devices`, and `events` successfully through the thin TLS client wrapper
+  - no write/control endpoints were exercised during the live panel validation pass
+  - reversed the late export-blob issue and confirmed the root cause was a truncated direct file read rather than an unsupported export variant:
+    - `EXPORT.CFG` on the live `FLEXI_CFG` volume starts at the FAT16 data area, sector `34`
+    - the old direct-read defaults started at sector `35`, so the first 512-byte sector of the file was dropped
+    - when read from the correct start sector, the live export decodes as a normal top-level MessagePack map and `main_config` is present exactly
+    - exact live `main_config` values from the connected panel now decode as:
+      - users `100`
+      - peripheries/devices `50`
+      - sections `6`
+      - PG outputs `20`
+      - language `SK`
+      - code length `4`
+      - code prefix `False`
+      - system name `VO 66`
+  - verified a fresh patched live pull with `venv/bin/python export_cfg_tool.py pull-live ...` and confirmed `extract-communications` now returns the exact current `main_config` and communicator data from the live panel
+  - verified the richer parity-oriented live snapshot path on the connected panel:
+    - central LAN IP is decoded on the live path
+    - thermostat/smoke temperatures are decoded on the live path
+    - wireless battery level and signal strength values are decoded on the live path
+    - the current live panel still does not appear to expose extra central battery/bus data through the same path on `JA-107K`, which matches the practical limits of the earlier integration's model-specific queries
+- Runtime operations currently rely on the already proven helpers:
+  - live export pulls
+  - event archive pulls
+  - user CRUD via `IMPORT.CFG` staging + authoritative export verification
+  - section and PG control via HID UI packets
+
+## Latest Decisions / Assumptions
+- Use the current proven helper stack first, then progressively internalize logic into the new package.
+- Prefer cached export/catalog reads plus periodic live status polling instead of a complex long-lived HID stream in the first server cut.
+- Treat F-Link initial-setup limits as a higher-layer client contract rather than a low-level raw-config restriction:
+  - raw export endpoints remain full-fidelity
+  - client-facing status/control/user endpoints enforce usable ranges
+  - Home Assistant consumes the exposed usable-range metadata and ignores raw tail capacity outside that range
+- When `main_config` is absent, infer usable ranges pragmatically from catalog structure:
+  - sections from real device section assignments
+  - devices from contiguous non-system object IDs
+  - users from the highest regular user ID below the internal high-ID range
+  - PG outputs from the first long all-default suffix in the PG catalog
+- Exact export decoding for `main_config` now depends on reading the real `EXPORT.CFG` file bytes from the FAT16 volume instead of assuming a fixed raw sector window.
+- Root export-map extraction now uses standard MessagePack unpacking of the first top-level object, which is robust to trailing padding or appended data after the root map.
+- Keep the document authoritative for implementation state and next steps.
+
+## Next Recommended Tasks
+1. Move the remaining reusable logic from root RE scripts into `src/jablotron_api/`.
+2. Add more failure-path tests around runtime/helper exceptions and WebSocket scope denials.
+3. Perform Home Assistant alpha testing against the server-backed integration and record any real-world parity gaps here.
+4. Decide whether the remaining root-level reverse-engineering CLIs should become thin wrappers or stay as explicitly low-level tooling outside the server package.
+5. Add a documented migration step for any users who tested the earlier alpha API runtime with the pre-parity control IDs.
+6. Decide whether the legacy `custom_components/jablotron100` tree in the main repo should stay as an internal development copy or be reduced once the submodule-based HACS package is the only supported install path.
+
+## Progress Log
+### 2026-03-24
+- Added the initial installable `jablotron_api` package, FastAPI app, WebSocket manager, SQLite token store, reference client, CLI, and first `PanelRuntime`.
+- Chose a pragmatic first server cut that wraps existing proven RE helpers instead of fully relocating all logic immediately.
+- Recorded the current limitation around certificate fingerprint extraction for direct ASGI transport; transport-level mTLS is intended, but app-layer fingerprint binding still needs server-level peer-cert plumbing.
+- Added container build/deploy artifacts and initial FastAPI route/WebSocket tests.
+- Migrated the Home Assistant integration to a first API-backed runtime without removing the legacy HID-oriented module used by the low-level reverse-engineering tools.
+- Verified the repo test suite after the refactor: `venv/bin/pytest -q` completed with `6 passed`.
+- Added a packaged demo runtime so the docker image, mTLS wiring, client wrappers, and Home Assistant integration can be smoke-tested without a live panel.
+- Expanded the reference client and thin wrappers to support mTLS certificates on both REST and WebSocket connections, plus control-oriented alpha-test commands.
+- Tightened WebSocket authorization so topic subscriptions are filtered by token scopes and catalog snapshots use a dedicated `catalog` topic instead of overloading `system`.
+- Updated the Home Assistant API runtime to consume catalog-driven section/PG/device names directly, so section and peripheral naming no longer depends on manual generic setup.
+- Completed a real dockerized smoke test of the demo runtime with generated mTLS material and the root wrapper tools; the next missing validation step is live hardware testing against a real panel and Home Assistant alpha testing against that server.
+- Performed a live read-only validation pass against the connected panel and found/fixed two concrete runtime issues: export catalog refresh reliability on the live path and decoded recent-event field mapping.
+- Finished catalog-name unification so live status rows now reuse export-derived section and PG names instead of generic placeholders.
+- Implemented initial-setup aware client-facing limits:
+  - `ExportCatalogModel` now exposes `initial_setup` and `raw_counts`
+  - `PanelRuntime` now filters status/users/control operations to usable ranges while keeping `/v1/export/*` raw
+  - Home Assistant catalog consumption now respects those usable ranges instead of blindly creating entities for raw tail capacity
+- Investigated the live export and confirmed that `main_config` is still `None` for the current panel/export variant, so the first implementation uses a documented inference fallback instead of pretending the limits were decoded exactly.
+- Verified on the live connected panel that the inferred usable limits match the known F-Link values (`6` sections, `50` devices, `100` users, `20` PG outputs) and that filtered runtime status now returns exactly `6` sections, `20` PGs, and `50` devices.
+- Verified the full local test suite after the initial-setup implementation: `venv/bin/pytest -q` completed with `10 passed`.
+- Added direct transport-aware TLS fingerprint extraction by running the bundled server with custom Uvicorn protocol classes that inject the client certificate fingerprint into ASGI scope for both HTTP and WebSocket.
+- Verified that a cert-bound token now authenticates successfully over the real demo-mode TLS server without the previous manual fingerprint parameter.
+- Reversed the late export-blob issue and confirmed the live panel was not producing a special unsupported export format; the direct-read path was simply omitting the first sector of `EXPORT.CFG`.
+- Added FAT16-based `EXPORT.CFG` discovery and exact file reading for live direct pulls, with fallback to the previous raw-sector method only if the filesystem-based path fails.
+- Switched root export-map extraction to standard MessagePack unpacking of the first top-level object so valid exports still decode even if trailing bytes remain after the root map.
+- Verified against the connected live panel that a fresh patched pull now decodes `main_config` exactly, including `users=100`, `peripheries=50`, `sections=6`, `pgs=20`, `language=SK`, `code_len=4`, and `name='VO 66'`.
+- Added focused regression tests for root export extraction and FAT16 export-file discovery/cluster walking, and verified the suite at `11 passed`.
+- Completed the API-backed Home Assistant parity pass:
+  - restored legacy control IDs such as `section_1`, `device_sensor_2`, `device_problem_sensor_2`, `pulses_4`, `lan`, and `gsm_signal_sensor`
+  - recreated the legacy entity surface from API data, including central-unit sensors, device problem sensors, wireless signal/battery sensors, temperature sensors, pulse sensors, and wrong-code event forwarding
+  - added optional user-supplied code forwarding on section arm/disarm API calls so the API-backed integration can surface `wrong_code` behavior again
+  - expanded the server status model to carry per-device diagnostic fields plus central-unit LAN/GSM/power/bus data where the panel path exposes them
+- Verified the richer live snapshot path against the connected panel: real thermostat/smoke temperatures, wireless battery levels, wireless signal strengths, and LAN IP are now decoded through the server-side parity path.
+- Fixed a packaging regression in the new legacy adapter so the server can still be imported by the system Python without requiring the full Home Assistant package to be installed globally.
+- Added parity-focused tests and verified the suite at `16 passed`.
+- Moved the API-backed Home Assistant integration into the prepared `jablotron100-api-HASS` git submodule as a HACS-ready package:
+  - new installable domain: `jablotron100_api_hass`
+  - new visible integration name: `jablotron100-api-HASS`
+  - added submodule-root `hacs.json` and `README.md`
+  - updated manifest metadata and UI titles so it can be installed alongside the original `jablotron100` integration without a domain clash
+- Added development-only mTLS onboarding files:
+  - `scripts/generate-dev-certs.sh` now generates a local CA plus server/client certs with SANs for localhost, detected host IPs, and any extra `--ip` / `--dns` values
+  - `docker-compose.dev.yml` mounts `.dev-certs` and `.dev-data` for a low-friction local alpha path
+  - `docs/dev-mtls.md` documents the exact IP-vs-hostname rule for certificate SANs and the Home Assistant config values to use
+- Fixed the container entrypoint environment so `/app` is on `PYTHONPATH`; this keeps the current packaged server able to import the still-root-level helper modules during dockerized dev and alpha testing.
+- Fixed the reference Python client to build one explicit SSL context for HTTPS as well as WebSocket connections, which avoids the earlier `httpx` mTLS disconnect on the local development path.
+- Fixed the Home Assistant API runtime control path to use thread-safe `hass.add_job(...)` scheduling for section and PG control calls invoked from executor-backed entity methods, removing the `hass.async_create_task` cross-thread runtime error during arm/disarm and PG toggles.
+- Hardened two more Home Assistant runtime boundaries in the API-backed integration:
+  - `_send_signal_entities_added()` now tolerates being called without a running loop in the current thread and reschedules dispatcher delivery onto the HA loop
+  - `_trigger_wrong_code()` now reschedules event-entity updates and bus firing onto the HA loop if ever called from a non-loop thread
+- Corrected the section-number/name bridge between raw export metadata and live HID status/control:
+  - live HID section IDs are 1-based human/F-Link numbers
+  - export section records are zero-based
+  - the server now renames live status sections using `display_id + 1`
+  - the Home Assistant API runtime now builds section entities and smoke/fire associations using human section numbers derived from `display_id + 1`
+- Fixed a Home Assistant startup regression in the HACS-facing integration:
+  - the long-lived WebSocket receive loop was previously started with `hass.async_create_task(...)` during entry initialization
+  - Home Assistant treated that task as part of startup and logged `Setup timed out for bootstrap waiting on <Jablotron._ws_loop()>`
+  - the integration now starts the WebSocket loop with `config_entry.async_create_background_task(...)` after the initial REST bootstrap completes, so startup is no longer blocked by the forever-running push task
+- Fixed severe live-panel event-log pollution from the API server status poller:
+  - root cause: every `refresh_status()` opened a fresh HID client, sent `perform_login(...)`, queried status, sent `perform_logout(...)`, and closed the HID handle
+  - with the default `15s` poll interval this produced repeated `Spojenie nadviazané` / `Spojenie ukončené` and `Autorizácia OK` events multiple times per minute
+  - reverse-engineering review plus live probing showed that a privileged read session can be kept alive without resending the service code by maintaining the HID handle and sending raw `52 01 02` keepalive packets
+  - the server now uses a persistent `PersistentSnapshotSession` for steady-state status polling:
+    - one HID login when the status session is first created
+    - raw `52 01 02` keepalive every second
+    - device-state broadcast renewal before the 5-minute timeout lapses
+    - no `perform_logout(...)` after each status refresh
+  - export pulls, event archive reads, control actions, and write/apply flows now explicitly close that persistent read session first so their one-shot HID helpers do not fight over the same device
+  - focused regression coverage now checks that repeated snapshot queries reuse the same authenticated session instead of performing a second login
+  - live verification on 2026-03-25:
+    - a direct wrapped `PersistentSnapshotSession` against `/dev/hidraw0` performed two real status queries `35s` apart with `login_calls == 1`
+    - the rebuilt dockerized live server still served `/v1/system` and `/v1/status` successfully after the change
+- Added a dedicated Home Assistant control-code path for client-triggered control actions:
+  - the API-backed Home Assistant integration now exposes an optional `Default control code` in the options flow
+  - when set, section arm/disarm and PG on/off requests initiated from Home Assistant include that code explicitly in the REST request
+  - the API server now accepts an optional `code` query parameter on `POST /v1/pgs/{id}/on` and `POST /v1/pgs/{id}/off`, matching the existing section-control behavior
+  - the panel runtime uses the supplied action code for that control request instead of always falling back to the server-wide panel auth code
+  - this makes Home Assistant-originated user actions attributable to the Home Assistant code path instead of being indistinguishable from background server operations that still rely on the server auth code
+  - regression coverage now checks that the supplied code is forwarded from the REST layer into the panel runtime for section arm, section disarm, and PG control

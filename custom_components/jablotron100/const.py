@@ -14,6 +14,12 @@ EVENT_WRONG_CODE: Final = "{}_wrong_code".format(DOMAIN)
 
 CONF_UNIQUE_ID: Final = "unique_id"
 CONF_SERIAL_PORT: Final = "serial_port"
+CONF_SERVER_URL: Final = "server_url"
+CONF_API_TOKEN: Final = "api_token"
+CONF_TLS_CA_CERT: Final = "tls_ca_cert"
+CONF_TLS_CLIENT_CERT: Final = "tls_client_cert"
+CONF_TLS_CLIENT_KEY: Final = "tls_client_key"
+CONF_CONTROL_CODE: Final = "control_code"
 CONF_NUMBER_OF_DEVICES: Final = "number_of_devices"
 CONF_NUMBER_OF_PG_OUTPUTS: Final = "number_of_pg_outputs"
 CONF_DEVICES: Final = "devices"

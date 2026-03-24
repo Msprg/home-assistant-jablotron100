@@ -8,7 +8,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import JablotronConfigEntry
 from .const import EntityType
-from .jablotron import Jablotron, JablotronProgrammableOutput, JablotronEntity
+from .api_runtime import Jablotron, JablotronProgrammableOutput, JablotronEntity
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: JablotronConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -36,7 +36,7 @@ class JablotronProgrammableOutputEntity(JablotronEntity, SwitchEntity):
 	_control: JablotronProgrammableOutput
 
 	_attr_device_class = SwitchDeviceClass.SWITCH
-	_attr_translation_key = "pg_output"
+	_attr_name = None
 
 	def __init__(
 		self,
@@ -44,10 +44,6 @@ class JablotronProgrammableOutputEntity(JablotronEntity, SwitchEntity):
 		control: JablotronProgrammableOutput,
 	) -> None:
 		super().__init__(jablotron, control)
-
-		self._attr_translation_placeholders = {
-			"pgOutputNo": control.pg_output_number,
-		}
 
 	def _update_attributes(self) -> None:
 		super()._update_attributes()

@@ -1,4 +1,6 @@
 # Development requirements for Jablotron Home Assistant integration
+-e .
+
 # Core Home Assistant dependencies
 homeassistant>=2025.1.0
 

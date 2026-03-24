@@ -13,7 +13,10 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from struct import unpack_from
 from typing import Callable, Iterable, Optional
+
+import msgpack
 
 from flexi_pcap_tool import IMPORT_START_LBA
 from jablotron_usb_debug import (
@@ -29,6 +32,7 @@ from jablotron_usb_debug import (
 SECTOR_SIZE = 512
 EXPORT_START_LBA = 35
 EXPORT_SECTORS = 2048
+EXPORT_FILENAME_83 = b"EXPORT  CFG"
 DEFAULT_FLEXI_CFG_LABEL = "FLEXI_CFG"
 DEFAULT_FLEXI_CFG_LINK = Path("/dev/disk/by-label") / DEFAULT_FLEXI_CFG_LABEL
 DEFAULT_FLEXI_LOG_LABEL = "FLEXI_LOG"
@@ -868,7 +872,12 @@ def _skip_msgpack_string(data: bytes, start: int) -> int:
 
 
 def _extract_export_root_fields(blob: bytes) -> dict[int, object | None]:
-    root, _cursor = decode_msgpack_value(blob, 0)
+    unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
+    unpacker.feed(blob)
+    try:
+        root = next(unpacker)
+    except Exception:
+        return {}
     if not isinstance(root, dict):
         return {}
     return {key: value for key, value in root.items() if isinstance(key, int)}
@@ -1627,6 +1636,11 @@ def read_export_direct(
 ) -> None:
     resolved_device = resolve_flexi_cfg_device(device)
     output.parent.mkdir(parents=True, exist_ok=True)
+    if start_lba == EXPORT_START_LBA and sectors == EXPORT_SECTORS:
+        file_bytes = _read_export_file_via_fat(device=resolved_device)
+        if file_bytes is not None:
+            output.write_bytes(file_bytes)
+            return
     command = [
         "dd",
         f"if={resolved_device}",
@@ -1640,6 +1654,124 @@ def read_export_direct(
     if os.geteuid() != 0:
         command = ["sudo", "-n"] + command
     subprocess.run(command, check=True)
+
+
+def _read_export_file_via_fat(*, device: str) -> bytes | None:
+    try:
+        boot_sector = read_device_direct_bytes(device=device, start_lba=0, sectors=1)
+        geometry = _parse_fat_geometry(boot_sector)
+        root_dir = read_device_direct_bytes(
+            device=device,
+            start_lba=geometry["root_dir_start_sector"],
+            sectors=geometry["root_dir_sectors"],
+        )
+        entry = _find_fat_root_entry(root_dir, EXPORT_FILENAME_83)
+        if entry is None:
+            return None
+        start_cluster, file_size = entry
+        if file_size <= 0 or start_cluster < 2:
+            return None
+        fat = read_device_direct_bytes(
+            device=device,
+            start_lba=geometry["reserved_sectors"],
+            sectors=geometry["sectors_per_fat"],
+        )
+        clusters = _follow_fat16_chain(
+            fat=fat,
+            start_cluster=start_cluster,
+            max_clusters=(file_size + geometry["cluster_size_bytes"] - 1) // geometry["cluster_size_bytes"],
+        )
+        if not clusters:
+            return None
+        runs = _cluster_runs(clusters)
+        parts: list[bytes] = []
+        for run_start, run_length in runs:
+            start_sector = geometry["data_start_sector"] + (run_start - 2) * geometry["sectors_per_cluster"]
+            sector_count = run_length * geometry["sectors_per_cluster"]
+            parts.append(read_device_direct_bytes(device=device, start_lba=start_sector, sectors=sector_count))
+        return b"".join(parts)[:file_size]
+    except Exception:
+        return None
+
+
+def _parse_fat_geometry(boot_sector: bytes) -> dict[str, int]:
+    if len(boot_sector) < SECTOR_SIZE:
+        raise ValueError("Short FAT boot sector.")
+    bytes_per_sector = unpack_from("<H", boot_sector, 11)[0]
+    sectors_per_cluster = boot_sector[13]
+    reserved_sectors = unpack_from("<H", boot_sector, 14)[0]
+    fat_count = boot_sector[16]
+    root_entries = unpack_from("<H", boot_sector, 17)[0]
+    sectors_per_fat = unpack_from("<H", boot_sector, 22)[0]
+    if bytes_per_sector != SECTOR_SIZE or sectors_per_cluster <= 0 or fat_count <= 0 or sectors_per_fat <= 0:
+        raise ValueError("Unsupported FAT geometry for EXPORT.CFG direct read.")
+    root_dir_sectors = (root_entries * 32 + bytes_per_sector - 1) // bytes_per_sector
+    data_start_sector = reserved_sectors + fat_count * sectors_per_fat + root_dir_sectors
+    return {
+        "bytes_per_sector": bytes_per_sector,
+        "sectors_per_cluster": sectors_per_cluster,
+        "cluster_size_bytes": bytes_per_sector * sectors_per_cluster,
+        "reserved_sectors": reserved_sectors,
+        "sectors_per_fat": sectors_per_fat,
+        "root_dir_start_sector": reserved_sectors + fat_count * sectors_per_fat,
+        "root_dir_sectors": root_dir_sectors,
+        "data_start_sector": data_start_sector,
+    }
+
+
+def _find_fat_root_entry(root_dir: bytes, filename_83: bytes) -> tuple[int, int] | None:
+    for offset in range(0, len(root_dir), 32):
+        entry = root_dir[offset : offset + 32]
+        if len(entry) < 32:
+            break
+        first = entry[0]
+        if first == 0x00:
+            break
+        if first == 0xE5:
+            continue
+        attrs = entry[11]
+        if attrs == 0x0F:
+            continue
+        if entry[:11] != filename_83:
+            continue
+        start_cluster = unpack_from("<H", entry, 26)[0]
+        file_size = unpack_from("<I", entry, 28)[0]
+        return start_cluster, file_size
+    return None
+
+
+def _follow_fat16_chain(*, fat: bytes, start_cluster: int, max_clusters: int) -> list[int]:
+    clusters: list[int] = []
+    seen: set[int] = set()
+    cluster = start_cluster
+    while cluster >= 2 and cluster not in seen and len(clusters) < max_clusters:
+        seen.add(cluster)
+        clusters.append(cluster)
+        entry_offset = cluster * 2
+        if entry_offset + 2 > len(fat):
+            break
+        next_cluster = unpack_from("<H", fat, entry_offset)[0]
+        if next_cluster >= 0xFFF8 or next_cluster == 0x0000:
+            break
+        cluster = next_cluster
+    return clusters
+
+
+def _cluster_runs(clusters: list[int]) -> list[tuple[int, int]]:
+    if not clusters:
+        return []
+    runs: list[tuple[int, int]] = []
+    run_start = clusters[0]
+    run_length = 1
+    for cluster in clusters[1:]:
+        if cluster == run_start + run_length:
+            run_length += 1
+            continue
+        runs.append((run_start, run_length))
+        run_start = cluster
+        run_length = 1
+    runs.append((run_start, run_length))
+    return runs
 
 
 def read_device_direct_bytes(*, device: str, start_lba: int, sectors: int) -> bytes:
