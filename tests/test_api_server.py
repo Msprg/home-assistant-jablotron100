@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from jablotron_api.domain.models import (
     CentralStatusModel,
     DEFAULT_ADMIN_SCOPES,
+    DeviceStatusModel,
     ExportCatalogModel,
     ExportPGModel,
     ExportSectionModel,
@@ -280,6 +281,11 @@ def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -
     assert calls[0]["timeout"] == 2.0
     assert calls[1]["query_device_status"] is False
     assert calls[1]["timeout"] == 0.6
+
+
+def test_device_problem_defaults_to_false() -> None:
+    device = DeviceStatusModel(id=1, name="Device 1")
+    assert device.problem is False
 
 
 def test_export_endpoints_and_device_metadata(tmp_path: Path) -> None:

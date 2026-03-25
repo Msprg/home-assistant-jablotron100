@@ -184,6 +184,13 @@
 
 ## Progress Log
 ### 2026-03-25
+- Fixed API-backed Home Assistant `problem` binary sensors showing `unknown` for most devices:
+  - server-side `DeviceStatusModel.problem` now defaults to `False` instead of `None`
+  - the HACS integration runtime now seeds newly created section-problem, device-problem, and fire entities with `STATE_OFF` so they do not sit in `unknown` while waiting for a later state packet
+  - mirrored the same runtime fix into the in-repo development copy of the integration
+  - focused validation:
+    - `venv/bin/pytest -q tests/test_api_server.py tests/test_jablotron_re_tools.py` -> `19 passed`
+    - `python3 -m compileall jablotron100-api-HASS/custom_components/jablotron100_api_hass/api_runtime.py custom_components/jablotron100/api_runtime.py src/jablotron_api/domain/models.py` passed
 - Tightened status responsiveness without turning every cycle into a full device sweep:
   - `PanelRuntimeConfig.poll_interval_seconds` now defaults to `2.0s` instead of `15.0s`
   - added `full_refresh_interval_seconds` (default `15.0s`) so sections/PGs refresh quickly while full device-info sweeps remain slower

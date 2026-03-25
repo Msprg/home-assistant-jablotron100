@@ -341,6 +341,10 @@ class Jablotron:
             self.entities_states["login"] = STATE_ON
         return added
 
+    def _ensure_default_state(self, entity_id: str, state: StateType | AlarmControlPanelState) -> None:
+        if entity_id not in self.entities_states:
+            self.entities_states[entity_id] = state
+
     def _section_has_smoke_detector(self, section_no: int) -> bool:
         for device in self._catalog.get("devices", []):
             if int(device.get("section_id") or 0) + 1 == section_no and device.get("inferred_device_type") == "smoke_detector":
@@ -371,8 +375,10 @@ class Jablotron:
             section_hass_device = JablotronHassDevice(id=f"section_{section_no}", name=section.get("name") or f"Section {section_no}")
             added_any = self._ensure_alarm_panel(section_no, section_hass_device) or added_any
             added_any = self._ensure_control(EntityType.PROBLEM, self._legacy_section_problem_id(section_no), hass_device=section_hass_device) or added_any
+            self._ensure_default_state(self._legacy_section_problem_id(section_no), STATE_OFF)
             if self._section_has_smoke_detector(section_no):
                 added_any = self._ensure_control(EntityType.FIRE, self._legacy_section_fire_id(section_no), hass_device=section_hass_device) or added_any
+                self._ensure_default_state(self._legacy_section_fire_id(section_no), STATE_OFF)
 
         for pg in catalog.get("pgs", []):
             pg_no = int(pg["display_id"])
@@ -390,6 +396,7 @@ class Jablotron:
                 name=device.get("name") or f"Device {device_no}",
             )
             added_any = self._ensure_control(EntityType.PROBLEM, self._legacy_device_problem_id(device_no), hass_device=hass_device) or added_any
+            self._ensure_default_state(self._legacy_device_problem_id(device_no), STATE_OFF)
 
             entity_type_name = device.get("inferred_entity_type")
             if entity_type_name:

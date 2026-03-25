@@ -77,7 +77,7 @@ class DeviceStatusModel(BaseModel):
     inferred_entity_type: str | None = None
     comment: str = ""
     state: str | None = None
-    problem: bool | None = None
+    problem: bool | None = False
     battery_level: int | None = None
     battery_problem: bool | None = None
     signal_strength: int | None = None
