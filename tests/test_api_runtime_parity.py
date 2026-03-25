@@ -184,7 +184,7 @@ def test_api_runtime_removes_stale_device_state_entity_when_mapping_drops_state(
             "devices": [
                 {
                     "id": 35,
-                    "name": "VSTUP HLAVNY",
+                    "name": "Module channel 1",
                     "inferred_device_type": "door_opening_detector",
                     "inferred_entity_type": "device_state_door",
                 }
@@ -201,7 +201,7 @@ def test_api_runtime_removes_stale_device_state_entity_when_mapping_drops_state(
             "devices": [
                 {
                     "id": 35,
-                    "name": "VSTUP HLAVNY",
+                    "name": "Module channel 1",
                     "inferred_device_type": "io_module",
                     "inferred_entity_type": None,
                 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import Request
 from fastapi.testclient import TestClient
@@ -24,7 +25,7 @@ from jablotron_api.domain.models import (
     UserModel,
 )
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
-from jablotron_api.panel.runtime import _apply_catalog_names, _infer_device_type
+from jablotron_api.panel.runtime import _apply_catalog_names, _catalog_to_model, _infer_device_type
 from jablotron_api.protocol import legacy
 from jablotron_api.protocol.legacy import LegacyPanelSnapshot, PersistentSnapshotSession
 from jablotron_api.server.app import create_app
@@ -321,9 +322,35 @@ def test_catalog_names_are_applied_to_live_status() -> None:
 
 
 def test_infer_device_type_avoids_module_name_mismatches() -> None:
-    assert _infer_device_type(name="VSTUP HLAVNY", hardware_model="JA-114HN", type_raw=14, object_id=35) == ("io_module", None)
-    assert _infer_device_type(name="RFID čítačka Hlavna", hardware_model="JA-122E", type_raw=14, object_id=40) == ("rfid_reader", None)
-    assert _infer_device_type(name="Posilnovac zbernice", hardware_model="120Z", type_raw=14, object_id=1) == ("bus_booster", None)
+    assert _infer_device_type(name="Module channel 1", hardware_model="JA-114HN", type_raw=14, object_id=35) == ("io_module", None)
+    assert _infer_device_type(name="Reader 1", hardware_model="JA-122E", type_raw=14, object_id=40) == ("rfid_reader", None)
+    assert _infer_device_type(name="Bus booster", hardware_model="120Z", type_raw=14, object_id=1) == ("bus_booster", None)
+
+
+def test_catalog_devices_named_like_pgs_do_not_become_fake_doors() -> None:
+    snapshot = SimpleNamespace(
+        sections_by_id={},
+        pgs_by_id={5: SimpleNamespace(pg_id=5, display_id=6, name="PG mirror channel 1", comment="", section_id=0)},
+        objects_by_id={
+            36: SimpleNamespace(
+                object_id=36,
+                name="PG mirror channel 1",
+                kind_raw=4,
+                section_id=0,
+                type_raw=14,
+                subtype_raw=-1,
+                comment="",
+            )
+        },
+        users=[],
+        hardware_by_id={},
+        main_config=None,
+        path=None,
+        sha256=None,
+    )
+    catalog = _catalog_to_model(snapshot)
+    assert catalog.devices[0].inferred_device_type == "io_module"
+    assert catalog.devices[0].inferred_entity_type is None
 
 
 def test_persistent_snapshot_session_reuses_single_login(monkeypatch) -> None:

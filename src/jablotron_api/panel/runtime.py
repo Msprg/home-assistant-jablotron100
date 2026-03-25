@@ -286,6 +286,7 @@ def _filter_users_for_clients(users: list[UserModel], initial_setup: InitialSetu
 
 def _catalog_to_model(snapshot: ExportCatalogSnapshot) -> ExportCatalogModel:
     initial_setup = _build_initial_setup(snapshot)
+    pg_names = {pg.name for pg in snapshot.pgs_by_id.values() if pg.name}
     return ExportCatalogModel(
         sections=[
             ExportSectionModel(
@@ -315,18 +316,34 @@ def _catalog_to_model(snapshot: ExportCatalogSnapshot) -> ExportCatalogModel:
                 type_raw=device.type_raw,
                 subtype_raw=device.subtype_raw,
                 hardware_model=snapshot.hardware_by_id.get(device.object_id).model if device.object_id in snapshot.hardware_by_id else None,
-                inferred_device_type=_infer_device_type(
-                    name=device.name or f"Object {device.object_id}",
-                    hardware_model=snapshot.hardware_by_id.get(device.object_id).model if device.object_id in snapshot.hardware_by_id else None,
-                    type_raw=device.type_raw,
-                    object_id=device.object_id,
-                )[0],
-                inferred_entity_type=_infer_device_type(
-                    name=device.name or f"Object {device.object_id}",
-                    hardware_model=snapshot.hardware_by_id.get(device.object_id).model if device.object_id in snapshot.hardware_by_id else None,
-                    type_raw=device.type_raw,
-                    object_id=device.object_id,
-                )[1],
+                inferred_device_type=(
+                    "io_module"
+                    if (
+                        (device.name or "") in pg_names
+                        and snapshot.hardware_by_id.get(device.object_id) is None
+                        and device.type_raw == 14
+                    )
+                    else _infer_device_type(
+                        name=device.name or f"Object {device.object_id}",
+                        hardware_model=snapshot.hardware_by_id.get(device.object_id).model if device.object_id in snapshot.hardware_by_id else None,
+                        type_raw=device.type_raw,
+                        object_id=device.object_id,
+                    )[0]
+                ),
+                inferred_entity_type=(
+                    None
+                    if (
+                        (device.name or "") in pg_names
+                        and snapshot.hardware_by_id.get(device.object_id) is None
+                        and device.type_raw == 14
+                    )
+                    else _infer_device_type(
+                        name=device.name or f"Object {device.object_id}",
+                        hardware_model=snapshot.hardware_by_id.get(device.object_id).model if device.object_id in snapshot.hardware_by_id else None,
+                        type_raw=device.type_raw,
+                        object_id=device.object_id,
+                    )[1]
+                ),
                 comment=device.comment,
             )
             for device in snapshot.objects_by_id.values()
