@@ -7,6 +7,7 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from jablotron_api.domain.models import (
+    CentralStatusModel,
     DEFAULT_ADMIN_SCOPES,
     ExportCatalogModel,
     ExportPGModel,
@@ -21,9 +22,10 @@ from jablotron_api.domain.models import (
     UserCreateModel,
     UserModel,
 )
+from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
 from jablotron_api.panel.runtime import _apply_catalog_names
 from jablotron_api.protocol import legacy
-from jablotron_api.protocol.legacy import PersistentSnapshotSession
+from jablotron_api.protocol.legacy import LegacyPanelSnapshot, PersistentSnapshotSession
 from jablotron_api.server.app import create_app
 from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
@@ -238,6 +240,46 @@ def test_control_endpoints_forward_supplied_code(tmp_path: Path) -> None:
     pg_response = client.post("/v1/pgs/1/on?code=2468", headers=headers)
     assert pg_response.status_code == 200
     assert runtime.last_pg_code == "2468"
+
+
+def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeSession:
+        def query_snapshot(self, **kwargs):
+            calls.append(dict(kwargs))
+            return LegacyPanelSnapshot(
+                sections=[SectionStatusModel(id=1, name="Section 1", state="disarmed")],
+                pgs=[PGStatusModel(id=1, name="PG output 1", state="off")],
+                devices=[],
+                central=CentralStatusModel(),
+                service_mode=False,
+            )
+
+    async def run() -> None:
+        runtime = PanelRuntime(
+            PanelRuntimeConfig(
+                poll_interval_seconds=2.0,
+                full_refresh_interval_seconds=15.0,
+                fast_status_timeout_seconds=0.6,
+                full_status_timeout_seconds=2.0,
+            )
+        )
+        fake_session = FakeSession()
+        runtime._create_status_session = lambda: fake_session  # type: ignore[method-assign]
+
+        await runtime.refresh_status()
+        await runtime.refresh_status()
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert len(calls) == 2
+    assert calls[0]["query_device_status"] is True
+    assert calls[0]["timeout"] == 2.0
+    assert calls[1]["query_device_status"] is False
+    assert calls[1]["timeout"] == 0.6
 
 
 def test_export_endpoints_and_device_metadata(tmp_path: Path) -> None:

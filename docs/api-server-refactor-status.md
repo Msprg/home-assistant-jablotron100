@@ -184,6 +184,16 @@
 
 ## Progress Log
 ### 2026-03-25
+- Tightened status responsiveness without turning every cycle into a full device sweep:
+  - `PanelRuntimeConfig.poll_interval_seconds` now defaults to `2.0s` instead of `15.0s`
+  - added `full_refresh_interval_seconds` (default `15.0s`) so sections/PGs refresh quickly while full device-info sweeps remain slower
+  - added `fast_status_timeout_seconds` (default `0.6s`) and `full_status_timeout_seconds` (default `2.0s`)
+  - `PersistentSnapshotSession.query_snapshot(...)` now supports a lightweight mode that only requests section/PG state and reuses any already-streamed device packets, instead of sending full per-device info requests every cycle
+  - `PanelRuntime.refresh_status()` now runs:
+    - fast lightweight section/PG polls every `2s`
+    - full device-info refresh every `15s`
+    - diagnostics refresh every `1h`
+  - practical effect: Home Assistant and API clients should see section arm/disarm and PG changes much faster, without the server hammering every device-info query at 1-2 second cadence
 - Reverse-engineered the "system already in configuration" signal from two new F-Link traces dropped into `research/data ingest/` and sorted them into the permanent research layout:
   - raw comm logs moved to `research/traces/f_link_logs/2026-03-25_*`
   - matching USB captures moved to `research/captures/usb/f_link/2026-03-25_*.pcapng`

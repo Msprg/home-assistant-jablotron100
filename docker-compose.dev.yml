@@ -13,7 +13,7 @@ services:
       JABLOTRON_PANEL_AUTH_CODE: "${JABLOTRON_PANEL_AUTH_CODE:-1812}"
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-/dev/hidraw0}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-/dev/sdb1}"
-      JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-/dev/sdd1}"
+      JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-/dev/sdc1}"
     volumes:
       - ./.dev-data:/data
       - ./.dev-certs:/data/certs:ro
@@ -23,6 +23,6 @@ services:
     devices:
       - /dev/hidraw0:/dev/hidraw0
       - /dev/sdb1:/dev/sdb1
-      - /dev/sdd1:/dev/sdd1
+      - /dev/sdc1:/dev/sdc1
     ports:
       - "8443:8443"

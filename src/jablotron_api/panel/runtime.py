@@ -71,7 +71,10 @@ class PanelRuntimeConfig:
     stage_mode: str = "filesystem"
     read_cleanup_mode: str = "auto"
     write_cleanup_mode: str = "auto"
-    poll_interval_seconds: float = 15.0
+    poll_interval_seconds: float = 2.0
+    full_refresh_interval_seconds: float = 15.0
+    fast_status_timeout_seconds: float = 0.6
+    full_status_timeout_seconds: float = 2.0
     reset: bool = True
 
 
@@ -390,6 +393,7 @@ class PanelRuntime:
         self._poller_task: asyncio.Task[None] | None = None
         self._closed = False
         self._next_diagnostics_refresh_monotonic = 0.0
+        self._next_full_refresh_monotonic = 0.0
         self._status_session: PersistentSnapshotSession | None = None
 
     def _initial_setup(self) -> InitialSetupModel | None:
@@ -476,9 +480,12 @@ class PanelRuntime:
 
     async def refresh_status(self) -> PanelStatusModel:
         async with self._lock:
+            now = time.monotonic()
             pg_count = len(self._catalog.pgs) if self._catalog is not None else 0
             devices = self._status.devices if self._status is not None else (self._catalog.devices if self._catalog is not None else [])
-            include_diagnostics = time.monotonic() >= self._next_diagnostics_refresh_monotonic
+            include_diagnostics = now >= self._next_diagnostics_refresh_monotonic
+            include_full_refresh = self._status is None or now >= self._next_full_refresh_monotonic
+            timeout = self._config.full_status_timeout_seconds if include_full_refresh or include_diagnostics else self._config.fast_status_timeout_seconds
             if self._status_session is None:
                 self._status_session = self._create_status_session()
             snapshot = await asyncio.to_thread(
@@ -487,7 +494,9 @@ class PanelRuntime:
                 pg_count=pg_count,
                 devices=devices,
                 central=None if self._status is None else self._status.central,
+                query_device_status=include_full_refresh or include_diagnostics,
                 include_diagnostics=include_diagnostics,
+                timeout=timeout,
             )
             sections, pgs = _apply_catalog_names(sections=snapshot.sections, pgs=snapshot.pgs, catalog=self._catalog)
             status = PanelStatusModel(
@@ -500,6 +509,8 @@ class PanelRuntime:
             self._status = status
             if include_diagnostics:
                 self._next_diagnostics_refresh_monotonic = time.monotonic() + 3600.0
+            if include_full_refresh or include_diagnostics:
+                self._next_full_refresh_monotonic = time.monotonic() + self._config.full_refresh_interval_seconds
         await self._emit("status", status.model_dump(mode="json"))
         return status
 

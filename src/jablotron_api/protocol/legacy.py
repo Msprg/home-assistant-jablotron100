@@ -379,6 +379,7 @@ class PersistentSnapshotSession:
         pg_count: int,
         devices: list[DeviceStatusModel] | None = None,
         central: CentralStatusModel | None = None,
+        query_device_status: bool = True,
         include_diagnostics: bool = False,
         timeout: float = 2.0,
     ) -> LegacyPanelSnapshot:
@@ -392,6 +393,7 @@ class PersistentSnapshotSession:
                     pg_count=pg_count,
                     devices=devices,
                     central=central,
+                    query_device_status=query_device_status,
                     include_diagnostics=include_diagnostics,
                     timeout=timeout,
                 )
@@ -569,6 +571,7 @@ class PersistentSnapshotSession:
         pg_count: int,
         devices: list[DeviceStatusModel] | None,
         central: CentralStatusModel | None,
+        query_device_status: bool,
         include_diagnostics: bool,
         timeout: float,
     ) -> LegacyPanelSnapshot:
@@ -583,12 +586,13 @@ class PersistentSnapshotSession:
         self._drain_packets_locked(client, timeout=0.05)
         perform_sections_query(client)
 
-        status_device_numbers = sorted(
-            {device_id for device_id in devices_by_id}
-            | {device_id for device_id in special_devices.values() if isinstance(device_id, int)}
-        )
-        if status_device_numbers:
-            client.send_packets([Jablotron.create_packet_device_info(device_id) for device_id in status_device_numbers])
+        if query_device_status:
+            status_device_numbers = sorted(
+                {device_id for device_id in devices_by_id}
+                | {device_id for device_id in special_devices.values() if isinstance(device_id, int)}
+            )
+            if status_device_numbers:
+                client.send_packets([Jablotron.create_packet_device_info(device_id) for device_id in status_device_numbers])
 
         self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=timeout)
 
