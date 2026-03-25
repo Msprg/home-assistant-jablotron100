@@ -17,6 +17,9 @@ class JablotronApiError(Exception):
 
 
 class JablotronApiClient:
+    WS_HEARTBEAT_SECONDS = 10
+    WS_RECEIVE_TIMEOUT_SECONDS = 25
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -101,4 +104,6 @@ class JablotronApiClient:
         return await session.ws_connect(
             f"{ws_url}/v1/ws?token={self._api_token}",
             ssl=await self._ssl_context(),
+            heartbeat=self.WS_HEARTBEAT_SECONDS,
+            receive_timeout=self.WS_RECEIVE_TIMEOUT_SECONDS,
         )

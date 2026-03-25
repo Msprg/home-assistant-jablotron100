@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from itertools import chain, repeat
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from fastapi import Request
 from fastapi.testclient import TestClient
@@ -32,6 +34,7 @@ from jablotron_api.protocol import legacy
 from jablotron_api.protocol.legacy import LegacyPanelSnapshot, PersistentSnapshotSession
 from jablotron_api.server.app import create_app
 from jablotron_api.server.config import ServerSettings
+from jablotron_api.server.ws import ConnectionManager
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
 from jablotron_api.services.storage import TokenStore
 
@@ -779,3 +782,21 @@ def test_websocket_subscription(tmp_path: Path) -> None:
         snapshot = websocket.receive_json()
         assert snapshot["event"] == "snapshot"
         assert snapshot["topic"] == "status"
+
+
+def test_connection_manager_close_all_closes_connected_websockets() -> None:
+    manager = ConnectionManager()
+    websocket_a = AsyncMock()
+    websocket_b = AsyncMock()
+
+    async def _exercise() -> None:
+        await manager.connect(websocket_a)
+        await manager.connect(websocket_b)
+        await manager.subscribe(websocket_a, ["status"])
+        await manager.close_all(code=1001, reason="server shutdown")
+
+    asyncio.run(_exercise())
+
+    websocket_a.close.assert_awaited_once_with(code=1001, reason="server shutdown")
+    websocket_b.close.assert_awaited_once_with(code=1001, reason="server shutdown")
+    assert manager._connections == {}

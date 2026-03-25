@@ -378,3 +378,9 @@
   - the server CLI now sets an explicit Uvicorn graceful-shutdown timeout of `15s`
   - `docker-compose.dev.yml` now gives the container a `20s` `stop_grace_period` so FastAPI lifespan shutdown and HID logout can complete before Docker escalates to a forced kill
   - regression coverage now verifies that `PersistentSnapshotSession.close()` performs logout before the HID client is closed
+- Tightened API server disconnect detection and graceful websocket shutdown for Home Assistant:
+  - FastAPI lifespan shutdown now explicitly closes all `/v1/ws` clients through the websocket connection manager before panel runtime shutdown continues
+  - the websocket manager gained `close_all(...)`, which issues real close frames to connected clients instead of relying on the process exit path alone
+  - the Home Assistant API client websocket now uses `heartbeat=10` seconds and `receive_timeout=25` seconds so dead blackholed connections are detected in bounded time rather than waiting for TCP to give up
+  - the Home Assistant websocket loop now treats a clean websocket end as a disconnect immediately, marks `last_update_success=False`, and enters the normal reconnect path instead of leaving entity availability stale until a later connect failure
+  - focused regression coverage now checks websocket-manager shutdown closing and the Home Assistant client websocket heartbeat configuration

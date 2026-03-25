@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import custom_components.jablotron100.api_client as api_client_module
 from custom_components.jablotron100.api_runtime import Jablotron, JablotronCentralUnit
+from custom_components.jablotron100.api_client import JablotronApiClient
 from custom_components.jablotron100.const import CONF_API_TOKEN, CONF_SERVER_URL, EVENT_WRONG_CODE, EntityType, EventLoginType
 
 
@@ -24,6 +28,9 @@ class _FakeHass:
 
     def async_create_task(self, coro):
         return self.loop.create_task(coro)
+
+    async def async_add_executor_job(self, target, *args):
+        return target(*args)
 
     def add_job(self, target, *args):
         return target(*args)
@@ -279,3 +286,65 @@ def test_api_runtime_removes_stale_dynamic_entities_when_status_data_disappears(
     assert "device_battery_problem_sensor_24" not in runtime.entities[EntityType.BATTERY_PROBLEM]
     assert "device_temperature_sensor_24" not in runtime.entities[EntityType.TEMPERATURE]
     assert "device_signal_strength_sensor_24" not in runtime.entities[EntityType.SIGNAL_STRENGTH]
+
+
+def test_api_client_ws_connect_uses_heartbeat_and_receive_timeout(monkeypatch) -> None:
+    hass = _FakeHass()
+    client = JablotronApiClient(hass, server_url="https://panel.local", api_token="token")
+    captured: dict[str, object] = {}
+
+    async def _fake_ws_connect(url: str, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return SimpleNamespace()
+
+    fake_session = SimpleNamespace(ws_connect=_fake_ws_connect)
+    monkeypatch.setattr(api_client_module, "async_get_clientsession", lambda _hass: fake_session)
+
+    async def _exercise() -> None:
+        await client.ws_connect()
+
+    asyncio.run(_exercise())
+
+    assert captured["url"] == "wss://panel.local/v1/ws?token=token"
+    assert captured["kwargs"]["heartbeat"] == 10
+    assert captured["kwargs"]["receive_timeout"] == 25
+
+
+def test_api_runtime_marks_unavailable_when_websocket_ends_cleanly() -> None:
+    runtime = _build_runtime()
+    runtime.last_update_success = True
+
+    class _FakeMessage:
+        type = SimpleNamespace(name="CLOSE")
+
+    class _FakeWebSocket:
+        async def receive_json(self):
+            return {"event": "hello"}
+
+        async def send_json(self, _payload):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            return None
+
+    runtime._api.ws_connect = AsyncMock(return_value=_FakeWebSocket())
+
+    async def _exercise() -> None:
+        task = asyncio.create_task(runtime._ws_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_exercise())
+
+    assert runtime.last_update_success is False

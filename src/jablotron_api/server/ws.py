@@ -23,6 +23,16 @@ class ConnectionManager:
     async def disconnect(self, websocket: WebSocket) -> None:
         self._connections.pop(websocket, None)
 
+    async def close_all(self, *, code: int = 1001, reason: str = "server shutdown") -> None:
+        async with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for websocket in connections:
+            try:
+                await websocket.close(code=code, reason=reason)
+            except Exception:
+                continue
+
     async def subscribe(self, websocket: WebSocket, topics: list[str]) -> None:
         self._connections.setdefault(websocket, set()).update(topics)
 
@@ -40,4 +50,3 @@ class ConnectionManager:
                     dead.append(websocket)
             for websocket in dead:
                 self._connections.pop(websocket, None)
-

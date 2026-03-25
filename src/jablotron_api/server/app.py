@@ -47,6 +47,7 @@ def create_app(
         runtime.add_listener(lambda topic, payload: ws_manager.broadcast(topic, "update", payload))
         await runtime.start()
         yield
+        await ws_manager.close_all(code=1001, reason="server shutdown")
         await runtime.close()
 
     app = FastAPI(title="Jablotron API Server", version=__version__, lifespan=lifespan)
@@ -322,6 +323,8 @@ def create_app(
                 elif action == "ping":
                     await websocket.send_json({"event": "pong"})
         except WebSocketDisconnect:
+            pass
+        finally:
             await ws_manager.disconnect(websocket)
 
     return app

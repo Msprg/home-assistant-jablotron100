@@ -168,6 +168,7 @@ class Jablotron:
 
     async def _ws_loop(self) -> None:
         while True:
+            ws = None
             try:
                 ws = await self._api.ws_connect()
                 await ws.receive_json()
@@ -187,7 +188,10 @@ class Jablotron:
                             added = self._apply_catalog(data)
                             if added:
                                 self._send_signal_entities_added()
+                raise ConnectionError("API websocket closed")
             except asyncio.CancelledError:
+                if ws is not None:
+                    await ws.close()
                 raise
             except Exception as exc:
                 self.last_update_success = False
