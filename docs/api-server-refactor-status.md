@@ -327,3 +327,14 @@
     - status snapshot on that same persistent HID session
   - `/v1/system` no longer forces a fresh privileged system-info poll on every request once system info is already cached from startup
   - focused regression coverage now checks that system-info queries and snapshot queries can share the same HID client and original login
+- Investigated unavailable central-unit entities in the API-backed Home Assistant integration (`Power supply`, `GSM signal`, `GSM signal strength`) on the live JA-107K panel:
+  - live API probing showed this was not a Home Assistant availability bug; the server was returning `None` for those central fields
+  - direct packet dumps confirmed:
+    - the current JA-107K diagnostics path does return LAN info for device `233`
+    - it does not currently return central power/battery info for device `0` through the known request sequence
+    - GSM diagnostics for device `234` arrive as `DeviceInfoType.UNKNOWN_GSM (21)` rather than the already-decoded `DeviceInfoType.GSM (4)`
+  - the Home Assistant API runtime now follows the stricter client behavior chosen during testing:
+    - `Power supply`, `GSM signal`, and `GSM signal strength` are not created at all unless `/v1/status` carries real non-`None` values for them
+    - if older registry entries for those controls already exist from a previous build, the runtime removes them during startup rather than leaving them behind as `unavailable`
+  - `LAN connection` remains available because the live JA-107K path does decode it reliably
+  - exact JA-107K decoding for central power and `UNKNOWN_GSM` remains a protocol follow-up item rather than a parity blocker

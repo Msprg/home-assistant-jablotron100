@@ -159,3 +159,16 @@ def test_api_runtime_triggers_wrong_code_event() -> None:
 
     assert event_entity.events == [EventLoginType.WRONG_CODE.value]
     assert runtime._hass.bus.events == [EVENT_WRONG_CODE]
+
+
+def test_api_runtime_seeds_legacy_central_fallback_states() -> None:
+    runtime = _build_runtime()
+
+    runtime._apply_catalog({"sections": [], "pgs": [], "devices": [], "users": []})
+    runtime._apply_status({"service_mode": False, "sections": [], "pgs": [], "devices": [], "central": {}})
+    runtime._remove_unsupported_central_entities({"central": {}})
+
+    assert "device_power_supply_sensor_0" not in runtime.entities[EntityType.POWER_SUPPLY]
+    assert "gsm_signal_sensor" not in runtime.entities[EntityType.GSM_SIGNAL]
+    assert "gsm_signal_strength_sensor" not in runtime.entities[EntityType.GSM_SIGNAL_STRENGTH]
+    assert "lan" in runtime.entities[EntityType.LAN_CONNECTION]

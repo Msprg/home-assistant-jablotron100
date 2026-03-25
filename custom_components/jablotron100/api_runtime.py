@@ -197,6 +197,7 @@ class Jablotron:
     def _apply_catalog_and_status(self, catalog: dict, status: dict) -> None:
         added = self._apply_catalog(catalog)
         added = self._apply_status(status) or added
+        self._remove_unsupported_central_entities(status)
         if added:
             self._send_signal_entities_added()
 
@@ -345,6 +346,29 @@ class Jablotron:
         if entity_id not in self.entities_states:
             self.entities_states[entity_id] = state
 
+    def _remove_control(self, entity_type: EntityType, control_id: str) -> None:
+        self.entities[entity_type].pop(control_id, None)
+        self.entities_states.pop(control_id, None)
+        self.hass_entities.pop(control_id, None)
+
+        if self._central_unit is None or not hasattr(self._hass, "data"):
+            return
+
+        target_unique_id = f"{DOMAIN}.{self._central_unit.unique_id}.{control_id}"
+        registry = er.async_get(self._hass)
+        for entity_id, entry in list(registry.entities.items()):
+            if entry.unique_id == target_unique_id:
+                registry.async_remove(entity_id)
+
+    def _remove_unsupported_central_entities(self, status: dict) -> None:
+        central = status.get("central") or {}
+        if central.get("power_supply") is None:
+            self._remove_control(EntityType.POWER_SUPPLY, self._legacy_power_supply_id())
+        if central.get("gsm_signal") is None:
+            self._remove_control(EntityType.GSM_SIGNAL, "gsm_signal_sensor")
+        if central.get("gsm_signal_strength") is None:
+            self._remove_control(EntityType.GSM_SIGNAL_STRENGTH, "gsm_signal_strength_sensor")
+
     def _section_has_smoke_detector(self, section_no: int) -> bool:
         for device in self._catalog.get("devices", []):
             if int(device.get("section_id") or 0) + 1 == section_no and device.get("inferred_device_type") == "smoke_detector":
@@ -355,11 +379,8 @@ class Jablotron:
         self._catalog = catalog
         self._code_prefix_enabled = bool((catalog.get("initial_setup") or {}).get("code_prefix"))
         added_any = self._ensure_login_event()
-        added_any = self._ensure_control(EntityType.POWER_SUPPLY, self._legacy_power_supply_id(), hass_device=None) or added_any
         if self._panel_has_lan_gsm():
             added_any = self._ensure_control(EntityType.LAN_CONNECTION, "lan", hass_device=None) or added_any
-            added_any = self._ensure_control(EntityType.GSM_SIGNAL, "gsm_signal_sensor", hass_device=None) or added_any
-            added_any = self._ensure_control(EntityType.GSM_SIGNAL_STRENGTH, "gsm_signal_strength_sensor", hass_device=None) or added_any
 
         usable_section_first_id = self._usable_first_id(catalog, "sections")
         usable_section_last_id = self._usable_last_id(catalog, "sections")
@@ -452,6 +473,8 @@ class Jablotron:
     def _ensure_central_dynamic_entities(self, status: dict) -> bool:
         added_any = False
         central = status.get("central") or {}
+        if central.get("power_supply") is not None:
+            added_any = self._ensure_control(EntityType.POWER_SUPPLY, self._legacy_power_supply_id(), hass_device=None) or added_any
         if central.get("battery_level") is not None or central.get("battery_problem") is not None:
             added_any = self._ensure_control(EntityType.BATTERY_LEVEL, self._legacy_device_battery_level_id(0), hass_device=None) or added_any
             added_any = self._ensure_control(EntityType.BATTERY_PROBLEM, self._legacy_device_battery_problem_id(0), hass_device=None) or added_any
@@ -459,6 +482,10 @@ class Jablotron:
             added_any = self._ensure_control(EntityType.BATTERY_LOAD_VOLTAGE, self._legacy_device_battery_load_voltage_id(0), hass_device=None) or added_any
         if central.get("lan_ip"):
             added_any = self._ensure_control(EntityType.LAN_IP, "lan_ip", hass_device=None) or added_any
+        if central.get("gsm_signal") is not None:
+            added_any = self._ensure_control(EntityType.GSM_SIGNAL, "gsm_signal_sensor", hass_device=None) or added_any
+        if central.get("gsm_signal_strength") is not None:
+            added_any = self._ensure_control(EntityType.GSM_SIGNAL_STRENGTH, "gsm_signal_strength_sensor", hass_device=None) or added_any
         for bus in central.get("buses") or []:
             bus_no = int(bus["bus_number"])
             added_any = self._ensure_control(EntityType.BUS_VOLTAGE, self._legacy_bus_voltage_id(bus_no), hass_device=None, name=f"BUS {bus_no} voltage") or added_any
