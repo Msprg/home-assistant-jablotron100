@@ -183,6 +183,30 @@
 6. Decide whether the legacy `custom_components/jablotron100` tree in the main repo should stay as an internal development copy or be reduced once the submodule-based HACS package is the only supported install path.
 
 ## Progress Log
+### 2026-03-25
+- Reverse-engineered the "system already in configuration" signal from two new F-Link traces dropped into `research/data ingest/` and sorted them into the permanent research layout:
+  - raw comm logs moved to `research/traces/f_link_logs/2026-03-25_*`
+  - matching USB captures moved to `research/captures/usb/f_link/2026-03-25_*.pcapng`
+  - decoded HTML/plaintext exports written to `research/exports/f_link_comm_logs_html/` and `research/exports/f_link_comm_logs_text/`
+  - findings recorded in `research/notes/2026-03-25_configuration-mode-signal.txt`
+- Confirmed from the paired traces that:
+  - `sections_states ... 0x94` means configuration-active, not a generic failure
+  - the stronger "another F-Link/configuration session already owns setup mode" indicator is the `73 09 ... 94 A0 00` state packet
+  - F-Link logs this same condition as `All config channels in use flag set`
+- Updated `jablotron_re_tools.py` accordingly:
+  - setup-mode entry now raises a dedicated "system already in configuration mode" error instead of falling through to `Did not enter setup mode.`
+  - post-read cleanup now treats `0x94` as a known configuration-active state instead of a generic dirty exit
+  - automatic cleanup no longer falls through to the noisy `login-exit` retry when the panel is already reporting configuration-active/in-use
+  - export-pull warnings now mention configuration-active state explicitly instead of claiming an unknown unclean exit
+- Updated `jablotron_event_tool.py` so event-session cleanup reports the same configuration-in-use condition consistently.
+- Added focused regression tests around:
+  - `0x94` / `73 09 ... 94 A0 00` detection
+  - setup-mode conflict classification
+  - cleanup short-circuiting before a fallback re-login when configuration is already active
+- Verification:
+  - `venv/bin/pytest -q tests/test_jablotron_re_tools.py tests/test_api_server.py` -> `17 passed`
+  - `python3 -m compileall jablotron_re_tools.py jablotron_event_tool.py` passed
+
 ### 2026-03-24
 - Added the initial installable `jablotron_api` package, FastAPI app, WebSocket manager, SQLite token store, reference client, CLI, and first `PanelRuntime`.
 - Chose a pragmatic first server cut that wraps existing proven RE helpers instead of fully relocating all logic immediately.
@@ -264,3 +288,25 @@
   - the panel runtime uses the supplied action code for that control request instead of always falling back to the server-wide panel auth code
   - this makes Home Assistant-originated user actions attributable to the Home Assistant code path instead of being indistinguishable from background server operations that still rely on the server auth code
   - regression coverage now checks that the supplied code is forwarded from the REST layer into the panel runtime for section arm, section disarm, and PG control
+- Reduced extra authorisation churn on control actions by reusing the persistent HID session for section and PG commands:
+  - root cause: section arm/disarm and PG control previously closed the persistent read session, opened a fresh HID client, logged in, sent the control packet, logged out, and then forced the status poller to log in again
+  - the persistent HID session now supports in-session section and PG control directly on the already-open handle
+  - when the requested control code matches the session’s current authorised code, the server now sends the control packet directly with no extra login or session restart
+  - when the requested control code differs, the server now switches authorisation in-session instead of tearing the HID handle down and reopening it
+  - if an in-session code switch fails, the session attempts to restore the previous authorisation and otherwise drops the handle cleanly so the next read starts from a known-good state
+  - focused regression coverage now checks that:
+    - same-code control actions reuse the same HID client and the original login
+    - different-code control actions switch codes without reopening the HID device or performing a second `perform_login(...)`
+- Reduced boot-time authorisation noise from the server startup path:
+  - likely root cause of the observed `3-4` standalone `User 100: HomeAssistant -> Autorizácia OK` events on container boot:
+    - startup did a one-shot privileged `refresh_system()`
+    - startup then did a separate privileged export/catalog pull
+    - startup then created the persistent status session with another privileged login
+    - the catalog pull can retry once on an empty first read, which explains the occasional fourth auth event
+  - the persistent HID session now supports system-info queries on the already-open handle
+  - startup ordering is now:
+    - export/catalog pull first
+    - system-info query on the persistent HID session
+    - status snapshot on that same persistent HID session
+  - `/v1/system` no longer forces a fresh privileged system-info poll on every request once system info is already cached from startup
+  - focused regression coverage now checks that system-info queries and snapshot queries can share the same HID client and original login

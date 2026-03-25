@@ -246,6 +246,23 @@ Notes:
   - users `95-99`: single-PG bindings for PGs `1`, `2`, `3`, `13`, and `16`
   - all of those test users currently decode with `access_raw = 0` / `coNoAccess`, so the new output makes it clear that section and PG rights are independent from the top-level access/competence label
   - the same live read hit a transport cleanup quirk: the post-read HID cleanup ended on `0x94` instead of `0x90`, but the pulled export itself was valid and decodable
+- New 2026-03-25 F-Link traces narrowed that `0x94` cleanup quirk further:
+  - archived raw comm logs:
+    - `research/traces/f_link_logs/2026-03-25_baseline-login-exit-without-changes/comm.log.htm`
+    - `research/traces/f_link_logs/2026-03-25_configuration-in-use-on-login/comm.log.htm`
+  - archived matching USB captures:
+    - `research/captures/usb/f_link/2026-03-25_baseline-login-exit-without-changes.pcapng`
+    - `research/captures/usb/f_link/2026-03-25_configuration-in-use-on-login.pcapng`
+  - decoded exports:
+    - `research/exports/f_link_comm_logs_html/2026-03-25_baseline-login-exit-without-changes.html`
+    - `research/exports/f_link_comm_logs_text/2026-03-25_baseline-login-exit-without-changes.txt`
+    - `research/exports/f_link_comm_logs_html/2026-03-25_configuration-in-use-on-login.html`
+    - `research/exports/f_link_comm_logs_text/2026-03-25_configuration-in-use-on-login.txt`
+  - interpretation:
+    - `sections_states ... 0x94` means configuration-active, not a generic failure
+    - the stronger "another F-Link already owns config channels" signal is `73 09 ... 94 A0 00`
+    - the failing F-Link trace logs `All config channels in use flag set` immediately after that packet
+  - see `research/notes/2026-03-25_configuration-mode-signal.txt`
 - A later transport-review validation on 2026-03-10 re-ran the refactored tooling live after low-level changes:
   - add user `89` as `transport89`
   - edit user `89` comment to `cleanup89`

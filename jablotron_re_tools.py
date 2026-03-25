@@ -55,6 +55,7 @@ REPORT_520125 = "520125" + "00" * 61
 REPORT_520213059A00 = "520213059a00" + "00" * 58
 EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
 EXITED_SECTIONS_MODE = 0x90
+CONFIGURATION_SECTIONS_MODE = 0x94
 SETUP_MODE_NUDGE_DELAY = 0.35
 SETUP_MODE_FIRST_KEEPALIVE_DELAY = 0.7
 SETUP_MODE_KEEPALIVE_INTERVAL = 1.0
@@ -1902,6 +1903,34 @@ def extract_sections_state_mode(packet: bytes) -> int | None:
     return None
 
 
+def extract_system_state_mode(packet: bytes) -> int | None:
+    if packet.startswith(b"\x73\x09") and len(packet) >= 3:
+        return packet[-3]
+    return None
+
+
+def is_configuration_sections_mode(mode: int | None) -> bool:
+    return mode == CONFIGURATION_SECTIONS_MODE
+
+
+def packet_has_configuration_channels_in_use(packet: bytes) -> bool:
+    return extract_system_state_mode(packet) == CONFIGURATION_SECTIONS_MODE
+
+
+def describe_sections_mode(mode: int | None) -> str:
+    if mode is None:
+        return "unknown"
+    if mode == EXITED_SECTIONS_MODE:
+        return f"exited (0x{mode:02x})"
+    if mode == CONFIGURATION_SECTIONS_MODE:
+        return f"configuration-active (0x{mode:02x})"
+    return f"0x{mode:02x}"
+
+
+def configuration_in_use_message() -> str:
+    return "System is already in configuration mode; another F-Link/configuration session appears to be active."
+
+
 def packet_startswith(packet: bytes, hex_prefix: str) -> bool:
     return packet.startswith(bytes.fromhex(hex_prefix))
 
@@ -1995,10 +2024,17 @@ def pull_live_export_snapshot(
     read_export_direct(device=resolved_device, output=output, start_lba=start_lba, sectors=sectors)
     if trigger and cleanup_mode != "none":
         cleanup_sections_mode = cleanup_read_session(port=port, code=code, cleanup_mode=cleanup_mode, verbose=verbose)
-        if cleanup_sections_mode != EXITED_SECTIONS_MODE:
+        if cleanup_sections_mode == CONFIGURATION_SECTIONS_MODE:
+            print(
+                "warning: read-session cleanup ended in the configuration-active state "
+                f"({describe_sections_mode(cleanup_sections_mode)}); "
+                "another F-Link/configuration session appears to be active. "
+                "Continuing because EXPORT.CFG was already read successfully."
+            )
+        elif cleanup_sections_mode != EXITED_SECTIONS_MODE:
             print(
                 "warning: read-session cleanup did not reach the exited state "
-                f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {cleanup_sections_mode!r}); "
+                f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {describe_sections_mode(cleanup_sections_mode)}); "
                 "continuing because EXPORT.CFG was already read successfully."
             )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -2192,6 +2228,8 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
     saw_1a0a_at: float | None = None
     saw_1b00 = False
     saw_sections_94 = False
+    saw_preexisting_configuration_state = False
+    saw_config_channels_in_use = False
     entered_setup = False
     deadline = time.time() + 15.0
     last_keepalive_at: float | None = None
@@ -2220,8 +2258,16 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
                 entered_setup = True
             else:
                 sections_mode = extract_sections_state_mode(packet)
+                system_state_mode = extract_system_state_mode(packet)
+                if not saw_1a0a and is_configuration_sections_mode(sections_mode):
+                    saw_preexisting_configuration_state = True
                 if saw_1a0a and sections_mode == 0x94:
                     saw_sections_94 = True
+                if is_configuration_sections_mode(system_state_mode):
+                    saw_config_channels_in_use = True
+
+        if saw_config_channels_in_use and not entered_setup:
+            break
 
         if (
             service_rights
@@ -2251,6 +2297,8 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
                 "nudged_0f": nudged_0f,
                 "saw_1a0a": saw_1a0a,
                 "saw_sections_94": saw_sections_94,
+                "saw_preexisting_configuration_state": saw_preexisting_configuration_state,
+                "saw_config_channels_in_use": saw_config_channels_in_use,
                 "saw_1b00": saw_1b00,
                 "last_keepalive_at": last_keepalive_at,
                 "next_keepalive_at": next_keepalive_at,
@@ -2259,6 +2307,8 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
         )
 
     if not entered_setup:
+        if saw_config_channels_in_use or (saw_preexisting_configuration_state and not saw_1a0a):
+            raise SystemExit(configuration_in_use_message())
         raise SystemExit("Did not enter setup mode.")
 
 
@@ -2356,15 +2406,28 @@ def cleanup_read_session(
             observed_modes = [
                 mode
                 for mode in (
-                    extract_sections_state_mode(packet)
+                    extract_sections_state_mode(packet) or extract_system_state_mode(packet)
                     for packet in [*pre_packets, *exit_packets, *post_packets]
                 )
                 if mode is not None
             ]
+            saw_config_channels_in_use = any(
+                packet_has_configuration_channels_in_use(packet)
+                for packet in [*pre_packets, *exit_packets, *post_packets]
+            )
             final_mode = observed_modes[-1] if observed_modes else None
             if verbose:
-                print("read_cleanup", {"attempt": attempt, "sections_mode": final_mode})
-            if final_mode == 0x90:
+                print(
+                    "read_cleanup",
+                    {
+                        "attempt": attempt,
+                        "sections_mode": describe_sections_mode(final_mode),
+                        "config_channels_in_use": saw_config_channels_in_use,
+                    },
+                )
+            if final_mode == EXITED_SECTIONS_MODE:
+                return final_mode
+            if saw_config_channels_in_use or final_mode == CONFIGURATION_SECTIONS_MODE:
                 return final_mode
         finally:
             client.close()

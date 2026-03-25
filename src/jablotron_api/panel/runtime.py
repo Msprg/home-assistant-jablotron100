@@ -52,9 +52,6 @@ from jablotron_api.domain.models import (
 )
 from jablotron_api.protocol.legacy import (
     PersistentSnapshotSession,
-    control_pg,
-    control_section,
-    query_system_info,
 )
 
 
@@ -459,19 +456,15 @@ class PanelRuntime:
             await asyncio.sleep(self._config.poll_interval_seconds)
 
     async def refresh_all(self) -> None:
-        await self.refresh_system()
         await self.refresh_catalog()
+        await self.refresh_system()
         await self.refresh_status()
 
     async def refresh_system(self) -> dict[str, str | None]:
         async with self._lock:
-            await self._close_status_session_locked()
-            info = await asyncio.to_thread(
-                query_system_info,
-                port=self._config.port,
-                code=self._config.auth_code,
-                reset=self._config.reset,
-            )
+            if self._status_session is None:
+                self._status_session = self._create_status_session()
+            info = await asyncio.to_thread(self._status_session.query_system_info)
             self._system_info.update(
                 {
                     "panel_model": info.model,
@@ -487,11 +480,7 @@ class PanelRuntime:
             devices = self._status.devices if self._status is not None else (self._catalog.devices if self._catalog is not None else [])
             include_diagnostics = time.monotonic() >= self._next_diagnostics_refresh_monotonic
             if self._status_session is None:
-                self._status_session = PersistentSnapshotSession(
-                    port=self._config.port,
-                    code=self._config.auth_code,
-                    reset=self._config.reset,
-                )
+                self._status_session = self._create_status_session()
             snapshot = await asyncio.to_thread(
                 self._status_session.query_snapshot,
                 panel_model=self._system_info.get("panel_model"),
@@ -707,42 +696,45 @@ class PanelRuntime:
             ArmMode.NIGHT: "arm_night",
         }[mode]
         async with self._lock:
-            await self._close_status_session_locked()
+            session = self._status_session
+            if session is None:
+                session = self._create_status_session()
+                self._status_session = session
             await asyncio.to_thread(
-                control_section,
-                port=self._config.port,
-                code=code or self._config.auth_code,
+                session.control_section,
                 section_id=section_id,
                 action=action,
-                reset=self._config.reset,
+                code=code,
             )
         return await self.refresh_status()
 
     async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
         async with self._lock:
-            await self._close_status_session_locked()
+            session = self._status_session
+            if session is None:
+                session = self._create_status_session()
+                self._status_session = session
             await asyncio.to_thread(
-                control_section,
-                port=self._config.port,
-                code=code or self._config.auth_code,
+                session.control_section,
                 section_id=section_id,
                 action="disarm",
-                reset=self._config.reset,
+                code=code,
             )
         return await self.refresh_status()
 
     async def set_pg(self, pg_id: int, enabled: bool, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_pg_id(pg_id)
         async with self._lock:
-            await self._close_status_session_locked()
+            session = self._status_session
+            if session is None:
+                session = self._create_status_session()
+                self._status_session = session
             await asyncio.to_thread(
-                control_pg,
-                port=self._config.port,
-                code=code or self._config.auth_code,
+                session.control_pg,
                 pg_id=pg_id,
                 enabled=enabled,
-                reset=self._config.reset,
+                code=code,
             )
         return await self.refresh_status()
 
@@ -918,6 +910,13 @@ class PanelRuntime:
     @property
     def system_info(self) -> dict[str, str | None]:
         return dict(self._system_info)
+
+    def _create_status_session(self) -> PersistentSnapshotSession:
+        return PersistentSnapshotSession(
+            port=self._config.port,
+            code=self._config.auth_code,
+            reset=self._config.reset,
+        )
 
     async def _close_status_session_locked(self) -> None:
         session = self._status_session

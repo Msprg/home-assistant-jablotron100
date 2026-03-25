@@ -273,6 +273,7 @@ def test_catalog_names_are_applied_to_live_status() -> None:
 
 
 def test_persistent_snapshot_session_reuses_single_login(monkeypatch) -> None:
+    client_creations = 0
     login_calls = 0
     enable_calls = 0
     section_query_calls = 0
@@ -280,6 +281,8 @@ def test_persistent_snapshot_session_reuses_single_login(monkeypatch) -> None:
 
     class FakeClient:
         def __init__(self, serial_port: str) -> None:
+            nonlocal client_creations
+            client_creations += 1
             self.serial_port = serial_port
 
         def send_packet(self, packet: bytes) -> None:
@@ -316,16 +319,161 @@ def test_persistent_snapshot_session_reuses_single_login(monkeypatch) -> None:
 
     session = PersistentSnapshotSession(port="auto", code="1812", reset=True)
     try:
-        first = session.query_snapshot(panel_model=None, pg_count=0)
-        second = session.query_snapshot(panel_model=None, pg_count=0)
+        first = session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+        second = session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
     finally:
         session.close()
 
     assert first.sections == []
     assert second.sections == []
+    assert client_creations == 1
     assert login_calls == 1
     assert enable_calls == 1
     assert section_query_calls == 3
+    assert close_calls == 1
+
+
+def test_persistent_snapshot_session_control_reuses_existing_login(monkeypatch) -> None:
+    client_creations = 0
+    login_calls = 0
+    close_calls = 0
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            nonlocal client_creations
+            client_creations += 1
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            return None
+
+        def send_packets(self, packets) -> None:
+            return None
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    def fake_login(client, code: str, *, reset: bool) -> None:
+        nonlocal login_calls
+        login_calls += 1
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", fake_login)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+        session.control_pg(pg_id=17, enabled=True, code="4458")
+        session.control_section(section_id=5, action="disarm", code="4458")
+        session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+    finally:
+        session.close()
+
+    assert client_creations == 1
+    assert login_calls == 1
+    assert close_calls == 1
+
+
+def test_persistent_snapshot_session_switches_codes_without_reopening(monkeypatch) -> None:
+    client_creations = 0
+    login_calls = 0
+    close_calls = 0
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            nonlocal client_creations
+            client_creations += 1
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            return None
+
+        def send_packets(self, packets) -> None:
+            return None
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    def fake_login(client, code: str, *, reset: bool) -> None:
+        nonlocal login_calls
+        login_calls += 1
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", fake_login)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+        session.control_section(section_id=5, action="disarm", code="1812")
+        session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+    finally:
+        session.close()
+
+    assert client_creations == 1
+    assert login_calls == 1
+    assert close_calls == 1
+
+
+def test_persistent_snapshot_session_system_info_reuses_existing_login(monkeypatch) -> None:
+    client_creations = 0
+    login_calls = 0
+    close_calls = 0
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            nonlocal client_creations
+            client_creations += 1
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            return None
+
+        def send_packets(self, packets) -> None:
+            return None
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    def fake_login(client, code: str, *, reset: bool) -> None:
+        nonlocal login_calls
+        login_calls += 1
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", fake_login)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        session.query_system_info(timeout=0.01)
+        session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+    finally:
+        session.close()
+
+    assert client_creations == 1
+    assert login_calls == 1
     assert close_calls == 1
 
 

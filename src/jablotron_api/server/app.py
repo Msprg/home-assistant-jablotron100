@@ -93,7 +93,8 @@ def create_app(
 
     async def build_system_payload(token: AuthenticatedToken) -> ServerSystemModel:
         require_scopes(token, Scope.SYSTEM_READ.value)
-        await runtime.refresh_system()
+        if not runtime.system_info.get("panel_model"):
+            await runtime.refresh_system()
         return ServerSystemModel(
             server_version=__version__,
             panel_model=runtime.system_info.get("panel_model"),

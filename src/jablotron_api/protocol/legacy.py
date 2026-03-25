@@ -13,6 +13,9 @@ from jablotron_usb_debug import (
     Jablotron,
     JablotronUSBClient,
     SystemInfo,
+    UI_CONTROL_AUTHORISATION_END,
+    UI_CONTROL_MODIFY_SECTION,
+    UI_CONTROL_TOGGLE_PG_OUTPUT,
     ensure_serial_port,
     perform_enable_device_states,
     perform_login,
@@ -359,6 +362,7 @@ class PersistentSnapshotSession:
         self._stop_event = threading.Event()
         self._keepalive_thread: threading.Thread | None = None
         self._last_enable_device_states_at = 0.0
+        self._authorized_code: str | None = None
 
     def close(self) -> None:
         self._stop_event.set()
@@ -395,13 +399,59 @@ class PersistentSnapshotSession:
                 self._close_client_locked()
                 raise
 
-    def _ensure_client_locked(self) -> JablotronUSBClient:
+    def query_system_info(self, *, timeout: float = 2.0) -> LegacySystemInfo:
+        with self._io_lock:
+            try:
+                client = self._ensure_client_locked()
+                return self._query_system_info_locked(client, timeout=timeout)
+            except Exception:
+                self._close_client_locked()
+                raise
+
+    def control_section(self, *, section_id: int, action: str, code: str | None = None) -> None:
+        if action not in {"disarm", "arm_away", "arm_home", "arm_night"}:
+            raise ValueError(f"Unsupported section action: {action}")
+        int_packets = {
+            "disarm": 143,
+            "arm_away": 159,
+            "arm_home": 175,
+            "arm_night": 175,
+        }
+        with self._io_lock:
+            previous_code = self._authorized_code
+            requested_code = code or self._code
+            try:
+                client = self._ensure_client_locked(auth_code=requested_code)
+                self._ensure_authorized_code_locked(client, requested_code)
+                modify_packet = Jablotron.int_to_bytes(int_packets[action] + section_id)
+                client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_MODIFY_SECTION, modify_packet))
+                time.sleep(0.3)
+            except Exception:
+                self._restore_previous_authorization_locked(previous_code)
+                raise
+
+    def control_pg(self, *, pg_id: int, enabled: bool, code: str | None = None) -> None:
+        with self._io_lock:
+            previous_code = self._authorized_code
+            requested_code = code or self._code
+            try:
+                client = self._ensure_client_locked(auth_code=requested_code)
+                self._ensure_authorized_code_locked(client, requested_code)
+                payload = Jablotron.int_to_bytes(pg_id - 1) + (b"\x01" if enabled else b"\x00")
+                client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_TOGGLE_PG_OUTPUT, payload))
+                time.sleep(0.3)
+            except Exception:
+                self._restore_previous_authorization_locked(previous_code)
+                raise
+
+    def _ensure_client_locked(self, auth_code: str | None = None) -> JablotronUSBClient:
         if self._client is not None:
             return self._client
 
         client = JablotronUSBClient(self._serial_port)
         try:
-            perform_login(client, self._code, reset=self._reset)
+            active_code = auth_code or self._code
+            perform_login(client, active_code, reset=self._reset)
             time.sleep(0.5)
             perform_enable_device_states(client)
             self._last_enable_device_states_at = time.monotonic()
@@ -412,6 +462,7 @@ class PersistentSnapshotSession:
             raise
 
         self._client = client
+        self._authorized_code = active_code
         self._ensure_keepalive_thread_locked()
         return client
 
@@ -430,12 +481,35 @@ class PersistentSnapshotSession:
         client = self._client
         self._client = None
         self._last_enable_device_states_at = 0.0
+        self._authorized_code = None
         if client is None:
             return
         try:
             client.close()
         except Exception:
             pass
+
+    def _ensure_authorized_code_locked(self, client: JablotronUSBClient, code: str) -> None:
+        if self._authorized_code == code:
+            return
+        client.send_packets(
+            [
+                Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END),
+                Jablotron.create_packet_authorisation_code(code),
+            ]
+        )
+        _await_login_success(client)
+        time.sleep(0.5)
+        self._authorized_code = code
+
+    def _restore_previous_authorization_locked(self, previous_code: str | None) -> None:
+        client = self._client
+        if client is None or previous_code is None or previous_code == self._authorized_code:
+            return
+        try:
+            self._ensure_authorized_code_locked(client, previous_code)
+        except Exception:
+            self._close_client_locked()
 
     def _keepalive_loop(self) -> None:
         while not self._stop_event.wait(1.0):
@@ -550,6 +624,45 @@ class PersistentSnapshotSession:
             central=parser.central,
             service_mode=parser.service_mode,
         )
+
+    def _query_system_info_locked(self, client: JablotronUSBClient, *, timeout: float) -> LegacySystemInfo:
+        model = None
+        hardware_version = None
+        firmware_version = None
+        self._drain_packets_locked(client, timeout=0.05)
+        perform_system_info_query(
+            client,
+            [SystemInfo.MODEL, SystemInfo.HARDWARE_VERSION, SystemInfo.FIRMWARE_VERSION],
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            batch = list(client.read_packets(timeout=min(0.2, remaining)))
+            if not batch:
+                continue
+            for packet in batch:
+                if Jablotron._is_login_error_packet(packet):
+                    self._close_client_locked()
+                    raise WrongCodeError("Wrong code.")
+                if packet[:1] != b"\x40":
+                    continue
+                try:
+                    info_type = SystemInfo(Jablotron.bytes_to_int(packet[2:3]))
+                except ValueError:
+                    continue
+                try:
+                    value = Jablotron.decode_system_info_packet(packet)
+                except UnicodeDecodeError:
+                    continue
+                if info_type == SystemInfo.MODEL:
+                    model = value
+                elif info_type == SystemInfo.HARDWARE_VERSION:
+                    hardware_version = value
+                elif info_type == SystemInfo.FIRMWARE_VERSION:
+                    firmware_version = value
+            if model is not None and hardware_version is not None and firmware_version is not None:
+                break
+        return LegacySystemInfo(model=model, hardware_version=hardware_version, firmware_version=firmware_version)
 
 
 def query_system_info(*, port: str, code: str, reset: bool = True, timeout: float = 2.0) -> LegacySystemInfo:

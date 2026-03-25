@@ -19,10 +19,13 @@ from pathlib import Path
 from typing import TextIO
 
 from jablotron_re_tools import (
+    CONFIGURATION_SECTIONS_MODE,
     EXITED_SECTIONS_MODE,
     JablotronUSBClient,
     add_flexi_log_device_argument,
     cleanup_read_session,
+    configuration_in_use_message,
+    describe_sections_mode,
     drain_packets,
     enter_setup_mode,
     extract_export_catalog,
@@ -1922,9 +1925,11 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
                 verbose=args.verbose,
             )
             if final_mode != EXITED_SECTIONS_MODE:
+                if final_mode == CONFIGURATION_SECTIONS_MODE:
+                    raise SystemExit(configuration_in_use_message())
                 raise SystemExit(
                     "Event-session cleanup did not reach the exited state "
-                    f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {final_mode!r})."
+                    f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {describe_sections_mode(final_mode)})."
                 )
 
 
