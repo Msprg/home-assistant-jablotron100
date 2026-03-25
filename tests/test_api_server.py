@@ -24,7 +24,7 @@ from jablotron_api.domain.models import (
     UserModel,
 )
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
-from jablotron_api.panel.runtime import _apply_catalog_names
+from jablotron_api.panel.runtime import _apply_catalog_names, _infer_device_type
 from jablotron_api.protocol import legacy
 from jablotron_api.protocol.legacy import LegacyPanelSnapshot, PersistentSnapshotSession
 from jablotron_api.server.app import create_app
@@ -318,6 +318,12 @@ def test_catalog_names_are_applied_to_live_status() -> None:
     )
     assert sections[0].name == "Ground Floor"
     assert pgs[0].name == "Gate Relay"
+
+
+def test_infer_device_type_avoids_module_name_mismatches() -> None:
+    assert _infer_device_type(name="VSTUP HLAVNY", hardware_model="JA-114HN", type_raw=14, object_id=35) == ("io_module", None)
+    assert _infer_device_type(name="RFID čítačka Hlavna", hardware_model="JA-122E", type_raw=14, object_id=40) == ("rfid_reader", None)
+    assert _infer_device_type(name="Posilnovac zbernice", hardware_model="120Z", type_raw=14, object_id=1) == ("bus_booster", None)
 
 
 def test_persistent_snapshot_session_reuses_single_login(monkeypatch) -> None:

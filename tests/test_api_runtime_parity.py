@@ -172,3 +172,43 @@ def test_api_runtime_seeds_legacy_central_fallback_states() -> None:
     assert "gsm_signal_sensor" not in runtime.entities[EntityType.GSM_SIGNAL]
     assert "gsm_signal_strength_sensor" not in runtime.entities[EntityType.GSM_SIGNAL_STRENGTH]
     assert "lan" in runtime.entities[EntityType.LAN_CONNECTION]
+
+
+def test_api_runtime_removes_stale_device_state_entity_when_mapping_drops_state() -> None:
+    runtime = _build_runtime()
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 35,
+                    "name": "VSTUP HLAVNY",
+                    "inferred_device_type": "door_opening_detector",
+                    "inferred_entity_type": "device_state_door",
+                }
+            ],
+            "users": [],
+        }
+    )
+    assert "device_sensor_35" in runtime.entities[EntityType.DEVICE_STATE_DOOR]
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 35,
+                    "name": "VSTUP HLAVNY",
+                    "inferred_device_type": "io_module",
+                    "inferred_entity_type": None,
+                }
+            ],
+            "users": [],
+        }
+    )
+
+    for bucket in runtime.entities.values():
+        assert "device_sensor_35" not in bucket

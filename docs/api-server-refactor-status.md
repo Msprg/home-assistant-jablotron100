@@ -338,3 +338,9 @@
     - if older registry entries for those controls already exist from a previous build, the runtime removes them during startup rather than leaving them behind as `unavailable`
   - `LAN connection` remains available because the live JA-107K path does decode it reliably
   - exact JA-107K decoding for central power and `UNKNOWN_GSM` remains a protocol follow-up item rather than a parity blocker
+- Audited the live export-catalog hardware-model mapping and corrected obvious non-detector mismatches that were being turned into misleading state entities:
+  - `JA-114HN` now maps to `io_module` with no state entity instead of `door_opening_detector`
+  - `JA-122E` now maps to `rfid_reader` with no state entity instead of a generic `custom` binary-sensor path
+  - `120Z` now maps to `bus_booster` with no state entity instead of `custom`
+  - the Home Assistant API runtime now removes stale `device_sensor_*` entities if a corrected mapping no longer exposes a state entity for that device, so upgraded installs do not keep old wrong door/custom sensors around
+  - live verification after rebuilding the server showed the corrected catalog values for object IDs `1`, `35`, `40`, and `44`

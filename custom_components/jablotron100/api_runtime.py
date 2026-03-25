@@ -346,8 +346,12 @@ class Jablotron:
         if entity_id not in self.entities_states:
             self.entities_states[entity_id] = state
 
-    def _remove_control(self, entity_type: EntityType, control_id: str) -> None:
-        self.entities[entity_type].pop(control_id, None)
+    def _remove_control_by_id(self, control_id: str, *, entity_type: EntityType | None = None) -> None:
+        if entity_type is None:
+            for bucket in self.entities.values():
+                bucket.pop(control_id, None)
+        else:
+            self.entities[entity_type].pop(control_id, None)
         self.entities_states.pop(control_id, None)
         self.hass_entities.pop(control_id, None)
 
@@ -363,11 +367,11 @@ class Jablotron:
     def _remove_unsupported_central_entities(self, status: dict) -> None:
         central = status.get("central") or {}
         if central.get("power_supply") is None:
-            self._remove_control(EntityType.POWER_SUPPLY, self._legacy_power_supply_id())
+            self._remove_control_by_id(self._legacy_power_supply_id(), entity_type=EntityType.POWER_SUPPLY)
         if central.get("gsm_signal") is None:
-            self._remove_control(EntityType.GSM_SIGNAL, "gsm_signal_sensor")
+            self._remove_control_by_id("gsm_signal_sensor", entity_type=EntityType.GSM_SIGNAL)
         if central.get("gsm_signal_strength") is None:
-            self._remove_control(EntityType.GSM_SIGNAL_STRENGTH, "gsm_signal_strength_sensor")
+            self._remove_control_by_id("gsm_signal_strength_sensor", entity_type=EntityType.GSM_SIGNAL_STRENGTH)
 
     def _section_has_smoke_detector(self, section_no: int) -> bool:
         for device in self._catalog.get("devices", []):
@@ -428,6 +432,8 @@ class Jablotron:
                     entity_type = None
                 if entity_type is not None:
                     added_any = self._ensure_control(entity_type, self._legacy_device_state_id(device_no), hass_device=hass_device) or added_any
+            else:
+                self._remove_control_by_id(self._legacy_device_state_id(device_no))
 
             inferred_device_type = device.get("inferred_device_type")
             if inferred_device_type in TEMPERATURE_DEVICE_TYPES:

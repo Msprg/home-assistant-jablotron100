@@ -102,6 +102,12 @@ def _infer_device_type(*, name: str, hardware_model: str | None, type_raw: int |
 
     if object_id in {0, 233, 234, 235, 237}:
         return None, None
+    if hardware in {"120Z", "JA-120Z"}:
+        return "bus_booster", None
+    if hardware == "JA-114HN":
+        return "io_module", None
+    if hardware.startswith("JA-122E"):
+        return "rfid_reader", None
     if hardware.startswith("JA-110P"):
         return "motion_detector", "device_state_motion"
     if hardware.startswith("JA-111M"):
