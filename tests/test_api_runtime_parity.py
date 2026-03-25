@@ -212,3 +212,70 @@ def test_api_runtime_removes_stale_device_state_entity_when_mapping_drops_state(
 
     for bucket in runtime.entities.values():
         assert "device_sensor_35" not in bucket
+
+
+def test_api_runtime_removes_stale_dynamic_entities_when_status_data_disappears() -> None:
+    runtime = _build_runtime()
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "name": "Thermostat 24",
+                    "inferred_device_type": "thermostat",
+                    "inferred_entity_type": None,
+                }
+            ],
+            "users": [],
+        }
+    )
+    runtime._apply_status(
+        {
+            "service_mode": False,
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "battery_level": 60,
+                    "battery_problem": False,
+                    "temperature": 23.3,
+                    "wireless": True,
+                    "signal_strength": 55,
+                }
+            ],
+            "central": {},
+        }
+    )
+
+    assert "device_battery_level_sensor_24" in runtime.entities[EntityType.BATTERY_LEVEL]
+    assert "device_battery_problem_sensor_24" in runtime.entities[EntityType.BATTERY_PROBLEM]
+    assert "device_temperature_sensor_24" in runtime.entities[EntityType.TEMPERATURE]
+    assert "device_signal_strength_sensor_24" in runtime.entities[EntityType.SIGNAL_STRENGTH]
+
+    runtime._apply_status(
+        {
+            "service_mode": False,
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "battery_level": None,
+                    "battery_problem": None,
+                    "temperature": None,
+                    "wireless": False,
+                    "signal_strength": None,
+                }
+            ],
+            "central": {},
+        }
+    )
+
+    assert "device_battery_level_sensor_24" not in runtime.entities[EntityType.BATTERY_LEVEL]
+    assert "device_battery_problem_sensor_24" not in runtime.entities[EntityType.BATTERY_PROBLEM]
+    assert "device_temperature_sensor_24" not in runtime.entities[EntityType.TEMPERATURE]
+    assert "device_signal_strength_sensor_24" not in runtime.entities[EntityType.SIGNAL_STRENGTH]

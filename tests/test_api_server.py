@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from itertools import chain, repeat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -462,6 +463,55 @@ def test_persistent_snapshot_session_close_logs_out_before_closing(monkeypatch) 
     assert legacy.Jablotron.create_packet_command(b"\x0e") in sent_packets
     assert legacy.Jablotron.create_packet_command(b"\x02") in sent_packets
     assert events.index("client_close") > 0
+
+
+def test_diagnostics_timeout_is_longer_for_wireless_temperature_devices() -> None:
+    assert legacy._diagnostics_timeout_for_device(
+        DeviceStatusModel(id=41, name="Wireless thermostat", inferred_device_type="thermostat", wireless=True)
+    ) == legacy.WIRELESS_TEMPERATURE_DIAGNOSTICS_TIMEOUT_SECONDS
+    assert legacy._diagnostics_timeout_for_device(
+        DeviceStatusModel(id=18, name="Wired thermostat", inferred_device_type="thermostat", wireless=False)
+    ) == legacy.DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS
+    assert legacy._diagnostics_timeout_for_device(
+        DeviceStatusModel(id=2, name="Wireless PIR", inferred_device_type="motion_detector", wireless=True)
+    ) == legacy.DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS
+
+
+def test_diagnostics_priority_prefers_unresolved_wireless_temperature_devices() -> None:
+    unresolved = DeviceStatusModel(id=41, name="Wireless thermostat", inferred_device_type="thermostat", wireless=True, temperature=None)
+    resolved = DeviceStatusModel(id=42, name="Wireless thermostat", inferred_device_type="thermostat", wireless=True, temperature=23.6)
+    wired = DeviceStatusModel(id=24, name="Wired thermostat", inferred_device_type="thermostat", wireless=False, temperature=23.3)
+
+    ordered = sorted([wired, resolved, unresolved], key=legacy._diagnostics_priority)
+
+    assert [device.id for device in ordered] == [41, 42, 24]
+
+
+def test_read_into_parser_can_wait_through_quiet_gap_for_late_packets(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read_packets(self, *, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                return iter([b"first"])
+            if self.calls == 2:
+                return iter(())
+            if self.calls == 3:
+                return iter([b"late"])
+            return iter(())
+
+    parser = type("Parser", (), {"seen": [], "parse_packet": lambda self, packet, *, pg_count: self.seen.append(packet)})()
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    client = FakeClient()
+
+    monotonic_values = chain([0.0, 0.0, 0.1, 0.1, 0.4, 0.4, 0.7, 0.7, 1.1], repeat(1.1))
+    monkeypatch.setattr(legacy.time, "monotonic", lambda: next(monotonic_values))
+
+    session._read_into_parser_locked(client, parser, pg_count=0, timeout=1.0, stop_on_first_gap=False)
+
+    assert parser.seen == [b"first", b"late"]
 
 
 def test_panel_runtime_close_runs_exit_only_cleanup_after_status_session(monkeypatch) -> None:

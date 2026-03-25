@@ -535,7 +535,15 @@ class PanelRuntime:
             )
             self._status = status
             if include_diagnostics:
-                self._next_diagnostics_refresh_monotonic = time.monotonic() + 3600.0
+                unresolved_wireless_temperatures = any(
+                    device.wireless
+                    and (device.inferred_device_type or "") in {"thermometer", "thermostat"}
+                    and device.temperature is None
+                    for device in status.devices
+                )
+                self._next_diagnostics_refresh_monotonic = time.monotonic() + (
+                    60.0 if unresolved_wireless_temperatures else 3600.0
+                )
             if include_full_refresh or include_diagnostics:
                 self._next_full_refresh_monotonic = time.monotonic() + self._config.full_refresh_interval_seconds
         await self._emit("status", status.model_dump(mode="json"))

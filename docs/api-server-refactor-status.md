@@ -235,6 +235,18 @@
   - focused validation:
     - `venv/bin/pytest -q` -> `33 passed`
     - live container stop/start with no multi-minute wait now comes back cleanly, with no startup `configuration-active (0x94)` warning
+- Investigated missing thermostat diagnostics on the live panel:
+  - direct live captures showed wireless thermostats `JA-150TP` do return temperature over HID, but their packets arrive later than the earlier per-device diagnostics window and often only after initial ack/status packets
+  - server changes in `src/jablotron_api/protocol/legacy.py` now:
+    - keep reading through quiet gaps during diagnostics instead of stopping after the first empty read
+    - use a longer diagnostics timeout for wireless thermometers/thermostats
+    - prepend a direct `device_info` request before each diagnostics force-info request
+    - prioritize unresolved wireless temperature devices first in the diagnostics sweep
+  - runtime changes in `src/jablotron_api/panel/runtime.py` now retry diagnostics after `60s` instead of `1h` when any wireless thermometer/thermostat is still missing temperature
+  - Home Assistant runtime changes now remove stale dynamic battery/signal/temperature entities when the current API payload no longer supports them, which should clean up wired thermostats that had orphaned battery entities from older runs
+  - focused live validation:
+    - manual single-device HID queries confirmed both wireless thermostats can return temperature packets on this panel
+    - live API runs after intermediate patches alternated between resolving one or the other wireless thermostat temperature, which is why the final reliability-oriented prioritization/retry patch was added
   - setup-mode conflict classification
   - cleanup short-circuiting before a fallback re-login when configuration is already active
 - Verification:

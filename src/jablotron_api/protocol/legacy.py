@@ -104,6 +104,23 @@ def _await_login_success(client: JablotronUSBClient, *, timeout: float = 0.8) ->
 RAW_SESSION_KEEPALIVE = bytes.fromhex("520102")
 EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
 DEVICE_STATE_RENEWAL_SECONDS = 240.0
+DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS = 0.5
+WIRELESS_TEMPERATURE_DIAGNOSTICS_TIMEOUT_SECONDS = 5.0
+
+
+def _diagnostics_timeout_for_device(device: DeviceStatusModel) -> float:
+    if device.wireless and (device.inferred_device_type or "") in {"thermometer", "thermostat"}:
+        return WIRELESS_TEMPERATURE_DIAGNOSTICS_TIMEOUT_SECONDS
+    return DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS
+
+
+def _diagnostics_priority(device: DeviceStatusModel) -> tuple[int, int]:
+    inferred = device.inferred_device_type or ""
+    if device.wireless and inferred in {"thermometer", "thermostat"} and device.temperature is None:
+        return (0, device.id)
+    if device.wireless and inferred in {"thermometer", "thermostat"}:
+        return (1, device.id)
+    return (2, device.id)
 
 
 @dataclass
@@ -569,6 +586,7 @@ class PersistentSnapshotSession:
         *,
         pg_count: int,
         timeout: float,
+        stop_on_first_gap: bool = True,
     ) -> None:
         deadline = time.monotonic() + timeout
         saw_packets = False
@@ -576,7 +594,7 @@ class PersistentSnapshotSession:
             remaining = max(0.0, deadline - time.monotonic())
             batch = list(client.read_packets(timeout=min(0.2, remaining)))
             if not batch:
-                if saw_packets:
+                if saw_packets and stop_on_first_gap:
                     break
                 continue
             saw_packets = True
@@ -617,23 +635,35 @@ class PersistentSnapshotSession:
         self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=timeout)
 
         if include_diagnostics:
-            diagnostic_numbers = sorted(
-                {
-                    device.id
-                    for device in devices_by_id.values()
-                    if _device_supports_diagnostics(device)
-                }
-                | {0}
-                | {device_id for key, device_id in special_devices.items() if key in {"lan", "gsm"} and isinstance(device_id, int)}
-            )
-            for device_id in diagnostic_numbers:
-                client.send_packets(
-                    [
-                        Jablotron._create_packet_device_diagnostics_start(device_id),
-                        Jablotron._create_packet_device_diagnostics_force_info(device_id),
-                    ]
+            diagnostic_numbers = [
+                device.id
+                for device in sorted(
+                    (device for device in devices_by_id.values() if _device_supports_diagnostics(device)),
+                    key=_diagnostics_priority,
                 )
-                self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=0.5)
+            ]
+            diagnostic_numbers.extend(
+                device_id
+                for key, device_id in special_devices.items()
+                if key in {"lan", "gsm"} and isinstance(device_id, int)
+            )
+            diagnostic_numbers.append(0)
+            for device_id in diagnostic_numbers:
+                device = devices_by_id.get(device_id)
+                packets = [
+                    Jablotron._create_packet_device_diagnostics_start(device_id),
+                    Jablotron._create_packet_device_diagnostics_force_info(device_id),
+                ]
+                if device is not None:
+                    packets.insert(0, Jablotron.create_packet_device_info(device_id))
+                client.send_packets(packets)
+                self._read_into_parser_locked(
+                    client,
+                    parser,
+                    pg_count=pg_count,
+                    timeout=DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS if device is None else _diagnostics_timeout_for_device(device),
+                    stop_on_first_gap=False,
+                )
                 client.send_packet(Jablotron._create_packet_device_diagnostics_end(device_id))
                 self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=0.1)
 

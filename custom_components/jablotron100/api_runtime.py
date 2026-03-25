@@ -463,15 +463,25 @@ class Jablotron:
         added_any = False
         if device.get("signal_strength") is not None or device.get("wireless"):
             added_any = self._ensure_control(EntityType.SIGNAL_STRENGTH, self._legacy_device_signal_strength_id(device_no), hass_device=hass_device) or added_any
+        else:
+            self._remove_control_by_id(self._legacy_device_signal_strength_id(device_no), entity_type=EntityType.SIGNAL_STRENGTH)
         if device.get("battery_level") is not None or device.get("battery_problem") is not None:
             added_any = self._ensure_control(EntityType.BATTERY_LEVEL, self._legacy_device_battery_level_id(device_no), hass_device=hass_device) or added_any
             added_any = self._ensure_control(EntityType.BATTERY_PROBLEM, self._legacy_device_battery_problem_id(device_no), hass_device=hass_device) or added_any
+        else:
+            self._remove_control_by_id(self._legacy_device_battery_level_id(device_no), entity_type=EntityType.BATTERY_LEVEL)
+            self._remove_control_by_id(self._legacy_device_battery_problem_id(device_no), entity_type=EntityType.BATTERY_PROBLEM)
         inferred_device_type = catalog_device.get("inferred_device_type")
         if inferred_device_type in SIREN_DEVICE_TYPES:
             added_any = self._ensure_control(EntityType.BATTERY_STANDBY_VOLTAGE, self._legacy_device_battery_standby_voltage_id(device_no), hass_device=hass_device) or added_any
             added_any = self._ensure_control(EntityType.BATTERY_LOAD_VOLTAGE, self._legacy_device_battery_load_voltage_id(device_no), hass_device=hass_device) or added_any
+        else:
+            self._remove_control_by_id(self._legacy_device_battery_standby_voltage_id(device_no), entity_type=EntityType.BATTERY_STANDBY_VOLTAGE)
+            self._remove_control_by_id(self._legacy_device_battery_load_voltage_id(device_no), entity_type=EntityType.BATTERY_LOAD_VOLTAGE)
         if device.get("temperature") is not None and inferred_device_type in TEMPERATURE_DEVICE_TYPES:
             added_any = self._ensure_control(EntityType.TEMPERATURE, self._legacy_device_temperature_id(device_no), hass_device=hass_device) or added_any
+        else:
+            self._remove_control_by_id(self._legacy_device_temperature_id(device_no), entity_type=EntityType.TEMPERATURE)
         for pulse_no, _pulse in enumerate(device.get("pulses") or []):
             added_any = self._ensure_control(EntityType.PULSES, self._legacy_pulse_id(device_no, pulse_no), hass_device=hass_device) or added_any
         return added_any
