@@ -384,7 +384,8 @@ class Jablotron:
             pg_no = int(pg["display_id"])
             if usable_pg_last_id is not None and pg_no > usable_pg_last_id:
                 continue
-            pg_hass_device = JablotronHassDevice(id=f"pg_{pg_no}", name=pg.get("name") or f"PG output {pg_no}")
+            pg_name = pg.get("name") or f"PG output {pg_no}"
+            pg_hass_device = JablotronHassDevice(id=f"pg_{pg_no}", name=f"PG{pg_no}: {pg_name}")
             added_any = self._ensure_pg_output(pg_no, pg_hass_device) or added_any
 
         for device in catalog.get("devices", []):
