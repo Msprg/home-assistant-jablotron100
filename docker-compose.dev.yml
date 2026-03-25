@@ -3,6 +3,7 @@ services:
     build: .
     image: jablotron-api-server:latest
     restart: unless-stopped
+    stop_grace_period: 20s
     environment:
       JABLOTRON_API_DB_PATH: /data/jablotron-api.db
       JABLOTRON_API_PORT: "8443"

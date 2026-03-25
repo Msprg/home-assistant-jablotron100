@@ -25,6 +25,7 @@ from jablotron_re_tools import (
     ExportSnapshot,
     UserRecord,
     apply_import_sector,
+    cleanup_read_session,
     default_export_output,
     extract_export_catalog,
     extract_users,
@@ -465,7 +466,10 @@ class PanelRuntime:
             except asyncio.CancelledError:
                 pass
         async with self._lock:
+            had_status_session = self._status_session is not None
             await self._close_status_session_locked()
+            if had_status_session:
+                await self._cleanup_shutdown_session_locked()
 
     def add_listener(self, listener: StatusListener) -> None:
         self._listeners.append(listener)
@@ -957,3 +961,15 @@ class PanelRuntime:
         self._status_session = None
         if session is not None:
             await asyncio.to_thread(session.close)
+
+    async def _cleanup_shutdown_session_locked(self) -> None:
+        try:
+            await asyncio.to_thread(
+                cleanup_read_session,
+                port=self._config.port,
+                code=self._config.auth_code,
+                cleanup_mode="exit-only",
+                verbose=False,
+            )
+        except Exception:
+            return

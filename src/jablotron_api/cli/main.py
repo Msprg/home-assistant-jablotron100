@@ -71,6 +71,7 @@ def cmd_server(_args: argparse.Namespace) -> None:
         ssl_keyfile=settings.tls_keyfile,
         ssl_ca_certs=settings.tls_ca_certs,
         ssl_cert_reqs=ssl.CERT_REQUIRED,
+        timeout_graceful_shutdown=15,
     )
 
 

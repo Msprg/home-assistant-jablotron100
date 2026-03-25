@@ -102,6 +102,7 @@ def _await_login_success(client: JablotronUSBClient, *, timeout: float = 0.8) ->
 
 
 RAW_SESSION_KEEPALIVE = bytes.fromhex("520102")
+EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
 DEVICE_STATE_RENEWAL_SECONDS = 240.0
 
 
@@ -370,6 +371,12 @@ class PersistentSnapshotSession:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         with self._io_lock:
+            client = self._client
+            if client is not None:
+                try:
+                    self._graceful_exit_locked(client)
+                except Exception:
+                    pass
             self._close_client_locked()
 
     def query_snapshot(
@@ -512,6 +519,19 @@ class PersistentSnapshotSession:
             self._ensure_authorized_code_locked(client, previous_code)
         except Exception:
             self._close_client_locked()
+
+    def _graceful_exit_locked(self, client: JablotronUSBClient) -> None:
+        client.send_packet(EXIT_DIAGNOSTICS_OFF_PACKET)
+        time.sleep(0.03)
+        client.send_packets(
+            [
+                Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END),
+                Jablotron.create_packet_command(b"\x0e"),
+            ]
+        )
+        time.sleep(0.06)
+        client.send_packet(Jablotron.create_packet_command(b"\x02"))
+        self._drain_packets_locked(client, timeout=0.8)
 
     def _keepalive_loop(self) -> None:
         while not self._stop_event.wait(1.0):

@@ -101,7 +101,7 @@
   - legacy control ID recreation
   - dynamic central/device diagnostic entity creation
   - wrong-code event forwarding in the API-backed runtime
-- Current local result after the latest implementation pass: `16 passed` via `venv/bin/pytest -q`
+- Current local result after the latest implementation pass: `33 passed` via `venv/bin/pytest -q`
 - Remaining test gaps:
   - runtime integration against mocked RE helper failures
   - Home Assistant integration behavior
@@ -157,6 +157,16 @@
   - event archive pulls
   - user CRUD via `IMPORT.CFG` staging + authoritative export verification
   - section and PG control via HID UI packets
+- Verified the stale-session cleanup fix on 2026-03-25:
+  - stopping the container and waiting roughly 3 minutes before restart produced a clean startup with no `configuration-active (0x94)` warning, proving the earlier warning was stale panel-side session state rather than an unavoidable startup export issue
+  - a manual `cleanup_read_session(..., cleanup_mode="exit-only")` run immediately after container stop reached `exited (0x90)` on the live panel without requiring a login-based cleanup fallback
+  - the runtime shutdown path was then patched so normal server shutdown now:
+    - closes the long-lived `PersistentSnapshotSession`
+    - immediately runs `cleanup_read_session(..., cleanup_mode="exit-only")` on a fresh HID handle
+  - live proof after the patch:
+    - rebuilt the Docker container
+    - performed an immediate `docker stop` followed by `docker start`
+    - startup completed cleanly with no `configuration-active (0x94)` warning
 
 ## Latest Decisions / Assumptions
 - Use the current proven helper stack first, then progressively internalize logic into the new package.
@@ -218,6 +228,13 @@
 - Updated `jablotron_event_tool.py` so event-session cleanup reports the same configuration-in-use condition consistently.
 - Added focused regression tests around:
   - `0x94` / `73 09 ... 94 A0 00` detection
+  - runtime shutdown running `exit-only` cleanup after closing the persistent HID session
+- Fixed server-side stale USB session handling across container restarts:
+  - `PanelRuntime.close()` now remembers whether a persistent status session existed, closes it, and then runs the low-level `exit-only` cleanup helper on a fresh HID connection before process exit
+  - this preserves the no-extra-auth steady-state behavior while still clearing the panel-side session state that previously survived rapid container restarts
+  - focused validation:
+    - `venv/bin/pytest -q` -> `33 passed`
+    - live container stop/start with no multi-minute wait now comes back cleanly, with no startup `configuration-active (0x94)` warning
   - setup-mode conflict classification
   - cleanup short-circuiting before a fallback re-login when configuration is already active
 - Verification:
@@ -344,3 +361,8 @@
   - `120Z` now maps to `bus_booster` with no state entity instead of `custom`
   - the Home Assistant API runtime now removes stale `device_sensor_*` entities if a corrected mapping no longer exposes a state entity for that device, so upgraded installs do not keep old wrong door/custom sensors around
   - live verification after rebuilding the server showed the corrected catalog values for object IDs `1`, `35`, `40`, and `44`
+- Improved container/server shutdown so ordinary docker restarts do not leave the server’s own privileged HID session behind:
+  - the persistent HID read session now sends `UI_CONTROL_AUTHORISATION_END` (`perform_logout(...)`) before closing the underlying HID handle
+  - the server CLI now sets an explicit Uvicorn graceful-shutdown timeout of `15s`
+  - `docker-compose.dev.yml` now gives the container a `20s` `stop_grace_period` so FastAPI lifespan shutdown and HID logout can complete before Docker escalates to a forced kill
+  - regression coverage now verifies that `PersistentSnapshotSession.close()` performs logout before the HID client is closed

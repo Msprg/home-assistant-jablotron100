@@ -24,6 +24,7 @@ from jablotron_api.domain.models import (
     UserCreateModel,
     UserModel,
 )
+import jablotron_api.panel.runtime as runtime_module
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
 from jablotron_api.panel.runtime import _apply_catalog_names, _catalog_to_model, _infer_device_type
 from jablotron_api.protocol import legacy
@@ -412,6 +413,83 @@ def test_persistent_snapshot_session_reuses_single_login(monkeypatch) -> None:
     assert enable_calls == 1
     assert section_query_calls == 3
     assert close_calls == 1
+
+
+def test_persistent_snapshot_session_close_logs_out_before_closing(monkeypatch) -> None:
+    events: list[str] = []
+    sent_packets: list[bytes] = []
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            sent_packets.append(packet)
+            return None
+
+        def send_packets(self, packets) -> None:
+            sent_packets.extend(list(packets))
+            return None
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            events.append("client_close")
+
+    def fake_login(client, code: str, *, reset: bool) -> None:
+        events.append("login")
+
+    def fake_enable(client) -> None:
+        events.append("enable")
+
+    def fake_sections(client) -> None:
+        events.append("sections")
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", fake_login)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", fake_enable)
+    monkeypatch.setattr(legacy, "perform_sections_query", fake_sections)
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="1812", reset=True)
+    session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
+    session.close()
+
+    assert legacy.EXIT_DIAGNOSTICS_OFF_PACKET in sent_packets
+    assert legacy.Jablotron.create_packet_ui_control(legacy.UI_CONTROL_AUTHORISATION_END) in sent_packets
+    assert legacy.Jablotron.create_packet_command(b"\x0e") in sent_packets
+    assert legacy.Jablotron.create_packet_command(b"\x02") in sent_packets
+    assert events.index("client_close") > 0
+
+
+def test_panel_runtime_close_runs_exit_only_cleanup_after_status_session(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeSession:
+        def close(self) -> None:
+            events.append(("session_close", None))
+
+    def fake_cleanup_read_session(*, port: str, code: str, cleanup_mode: str, verbose: bool):
+        events.append(("cleanup", {"port": port, "code": code, "cleanup_mode": cleanup_mode, "verbose": verbose}))
+        return 0x90
+
+    monkeypatch.setattr(runtime_module, "cleanup_read_session", fake_cleanup_read_session)
+
+    async def run() -> None:
+        runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="4458"))
+        runtime._status_session = FakeSession()  # type: ignore[assignment]
+        await runtime.close()
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert events == [
+        ("session_close", None),
+        ("cleanup", {"port": "auto", "code": "4458", "cleanup_mode": "exit-only", "verbose": False}),
+    ]
 
 
 def test_persistent_snapshot_session_control_reuses_existing_login(monkeypatch) -> None:
