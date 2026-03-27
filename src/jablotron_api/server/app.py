@@ -171,10 +171,11 @@ def create_app(
     @app.post("/v1/pgs/{pg_id}/on")
     async def pg_on(pg_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.PGS_CONTROL.value)
-        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
-            require_scopes(token, Scope.CODES_IMPERSONATE.value)
+        if code is None or not code.strip():
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PG control requires an explicit panel code.")
+        require_scopes(token, Scope.CODES_IMPERSONATE.value)
         try:
-            updated = await runtime.set_pg(pg_id, True, code=code)
+            updated = await runtime.set_pg(pg_id, True, code=code, allowed_user_ids=token.allowed_user_ids)
         except PermissionError as exc:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except ValueError as exc:
@@ -185,10 +186,11 @@ def create_app(
     @app.post("/v1/pgs/{pg_id}/off")
     async def pg_off(pg_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.PGS_CONTROL.value)
-        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
-            require_scopes(token, Scope.CODES_IMPERSONATE.value)
+        if code is None or not code.strip():
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PG control requires an explicit panel code.")
+        require_scopes(token, Scope.CODES_IMPERSONATE.value)
         try:
-            updated = await runtime.set_pg(pg_id, False, code=code)
+            updated = await runtime.set_pg(pg_id, False, code=code, allowed_user_ids=token.allowed_user_ids)
         except PermissionError as exc:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except ValueError as exc:
@@ -278,6 +280,7 @@ def create_app(
             label=payload.label,
             scopes=payload.scopes,
             certificate_fingerprint=payload.certificate_fingerprint,
+            allowed_user_ids=payload.allowed_user_ids,
         )
         token_store.write_audit(token_id=token.id, action="create_token", resource=f"token:{token_info.id}", details=payload.model_dump(mode="json"))
         return TokenCreateResponse(token=token_value, token_info=token_info)

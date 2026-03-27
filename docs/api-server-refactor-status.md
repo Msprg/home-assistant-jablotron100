@@ -390,3 +390,13 @@
   - the runtime now resolves the effective control code before section/PG actions and, when that code matches a known exported user, preflights the user's allowed sections/PGs before sending the HID command
   - this prevents the previous false-success case where a request without a Home Assistant override code could silently do nothing at the panel yet still return HTTP `200`
   - in the API-backed Home Assistant integration, PG switches no longer do optimistic local state flips; async switch calls now wait for the API result so denied requests stop looking locally successful
+- Hardened the design further for programmable outputs to decouple maintenance rights from client control identity:
+  - PG control now requires an explicit panel code on every API request; there is no fallback to the server's service/maintenance code for PG actions
+  - the token store now supports optional `allowed_user_ids` metadata so tokens can be bound to specific exported Jablotron user IDs
+  - when `allowed_user_ids` is present, the server resolves the supplied control code against the export catalog and rejects the action unless the code matches one of those bound users
+  - this allows a Home Assistant token to be limited to a dedicated `HomeAssistant` Jablotron user even while the server itself still runs with a service-level code for config/export operations
+  - the Home Assistant integration now raises a clear user-facing error for PG actions when:
+    - no `Default control code` is configured
+    - the supplied/default code is denied by token binding
+    - the supplied/default code is valid but lacks rights for the target PG
+  - the local bootstrap/admin CLI now supports `--allowed-user-id` so bound tokens can be minted without editing the SQLite database by hand

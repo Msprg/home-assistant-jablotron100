@@ -49,6 +49,7 @@ class TokenStore:
                     token_hash TEXT NOT NULL UNIQUE,
                     scopes_json TEXT NOT NULL,
                     certificate_fingerprint TEXT,
+                    allowed_user_ids_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     last_used_at TEXT,
                     revoked_at TEXT
@@ -70,6 +71,9 @@ class TokenStore:
                 );
                 """
             )
+            token_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
+            if "allowed_user_ids_json" not in token_columns:
+                conn.execute("ALTER TABLE tokens ADD COLUMN allowed_user_ids_json TEXT NOT NULL DEFAULT '[]'")
             conn.commit()
 
     def create_token(
@@ -78,17 +82,19 @@ class TokenStore:
         label: str,
         scopes: list[str] | None = None,
         certificate_fingerprint: str | None = None,
+        allowed_user_ids: list[int] | None = None,
     ) -> tuple[str, TokenInfoModel]:
         token_value = secrets.token_urlsafe(32)
         token_id = secrets.token_hex(8)
         created_at = utc_now_iso()
         effective_scopes = scopes or list(DEFAULT_ADMIN_SCOPES)
+        effective_allowed_user_ids = allowed_user_ids or []
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO tokens (
-                    id, label, token_hash, scopes_json, certificate_fingerprint, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, label, token_hash, scopes_json, certificate_fingerprint, allowed_user_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token_id,
@@ -96,6 +102,7 @@ class TokenStore:
                     token_hash(token_value),
                     json.dumps(effective_scopes),
                     certificate_fingerprint,
+                    json.dumps(effective_allowed_user_ids),
                     created_at,
                 ),
             )
@@ -105,6 +112,7 @@ class TokenStore:
             label=label,
             scopes=effective_scopes,
             certificate_fingerprint=certificate_fingerprint,
+            allowed_user_ids=effective_allowed_user_ids,
             created_at=datetime.fromisoformat(created_at),
         )
 
@@ -149,6 +157,7 @@ class TokenStore:
             label=row["label"],
             scopes=json.loads(row["scopes_json"]),
             certificate_fingerprint=row["certificate_fingerprint"],
+            allowed_user_ids=json.loads(row["allowed_user_ids_json"] or "[]"),
         )
 
     def write_audit(
@@ -201,8 +210,8 @@ class TokenStore:
             label=row["label"],
             scopes=json.loads(row["scopes_json"]),
             certificate_fingerprint=row["certificate_fingerprint"],
+            allowed_user_ids=json.loads(row["allowed_user_ids_json"] or "[]"),
             created_at=created_at,
             revoked_at=revoked_at,
             last_used_at=last_used_at,
         )
-

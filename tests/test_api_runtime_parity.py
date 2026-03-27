@@ -8,6 +8,7 @@ import custom_components.jablotron100.api_client as api_client_module
 from custom_components.jablotron100.api_runtime import Jablotron, JablotronCentralUnit
 from custom_components.jablotron100.api_client import JablotronApiClient
 from custom_components.jablotron100.const import CONF_API_TOKEN, CONF_SERVER_URL, EVENT_WRONG_CODE, EntityType, EventLoginType
+from custom_components.jablotron100.errors import ControlDenied
 
 
 class _FakeBus:
@@ -348,3 +349,17 @@ def test_api_runtime_marks_unavailable_when_websocket_ends_cleanly() -> None:
     asyncio.run(_exercise())
 
     assert runtime.last_update_success is False
+
+
+def test_api_runtime_pg_control_requires_default_control_code() -> None:
+    runtime = _build_runtime()
+
+    async def _exercise() -> None:
+        try:
+            await runtime.async_toggle_pg_output(7, "on")
+        except ControlDenied as exc:
+            assert str(exc) == "PG control requires a Default control code in the integration options."
+        else:
+            raise AssertionError("Expected ControlDenied when no PG control code is configured.")
+
+    asyncio.run(_exercise())

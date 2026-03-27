@@ -144,7 +144,7 @@ class FakeRuntime:
         self.status.sections[0].state = "disarmed"
         return self.status
 
-    async def set_pg(self, pg_id, enabled, code=None):
+    async def set_pg(self, pg_id, enabled, code=None, *, allowed_user_ids=None):
         if pg_id != 1:
             raise ValueError("PG 2 is outside the client-facing usable range 1-1.")
         self.last_pg_code = code
@@ -268,12 +268,12 @@ def test_control_endpoints_require_impersonation_scope_for_alternate_code(tmp_pa
     assert forbidden.json()["detail"]["missing"] == [Scope.CODES_IMPERSONATE.value]
 
 
-def test_control_endpoints_allow_server_code_without_impersonation_scope(tmp_path: Path) -> None:
+def test_pg_control_endpoints_require_explicit_code(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     store = TokenStore(tmp_path / "tokens.db")
     token, _ = store.create_token(
         label="pg-control-only",
-        scopes=[Scope.PGS_CONTROL.value],
+        scopes=[Scope.PGS_CONTROL.value, Scope.CODES_IMPERSONATE.value],
     )
     app = create_app(
         settings=ServerSettings(db_path=tmp_path / "tokens.db"),
@@ -282,9 +282,9 @@ def test_control_endpoints_allow_server_code_without_impersonation_scope(tmp_pat
     )
     client = TestClient(app)
 
-    response = client.post("/v1/pgs/1/on?code=1812", headers={"Authorization": f"Bearer {token}"})
-    assert response.status_code == 200
-    assert runtime.last_pg_code == "1812"
+    response = client.post("/v1/pgs/1/on", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == "PG control requires an explicit panel code."
 
 
 def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -> None:
@@ -349,11 +349,44 @@ def test_panel_runtime_rejects_pg_control_for_known_user_without_pg_rights() -> 
             ),
         )
         try:
-            await runtime.set_pg(15, True)
+            await runtime.set_pg(15, True, code="4458")
         except PermissionError as exc:
             assert str(exc) == "Code is known as user 100 and is not allowed to control PG 15."
         else:
             raise AssertionError("Expected PermissionError for unauthorized PG control.")
+
+    asyncio.run(run())
+
+
+def test_panel_runtime_rejects_pg_control_for_token_bound_to_other_user() -> None:
+    async def run() -> None:
+        runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="4458"))
+        runtime._catalog = ExportCatalogModel(
+            sections=[],
+            pgs=[ExportPGModel(id=15, display_id=15, name="PG output 15")],
+            devices=[],
+            users=[
+                UserModel(
+                    id=100,
+                    name="HomeAssistant",
+                    code="4458",
+                    section_ids=[1],
+                    pg_ids=[15],
+                    rights="coUserNoSelfedit",
+                )
+            ],
+            initial_setup=InitialSetupModel(
+                source="test",
+                exact=True,
+                pgs=InitialSetupRangeModel(first_id=1, last_id=20, count=20),
+            ),
+        )
+        try:
+            await runtime.set_pg(15, True, code="4458", allowed_user_ids=[101])
+        except PermissionError as exc:
+            assert str(exc) == "Code is known as user 100 and is not allowed by this token."
+        else:
+            raise AssertionError("Expected PermissionError for token/user mismatch.")
 
     asyncio.run(run())
 
@@ -829,7 +862,7 @@ def test_client_facing_ranges_are_enforced(tmp_path: Path) -> None:
     assert bad_section.status_code == 400
     assert "usable range 1-1" in bad_section.json()["detail"]
 
-    bad_pg = client.post("/v1/pgs/2/on", headers={"Authorization": f"Bearer {token}"})
+    bad_pg = client.post("/v1/pgs/2/on?code=1812", headers={"Authorization": f"Bearer {token}"})
     assert bad_pg.status_code == 400
     assert "usable range 1-1" in bad_pg.json()["detail"]
 

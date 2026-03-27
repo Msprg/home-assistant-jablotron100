@@ -33,6 +33,7 @@ from .const import (
     LOGGER,
     PartiallyArmingMode,
 )
+from .errors import ControlDenied
 
 
 LEGACY_LAN_GSM_MODELS = {"JA-101K", "JA-101K-LAN", "JA-106K-3G", "JA-14K", "JA-103K", "JA-103KRY", "JA-107K"}
@@ -639,6 +640,8 @@ class Jablotron:
 
     async def async_toggle_pg_output(self, pg_output_number: int, state: str, code: str | None = None) -> None:
         code = code or self.default_control_code()
+        if not code:
+            raise ControlDenied("PG control requires a Default control code in the integration options.")
 
         try:
             params = {"code": code} if code else None
@@ -648,7 +651,11 @@ class Jablotron:
             )
         except JablotronApiError as exc:
             LOGGER.warning("PG control failed: %s", exc)
-            raise
+            if exc.status == 403:
+                raise ControlDenied(str(exc.detail)) from exc
+            if exc.status == 400 and exc.detail == "Wrong code.":
+                raise ControlDenied("The configured control code was rejected by the panel.") from exc
+            raise ControlDenied(f"PG control failed: {exc.detail}") from exc
         added = self._apply_status(payload)
         if added:
             self._send_signal_entities_added()

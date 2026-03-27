@@ -773,9 +773,19 @@ class PanelRuntime:
             )
         return await self.refresh_status()
 
-    async def set_pg(self, pg_id: int, enabled: bool, code: str | None = None) -> PanelStatusModel:
+    async def set_pg(
+        self,
+        pg_id: int,
+        enabled: bool,
+        code: str | None = None,
+        *,
+        allowed_user_ids: list[int] | None = None,
+    ) -> PanelStatusModel:
         self._ensure_usable_pg_id(pg_id)
-        effective_code = await self._effective_control_code(code)
+        effective_code = (code or "").strip()
+        if not effective_code:
+            raise PermissionError("PG control requires an explicit panel code.")
+        await self._ensure_code_allowed_for_token(effective_code, allowed_user_ids)
         await self._ensure_code_can_control_pg(effective_code, pg_id)
         async with self._lock:
             session = self._status_session
@@ -812,12 +822,27 @@ class PanelRuntime:
                 f"Code is known as user {user.id} and is not allowed to control PG {pg_id}."
             )
 
+    async def _ensure_code_allowed_for_token(self, code: str, allowed_user_ids: list[int] | None) -> None:
+        if not allowed_user_ids:
+            return
+        user = await self._find_user_for_code(code)
+        if user is None:
+            raise PermissionError("Supplied code does not match an exported Jablotron user allowed by this token.")
+        if user.id not in allowed_user_ids:
+            raise PermissionError(f"Code is known as user {user.id} and is not allowed by this token.")
+
     async def _find_user_for_code(self, code: str) -> UserModel | None:
         catalog = await self.get_catalog()
         for user in catalog.users:
             if user.code == code:
                 return user
         return None
+
+    async def get_user_for_code(self, code: str) -> UserModel | None:
+        normalized = (code or "").strip()
+        if not normalized:
+            return None
+        return await self._find_user_for_code(normalized)
 
     def _user_args(self, *, command: str, user_id: int, payload: UserCreateModel | UserPatchModel | None = None) -> SimpleNamespace:
         fields = {}
