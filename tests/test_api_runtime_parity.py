@@ -45,6 +45,14 @@ class _FakeEventEntity:
         self.events.append(event.value)
 
 
+class _FakeRefreshEntity:
+    def __init__(self) -> None:
+        self.refresh_calls = 0
+
+    def refresh_state(self) -> None:
+        self.refresh_calls += 1
+
+
 def _build_runtime() -> Jablotron:
     hass = _FakeHass()
     runtime = Jablotron(
@@ -315,6 +323,8 @@ def test_api_client_ws_connect_uses_heartbeat_and_receive_timeout(monkeypatch) -
 def test_api_runtime_marks_unavailable_when_websocket_ends_cleanly() -> None:
     runtime = _build_runtime()
     runtime.last_update_success = True
+    refresh_entity = _FakeRefreshEntity()
+    runtime.hass_entities["entity-1"] = refresh_entity
 
     class _FakeMessage:
         type = SimpleNamespace(name="CLOSE")
@@ -349,6 +359,7 @@ def test_api_runtime_marks_unavailable_when_websocket_ends_cleanly() -> None:
     asyncio.run(_exercise())
 
     assert runtime.last_update_success is False
+    assert refresh_entity.refresh_calls >= 1
 
 
 def test_api_runtime_pg_control_requires_default_control_code() -> None:
@@ -385,3 +396,14 @@ def test_api_runtime_reads_api_token_from_options_override() -> None:
     )
 
     assert runtime._api._api_token == "options-token"
+
+
+def test_api_runtime_refreshes_all_entities_on_service_mode_change() -> None:
+    runtime = _build_runtime()
+    refresh_entity = _FakeRefreshEntity()
+    runtime.hass_entities["entity-1"] = refresh_entity
+
+    runtime._set_service_mode(True)
+    runtime._set_service_mode(False)
+
+    assert refresh_entity.refresh_calls == 2

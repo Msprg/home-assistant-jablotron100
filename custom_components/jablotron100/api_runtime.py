@@ -143,7 +143,6 @@ class Jablotron:
             firmware_version=system.get("panel_firmware_version") or "",
         )
         self._apply_catalog_and_status(catalog, status)
-        self.last_update_success = True
 
     def start_background_tasks(self, config_entry: ConfigEntry) -> None:
         if self._ws_task is not None:
@@ -166,6 +165,32 @@ class Jablotron:
 
     def reset_problem_sensor(self, control: JablotronControl) -> None:
         self._update_entity_state(control.id, STATE_OFF)
+
+    def _update_all_hass_entities(self) -> None:
+        def _refresh() -> None:
+            for hass_entity in self.hass_entities.values():
+                hass_entity.refresh_state()
+
+        try:
+            in_event_loop = self._hass.loop == asyncio.get_running_loop()
+        except RuntimeError:
+            in_event_loop = False
+        if in_event_loop:
+            _refresh()
+        else:
+            self._hass.add_job(_refresh)
+
+    def _set_connection_health(self, success: bool) -> None:
+        if self.last_update_success == success:
+            return
+        self.last_update_success = success
+        self._update_all_hass_entities()
+
+    def _set_service_mode(self, enabled: bool) -> None:
+        if self.in_service_mode == enabled:
+            return
+        self.in_service_mode = enabled
+        self._update_all_hass_entities()
 
     async def _ws_loop(self) -> None:
         while True:
@@ -195,7 +220,7 @@ class Jablotron:
                     await ws.close()
                 raise
             except Exception as exc:
-                self.last_update_success = False
+                self._set_connection_health(False)
                 LOGGER.warning("API websocket disconnected: %s", exc)
                 await asyncio.sleep(5)
 
@@ -514,8 +539,8 @@ class Jablotron:
         return added_any
 
     def _apply_status(self, status: dict) -> bool:
-        self.in_service_mode = bool(status.get("service_mode", False))
-        self.last_update_success = True
+        self._set_service_mode(bool(status.get("service_mode", False)))
+        self._set_connection_health(True)
         added_any = self._ensure_central_dynamic_entities(status)
 
         central = status.get("central") or {}

@@ -410,3 +410,10 @@
   - neither secret is prefilled or revealed; both fields are blank password inputs
   - leaving either field blank preserves the currently effective secret instead of clearing it
   - the runtime now prefers an option-level API token override over the original config-entry token so token rotation can happen without deleting and recreating the integration entry
+- Fixed the long-standing API-backed availability regression in Home Assistant:
+  - root cause: websocket disconnects correctly flipped `last_update_success=False`, but the runtime did not refresh existing entities when that availability flag changed
+  - result: entities could stay shown as available indefinitely even after the API server stopped cleanly or heartbeat timeouts detected a dead connection
+  - the API runtime now mirrors the old direct-HID integration’s `set_available/set_unavailable` behavior:
+    - connection-health transitions refresh all registered entities
+    - service-mode transitions also refresh all registered entities
+  - this ensures `available` is reevaluated by Home Assistant on both disconnect and reconnect instead of depending only on later state payload changes
