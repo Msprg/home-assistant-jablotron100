@@ -400,3 +400,13 @@
     - the supplied/default code is denied by token binding
     - the supplied/default code is valid but lacks rights for the target PG
   - the local bootstrap/admin CLI now supports `--allowed-user-id` so bound tokens can be minted without editing the SQLite database by hand
+- Improved the Home Assistant setup UX for the dedicated control code:
+  - the API-backed config flow now asks for `Default control code` during initial integration setup instead of only exposing it later in the options flow
+  - both the API token and the control code now use password-style text selectors in the Home Assistant UI so they are treated as secrets during entry setup and option edits
+  - the runtime now reads the control code from config-entry data as a fallback, so existing installs remain compatible while new installs can provide the secret up front
+  - diagnostics now redact both `api_token` and `control_code`
+- Extended secret rotation in the Home Assistant options flow:
+  - the options dialog now accepts a replacement API token as well as a replacement control code
+  - neither secret is prefilled or revealed; both fields are blank password inputs
+  - leaving either field blank preserves the currently effective secret instead of clearing it
+  - the runtime now prefers an option-level API token override over the original config-entry token so token rotation can happen without deleting and recreating the integration entry

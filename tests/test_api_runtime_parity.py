@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import custom_components.jablotron100.api_client as api_client_module
 from custom_components.jablotron100.api_runtime import Jablotron, JablotronCentralUnit
 from custom_components.jablotron100.api_client import JablotronApiClient
-from custom_components.jablotron100.const import CONF_API_TOKEN, CONF_SERVER_URL, EVENT_WRONG_CODE, EntityType, EventLoginType
+from custom_components.jablotron100.const import CONF_API_TOKEN, CONF_CONTROL_CODE, CONF_SERVER_URL, EVENT_WRONG_CODE, EntityType, EventLoginType
 from custom_components.jablotron100.errors import ControlDenied
 
 
@@ -363,3 +363,25 @@ def test_api_runtime_pg_control_requires_default_control_code() -> None:
             raise AssertionError("Expected ControlDenied when no PG control code is configured.")
 
     asyncio.run(_exercise())
+
+
+def test_api_runtime_reads_default_control_code_from_entry_data() -> None:
+    runtime = Jablotron(
+        _FakeHass(),
+        "entry-1",
+        {CONF_SERVER_URL: "https://panel.local", CONF_API_TOKEN: "token", CONF_CONTROL_CODE: "2468"},
+        {},
+    )
+
+    assert runtime.default_control_code() == "2468"
+
+
+def test_api_runtime_reads_api_token_from_options_override() -> None:
+    runtime = Jablotron(
+        _FakeHass(),
+        "entry-1",
+        {CONF_SERVER_URL: "https://panel.local", CONF_API_TOKEN: "entry-token"},
+        {CONF_API_TOKEN: "options-token"},
+    )
+
+    assert runtime._api._api_token == "options-token"
