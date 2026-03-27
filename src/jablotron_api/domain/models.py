@@ -22,6 +22,7 @@ class Scope(StrEnum):
     USERS_WRITE = "users:write"
     SECTIONS_CONTROL = "sections:control"
     PGS_CONTROL = "pgs:control"
+    CODES_IMPERSONATE = "codes:impersonate"
     TOKENS_ADMIN = "tokens:admin"
 
 
@@ -36,6 +37,7 @@ DEFAULT_ADMIN_SCOPES = [
         Scope.USERS_WRITE,
         Scope.SECTIONS_CONTROL,
         Scope.PGS_CONTROL,
+        Scope.CODES_IMPERSONATE,
         Scope.TOKENS_ADMIN,
     )
 ]

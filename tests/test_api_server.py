@@ -249,6 +249,44 @@ def test_control_endpoints_forward_supplied_code(tmp_path: Path) -> None:
     assert runtime.last_pg_code == "2468"
 
 
+def test_control_endpoints_require_impersonation_scope_for_alternate_code(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="pg-control-only",
+        scopes=[Scope.PGS_CONTROL.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    forbidden = client.post("/v1/pgs/1/on?code=2468", headers={"Authorization": f"Bearer {token}"})
+    assert forbidden.status_code == 403
+    assert forbidden.json()["detail"]["missing"] == [Scope.CODES_IMPERSONATE.value]
+
+
+def test_control_endpoints_allow_server_code_without_impersonation_scope(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="pg-control-only",
+        scopes=[Scope.PGS_CONTROL.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.post("/v1/pgs/1/on?code=1812", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert runtime.last_pg_code == "1812"
+
+
 def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -> None:
     calls: list[dict[str, object]] = []
 
@@ -278,8 +316,6 @@ def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -
         await runtime.refresh_status()
         await runtime.refresh_status()
 
-    import asyncio
-
     asyncio.run(run())
 
     assert len(calls) == 2
@@ -287,6 +323,39 @@ def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -
     assert calls[0]["timeout"] == 2.0
     assert calls[1]["query_device_status"] is False
     assert calls[1]["timeout"] == 0.6
+
+
+def test_panel_runtime_rejects_pg_control_for_known_user_without_pg_rights() -> None:
+    async def run() -> None:
+        runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="4458"))
+        runtime._catalog = ExportCatalogModel(
+            sections=[],
+            pgs=[ExportPGModel(id=15, display_id=15, name="PG output 15")],
+            devices=[],
+            users=[
+                UserModel(
+                    id=100,
+                    name="HomeAssistant",
+                    code="4458",
+                    section_ids=[1],
+                    pg_ids=[18],
+                    rights="coUserNoSelfedit",
+                )
+            ],
+            initial_setup=InitialSetupModel(
+                source="test",
+                exact=True,
+                pgs=InitialSetupRangeModel(first_id=1, last_id=20, count=20),
+            ),
+        )
+        try:
+            await runtime.set_pg(15, True)
+        except PermissionError as exc:
+            assert str(exc) == "Code is known as user 100 and is not allowed to control PG 15."
+        else:
+            raise AssertionError("Expected PermissionError for unauthorized PG control.")
+
+    asyncio.run(run())
 
 
 def test_device_problem_defaults_to_false() -> None:

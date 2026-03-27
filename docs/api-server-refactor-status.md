@@ -384,3 +384,9 @@
   - the Home Assistant API client websocket now uses `heartbeat=10` seconds and `receive_timeout=25` seconds so dead blackholed connections are detected in bounded time rather than waiting for TCP to give up
   - the Home Assistant websocket loop now treats a clean websocket end as a disconnect immediately, marks `last_update_success=False`, and enters the normal reconnect path instead of leaving entity availability stale until a later connect failure
   - focused regression coverage now checks websocket-manager shutdown closing and the Home Assistant client websocket heartbeat configuration
+- Tightened control-identity semantics for section and PG actions:
+  - explicit `code=...` action overrides are now treated as impersonation and require the new token scope `codes:impersonate` unless the supplied code is exactly the same as the server's configured panel auth code
+  - newly minted admin tokens include `codes:impersonate` by default via `DEFAULT_ADMIN_SCOPES`; older existing tokens do not gain it automatically
+  - the runtime now resolves the effective control code before section/PG actions and, when that code matches a known exported user, preflights the user's allowed sections/PGs before sending the HID command
+  - this prevents the previous false-success case where a request without a Home Assistant override code could silently do nothing at the panel yet still return HTTP `200`
+  - in the API-backed Home Assistant integration, PG switches no longer do optimistic local state flips; async switch calls now wait for the API result so denied requests stop looking locally successful

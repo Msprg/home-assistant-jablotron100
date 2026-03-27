@@ -635,23 +635,23 @@ class Jablotron:
         self._hass.add_job(_run)
 
     def toggle_pg_output(self, pg_output_number: int, state: str, code: str | None = None) -> None:
+        self._hass.add_job(self.async_toggle_pg_output(pg_output_number, state, code=code))
+
+    async def async_toggle_pg_output(self, pg_output_number: int, state: str, code: str | None = None) -> None:
         code = code or self.default_control_code()
 
-        async def _run() -> None:
-            try:
-                params = {"code": code} if code else None
-                payload = await self._api.post(
-                    f"/v1/pgs/{pg_output_number}/{'on' if state == STATE_ON else 'off'}",
-                    params=params,
-                )
-            except JablotronApiError as exc:
-                LOGGER.warning("PG control failed: %s", exc)
-                return
-            added = self._apply_status(payload)
-            if added:
-                self._send_signal_entities_added()
-
-        self._hass.add_job(_run)
+        try:
+            params = {"code": code} if code else None
+            payload = await self._api.post(
+                f"/v1/pgs/{pg_output_number}/{'on' if state == STATE_ON else 'off'}",
+                params=params,
+            )
+        except JablotronApiError as exc:
+            LOGGER.warning("PG control failed: %s", exc)
+            raise
+        added = self._apply_status(payload)
+        if added:
+            self._send_signal_entities_added()
 
 
 class JablotronEntity(Entity):

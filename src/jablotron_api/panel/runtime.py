@@ -736,6 +736,8 @@ class PanelRuntime:
 
     async def arm_section(self, section_id: int, mode: ArmMode, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
+        effective_code = await self._effective_control_code(code)
+        await self._ensure_code_can_control_section(effective_code, section_id)
         action = {
             ArmMode.AWAY: "arm_away",
             ArmMode.HOME: "arm_home",
@@ -750,12 +752,14 @@ class PanelRuntime:
                 session.control_section,
                 section_id=section_id,
                 action=action,
-                code=code,
+                code=effective_code,
             )
         return await self.refresh_status()
 
     async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
+        effective_code = await self._effective_control_code(code)
+        await self._ensure_code_can_control_section(effective_code, section_id)
         async with self._lock:
             session = self._status_session
             if session is None:
@@ -765,12 +769,14 @@ class PanelRuntime:
                 session.control_section,
                 section_id=section_id,
                 action="disarm",
-                code=code,
+                code=effective_code,
             )
         return await self.refresh_status()
 
     async def set_pg(self, pg_id: int, enabled: bool, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_pg_id(pg_id)
+        effective_code = await self._effective_control_code(code)
+        await self._ensure_code_can_control_pg(effective_code, pg_id)
         async with self._lock:
             session = self._status_session
             if session is None:
@@ -780,9 +786,38 @@ class PanelRuntime:
                 session.control_pg,
                 pg_id=pg_id,
                 enabled=enabled,
-                code=code,
+                code=effective_code,
             )
         return await self.refresh_status()
+
+    async def _effective_control_code(self, code: str | None) -> str:
+        normalized = (code or "").strip()
+        return normalized or self._config.auth_code
+
+    async def _ensure_code_can_control_section(self, code: str, section_id: int) -> None:
+        user = await self._find_user_for_code(code)
+        if user is None:
+            return
+        if section_id not in user.section_ids:
+            raise PermissionError(
+                f"Code is known as user {user.id} and is not allowed to control section {section_id}."
+            )
+
+    async def _ensure_code_can_control_pg(self, code: str, pg_id: int) -> None:
+        user = await self._find_user_for_code(code)
+        if user is None:
+            return
+        if pg_id not in user.pg_ids:
+            raise PermissionError(
+                f"Code is known as user {user.id} and is not allowed to control PG {pg_id}."
+            )
+
+    async def _find_user_for_code(self, code: str) -> UserModel | None:
+        catalog = await self.get_catalog()
+        for user in catalog.users:
+            if user.code == code:
+                return user
+        return None
 
     def _user_args(self, *, command: str, user_id: int, payload: UserCreateModel | UserPatchModel | None = None) -> SimpleNamespace:
         fields = {}

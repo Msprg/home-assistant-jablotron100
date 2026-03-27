@@ -143,8 +143,12 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.SECTIONS_CONTROL.value)
+        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
+            require_scopes(token, Scope.CODES_IMPERSONATE.value)
         try:
             updated = await runtime.arm_section(section_id, mode, code=code)
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="arm_section", resource=f"section:{section_id}", details={"mode": mode.value, "code_supplied": bool(code)})
@@ -153,8 +157,12 @@ def create_app(
     @app.post("/v1/sections/{section_id}/disarm")
     async def disarm_section(section_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.SECTIONS_CONTROL.value)
+        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
+            require_scopes(token, Scope.CODES_IMPERSONATE.value)
         try:
             updated = await runtime.disarm_section(section_id, code=code)
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="disarm_section", resource=f"section:{section_id}", details={"code_supplied": bool(code)})
@@ -163,8 +171,12 @@ def create_app(
     @app.post("/v1/pgs/{pg_id}/on")
     async def pg_on(pg_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.PGS_CONTROL.value)
+        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
+            require_scopes(token, Scope.CODES_IMPERSONATE.value)
         try:
             updated = await runtime.set_pg(pg_id, True, code=code)
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="pg_on", resource=f"pg:{pg_id}", details={"code_supplied": bool(code)})
@@ -173,8 +185,12 @@ def create_app(
     @app.post("/v1/pgs/{pg_id}/off")
     async def pg_off(pg_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.PGS_CONTROL.value)
+        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
+            require_scopes(token, Scope.CODES_IMPERSONATE.value)
         try:
             updated = await runtime.set_pg(pg_id, False, code=code)
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="pg_off", resource=f"pg:{pg_id}", details={"code_supplied": bool(code)})

@@ -52,8 +52,12 @@ class JablotronProgrammableOutputEntity(JablotronEntity, SwitchEntity):
 
 	def turn_on(self, **kwargs) -> None:
 		self._jablotron.toggle_pg_output(self._control.pg_output_number, STATE_ON)
-		self.update_state(STATE_ON)
 
 	def turn_off(self, **kwargs) -> None:
 		self._jablotron.toggle_pg_output(self._control.pg_output_number, STATE_OFF)
-		self.update_state(STATE_OFF)
+
+	async def async_turn_on(self, **kwargs) -> None:
+		await self._jablotron.async_toggle_pg_output(self._control.pg_output_number, STATE_ON)
+
+	async def async_turn_off(self, **kwargs) -> None:
+		await self._jablotron.async_toggle_pg_output(self._control.pg_output_number, STATE_OFF)
