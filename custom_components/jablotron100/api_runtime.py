@@ -17,6 +17,7 @@ from .api_client import JablotronApiClient, JablotronApiError
 from .const import (
     CONF_API_TOKEN,
     CONF_CONTROL_CODE,
+    CONF_DEVICE_TYPE_OVERRIDES,
     CONF_PARTIALLY_ARMING_MODE,
     CONF_REQUIRE_CODE_TO_ARM,
     CONF_REQUIRE_CODE_TO_DISARM,
@@ -26,7 +27,9 @@ from .const import (
     CONF_TLS_CLIENT_KEY,
     DEFAULT_CONF_REQUIRE_CODE_TO_ARM,
     DEFAULT_CONF_REQUIRE_CODE_TO_DISARM,
+    DEVICE_TYPE_TO_ENTITY_TYPE,
     DOMAIN,
+    DeviceType,
     EVENT_WRONG_CODE,
     EntityType,
     EventLoginType,
@@ -39,6 +42,7 @@ from .errors import ControlDenied
 LEGACY_LAN_GSM_MODELS = {"JA-101K", "JA-101K-LAN", "JA-106K-3G", "JA-14K", "JA-103K", "JA-103KRY", "JA-107K"}
 TEMPERATURE_DEVICE_TYPES = {"thermometer", "thermostat", "smoke_detector"}
 SIREN_DEVICE_TYPES = {"outdoor_siren", "indoor_siren"}
+IGNORED_DEVICE_TYPES = {DeviceType.OTHER.value, DeviceType.EMPTY.value}
 
 
 @dataclass
@@ -100,6 +104,43 @@ class Jablotron:
         self.last_update_success = False
         self.in_service_mode = False
         self._ws_task: asyncio.Task | None = None
+
+    def _device_type_overrides(self) -> dict[int, str]:
+        raw = self._options.get(CONF_DEVICE_TYPE_OVERRIDES, {})
+        if not isinstance(raw, dict):
+            return {}
+        overrides: dict[int, str] = {}
+        for device_id, device_type in raw.items():
+            try:
+                normalized_id = int(device_id)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(device_type, str):
+                continue
+            try:
+                overrides[normalized_id] = DeviceType(device_type).value
+            except ValueError:
+                continue
+        return overrides
+
+    def _apply_device_type_overrides(self, catalog: dict) -> dict:
+        overrides = self._device_type_overrides()
+        if not overrides:
+            return catalog
+
+        updated_catalog = dict(catalog)
+        updated_devices = []
+        for device in catalog.get("devices", []):
+            updated_device = dict(device)
+            override = overrides.get(int(device.get("id") or 0))
+            if override is not None:
+                override_type = DeviceType(override)
+                entity_type = DEVICE_TYPE_TO_ENTITY_TYPE.get(override_type)
+                updated_device["inferred_device_type"] = override_type.value
+                updated_device["inferred_entity_type"] = entity_type.value if entity_type is not None else None
+            updated_devices.append(updated_device)
+        updated_catalog["devices"] = updated_devices
+        return updated_catalog
 
     def signal_entities_added(self) -> str:
         return f"{DOMAIN}_{self._config_entry_id}_entities_added"
@@ -410,6 +451,7 @@ class Jablotron:
         return False
 
     def _apply_catalog(self, catalog: dict) -> bool:
+        catalog = self._apply_device_type_overrides(catalog)
         self._catalog = catalog
         self._code_prefix_enabled = bool((catalog.get("initial_setup") or {}).get("code_prefix"))
         added_any = self._ensure_login_event()
@@ -447,6 +489,9 @@ class Jablotron:
             device_no = int(device["id"])
             if usable_device_last_id is not None and device_no > usable_device_last_id:
                 continue
+            if device.get("inferred_device_type") in IGNORED_DEVICE_TYPES:
+                self._remove_device_controls(device_no)
+                continue
             hass_device = JablotronHassDevice(
                 id=self._legacy_device_id(device_no),
                 name=device.get("name") or f"Device {device_no}",
@@ -476,6 +521,18 @@ class Jablotron:
 
         return added_any
 
+    def _remove_device_controls(self, device_no: int) -> None:
+        self._remove_control_by_id(self._legacy_device_problem_id(device_no), entity_type=EntityType.PROBLEM)
+        self._remove_control_by_id(self._legacy_device_state_id(device_no))
+        self._remove_control_by_id(self._legacy_device_signal_strength_id(device_no), entity_type=EntityType.SIGNAL_STRENGTH)
+        self._remove_control_by_id(self._legacy_device_battery_level_id(device_no), entity_type=EntityType.BATTERY_LEVEL)
+        self._remove_control_by_id(self._legacy_device_battery_problem_id(device_no), entity_type=EntityType.BATTERY_PROBLEM)
+        self._remove_control_by_id(self._legacy_device_temperature_id(device_no), entity_type=EntityType.TEMPERATURE)
+        self._remove_control_by_id(self._legacy_device_battery_standby_voltage_id(device_no), entity_type=EntityType.BATTERY_STANDBY_VOLTAGE)
+        self._remove_control_by_id(self._legacy_device_battery_load_voltage_id(device_no), entity_type=EntityType.BATTERY_LOAD_VOLTAGE)
+        self._remove_control_by_id(self._legacy_pulse_id(device_no), entity_type=EntityType.PULSES)
+        self._remove_control_by_id(self._legacy_pulse_id(device_no, 1), entity_type=EntityType.PULSES)
+
     def _find_catalog_device(self, device_no: int) -> dict[str, Any]:
         for device in self._catalog.get("devices", []):
             if int(device["id"]) == device_no:
@@ -485,6 +542,9 @@ class Jablotron:
     def _ensure_device_dynamic_entities(self, device: dict) -> bool:
         device_no = int(device["id"])
         catalog_device = self._find_catalog_device(device_no)
+        if catalog_device.get("inferred_device_type") in IGNORED_DEVICE_TYPES:
+            self._remove_device_controls(device_no)
+            return False
         hass_device = JablotronHassDevice(
             id=self._legacy_device_id(device_no),
             name=catalog_device.get("name") or device.get("name") or f"Device {device_no}",

@@ -79,7 +79,8 @@
 
 ## Remaining Gaps / Known Blockers
 - Repo-root reverse-engineering tools are not yet reduced to thin wrappers.
-- The remaining major validation task is real Home Assistant alpha testing against a live server and panel, not a known missing parity feature in the integration code.
+- No known Home Assistant entity/control parity gaps remain against the legacy integration surface; rare hardware now depends on server heuristics plus per-device manual override options in the Home Assistant integration.
+- The remaining major validation task is broader live alpha coverage across more panel/device combinations, not a currently known missing parity feature in the integration code.
 - The HACS-facing API integration now lives in the `jablotron100-api-HASS` git submodule and still needs the usual downstream release/tag flow in that repo once the first alpha packaging round is accepted.
 - Development/deployment docs now cover a low-friction local mTLS path, but the first real Home Assistant alpha installation against that path still needs to be exercised end to end.
 
@@ -101,7 +102,11 @@
   - legacy control ID recreation
   - dynamic central/device diagnostic entity creation
   - wrong-code event forwarding in the API-backed runtime
-- Current local result after the latest implementation pass: `33 passed` via `venv/bin/pytest -q`
+- Added legacy-parity coverage for:
+  - restored thermostat/thermometer state entities
+  - restored legacy device-type inference for glass-break / garage-door / valve-style devices
+  - Home Assistant-side per-device type overrides, including ignored `other` devices
+- Current local result after the latest implementation pass: `51 passed` via `venv/bin/pytest -q`
 - Remaining test gaps:
   - runtime integration against mocked RE helper failures
   - Home Assistant integration behavior
@@ -417,3 +422,9 @@
     - connection-health transitions refresh all registered entities
     - service-mode transitions also refresh all registered entities
   - this ensures `available` is reevaluated by Home Assistant on both disconnect and reconnect instead of depending only on later state payload changes
+- Closed the last known Home Assistant parity gap around legacy device classes and manual classification:
+  - the server-side device inference table now restores legacy stateful types for thermostat / thermometer and adds heuristic paths for legacy garage-door, glass-break, lock, tamper, valve, button, and keypad-with-door-style devices
+  - thermostat and thermometer devices once again expose both their legacy binary state entities and their temperature sensors, matching the old integration surface
+  - the Home Assistant options flow now loads the exported catalog and offers per-device manual type overrides, so unusual hardware or ambiguous names can be corrected without editing YAML or server code
+  - overrides are applied locally in the Home Assistant runtime on top of the server’s inferred catalog, preserving the automatic setup path while allowing precise legacy-type restoration for systems we cannot physically test
+  - `other` / `empty` overrides now suppress stale entities entirely, mirroring the old integration’s ignored-device behavior

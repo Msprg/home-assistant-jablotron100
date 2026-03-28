@@ -434,6 +434,25 @@ def test_infer_device_type_avoids_module_name_mismatches() -> None:
     assert _infer_device_type(name="Bus booster", hardware_model="120Z", type_raw=14, object_id=1) == ("bus_booster", None)
 
 
+def test_infer_device_type_restores_legacy_stateful_types() -> None:
+    assert _infer_device_type(name="Thermostat hallway", hardware_model="JA-150TP", type_raw=None, object_id=41) == (
+        "thermostat",
+        "device_state_thermostat",
+    )
+    assert _infer_device_type(name="Glass break", hardware_model=None, type_raw=None, object_id=17) == (
+        "glass_break_detector",
+        "device_state_glass",
+    )
+    assert _infer_device_type(name="Garage gate", hardware_model=None, type_raw=None, object_id=18) == (
+        "garage_door_opening_detector",
+        "device_state_garage_door",
+    )
+    assert _infer_device_type(name="Valve boiler", hardware_model=None, type_raw=None, object_id=19) == (
+        "valve",
+        "device_state_valve",
+    )
+
+
 def test_catalog_devices_named_like_pgs_do_not_become_fake_doors() -> None:
     snapshot = SimpleNamespace(
         sections_by_id={},

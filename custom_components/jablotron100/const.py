@@ -20,6 +20,7 @@ CONF_TLS_CA_CERT: Final = "tls_ca_cert"
 CONF_TLS_CLIENT_CERT: Final = "tls_client_cert"
 CONF_TLS_CLIENT_KEY: Final = "tls_client_key"
 CONF_CONTROL_CODE: Final = "control_code"
+CONF_DEVICE_TYPE_OVERRIDES: Final = "device_type_overrides"
 CONF_NUMBER_OF_DEVICES: Final = "number_of_devices"
 CONF_NUMBER_OF_PG_OUTPUTS: Final = "number_of_pg_outputs"
 CONF_DEVICES: Final = "devices"
@@ -135,6 +136,28 @@ class EntityType(StrEnum):
 	PROGRAMMABLE_OUTPUT = "programmable_output"
 	SIGNAL_STRENGTH = "signal_strength"
 	TEMPERATURE = "temperature"
+
+
+DEVICE_TYPE_TO_ENTITY_TYPE: Final = {
+	DeviceType.MOTION_DETECTOR: EntityType.DEVICE_STATE_MOTION,
+	DeviceType.WINDOW_OPENING_DETECTOR: EntityType.DEVICE_STATE_WINDOW,
+	DeviceType.DOOR_OPENING_DETECTOR: EntityType.DEVICE_STATE_DOOR,
+	DeviceType.KEYPAD_WITH_DOOR_OPENING_DETECTOR: EntityType.DEVICE_STATE_DOOR,
+	DeviceType.GARAGE_DOOR_OPENING_DETECTOR: EntityType.DEVICE_STATE_GARAGE_DOOR,
+	DeviceType.GLASS_BREAK_DETECTOR: EntityType.DEVICE_STATE_GLASS,
+	DeviceType.FLOOD_DETECTOR: EntityType.DEVICE_STATE_MOISTURE,
+	DeviceType.GAS_DETECTOR: EntityType.DEVICE_STATE_GAS,
+	DeviceType.SMOKE_DETECTOR: EntityType.DEVICE_STATE_SMOKE,
+	DeviceType.LOCK: EntityType.DEVICE_STATE_LOCK,
+	DeviceType.TAMPER: EntityType.DEVICE_STATE_TAMPER,
+	DeviceType.THERMOSTAT: EntityType.DEVICE_STATE_THERMOSTAT,
+	DeviceType.THERMOMETER: EntityType.DEVICE_STATE_THERMOMETER,
+	DeviceType.SIREN_INDOOR: EntityType.DEVICE_STATE_INDOOR_SIREN_BUTTON,
+	DeviceType.BUTTON: EntityType.DEVICE_STATE_BUTTON,
+	DeviceType.KEY_FOB: EntityType.DEVICE_STATE_BUTTON,
+	DeviceType.VALVE: EntityType.DEVICE_STATE_VALVE,
+	DeviceType.CUSTOM: EntityType.DEVICE_STATE_CUSTOM,
+}
 
 
 class EventLoginType(StrEnum):

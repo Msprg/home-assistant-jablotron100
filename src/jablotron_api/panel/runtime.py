@@ -59,6 +59,26 @@ from jablotron_api.protocol.legacy import (
 StatusListener = Callable[[str, dict], Awaitable[None]]
 
 SYSTEM_OBJECT_IDS = {0, 233, 234, 235, 237}
+DEVICE_TYPE_TO_ENTITY_TYPE = {
+    "motion_detector": "device_state_motion",
+    "window_opening_detector": "device_state_window",
+    "door_opening_detector": "device_state_door",
+    "keypad_with_door_opening_detector": "device_state_door",
+    "garage_door_opening_detector": "device_state_garage_door",
+    "glass_break_detector": "device_state_glass",
+    "flood_detector": "device_state_moisture",
+    "gas_detector": "device_state_gas",
+    "smoke_detector": "device_state_smoke",
+    "lock": "device_state_lock",
+    "tamper": "device_state_tamper",
+    "thermostat": "device_state_thermostat",
+    "thermometer": "device_state_thermometer",
+    "indoor_siren": "device_state_indoor_siren_button",
+    "button": "device_state_button",
+    "key_fob": "device_state_button",
+    "valve": "device_state_valve",
+    "custom": "device_state_custom",
+}
 
 
 @dataclass
@@ -120,15 +140,29 @@ def _infer_device_type(*, name: str, hardware_model: str | None, type_raw: int |
     if hardware.startswith("JA-110A") or hardware.startswith("JA-111A"):
         return "indoor_siren", "device_state_indoor_siren_button"
     if hardware.startswith("JA-111TH"):
-        return "thermometer", None
+        return "thermometer", "device_state_thermometer"
     if hardware.startswith("JA-110TP") or hardware.startswith("JA-150TP"):
-        return "thermostat", None
+        return "thermostat", "device_state_thermostat"
     if hardware.startswith("JA-154J"):
         return "key_fob", "device_state_button"
     if hardware.startswith("JA-111R"):
         return "radio_module", None
     if hardware.startswith("JA-11") and hardware.endswith("E"):
+        if "vstup" in lowered_name or "door" in lowered_name or "dver" in lowered_name:
+            return "keypad_with_door_opening_detector", "device_state_door"
         return "keypad", None
+    if "garaz" in lowered_name or "garage" in lowered_name:
+        return "garage_door_opening_detector", "device_state_garage_door"
+    if "sklo" in lowered_name or "glass" in lowered_name:
+        return "glass_break_detector", "device_state_glass"
+    if "zamok" in lowered_name or "lock" in lowered_name:
+        return "lock", "device_state_lock"
+    if "tamper" in lowered_name or "sabot" in lowered_name:
+        return "tamper", "device_state_tamper"
+    if "ventil" in lowered_name or "valve" in lowered_name:
+        return "valve", "device_state_valve"
+    if "tlacid" in lowered_name or "button" in lowered_name:
+        return "button", "device_state_button"
     if "sirena" in lowered_name or "siren" in lowered_name:
         return "indoor_siren", "device_state_indoor_siren_button"
     if "elektrom" in lowered_name or "meter" in lowered_name:
@@ -140,12 +174,12 @@ def _infer_device_type(*, name: str, hardware_model: str | None, type_raw: int |
     if "zapl" in lowered_name:
         return "flood_detector", "device_state_moisture"
     if "teplomer" in lowered_name:
-        return "thermometer", None
+        return "thermometer", "device_state_thermometer"
     if "termostat" in lowered_name:
-        return "thermostat", None
+        return "thermostat", "device_state_thermostat"
     if "magnet" in lowered_name or "okno" in lowered_name:
         return "window_opening_detector", "device_state_window"
-    if "vstup" in lowered_name or "branka" in lowered_name:
+    if "dver" in lowered_name or "door" in lowered_name or "vstup" in lowered_name or "branka" in lowered_name:
         return "door_opening_detector", "device_state_door"
     if type_raw == 45:
         return "flood_detector", "device_state_moisture"

@@ -7,7 +7,15 @@ from unittest.mock import AsyncMock
 import custom_components.jablotron100.api_client as api_client_module
 from custom_components.jablotron100.api_runtime import Jablotron, JablotronCentralUnit
 from custom_components.jablotron100.api_client import JablotronApiClient
-from custom_components.jablotron100.const import CONF_API_TOKEN, CONF_CONTROL_CODE, CONF_SERVER_URL, EVENT_WRONG_CODE, EntityType, EventLoginType
+from custom_components.jablotron100.const import (
+    CONF_API_TOKEN,
+    CONF_CONTROL_CODE,
+    CONF_DEVICE_TYPE_OVERRIDES,
+    CONF_SERVER_URL,
+    EVENT_WRONG_CODE,
+    EntityType,
+    EventLoginType,
+)
 from custom_components.jablotron100.errors import ControlDenied
 
 
@@ -295,6 +303,85 @@ def test_api_runtime_removes_stale_dynamic_entities_when_status_data_disappears(
     assert "device_battery_problem_sensor_24" not in runtime.entities[EntityType.BATTERY_PROBLEM]
     assert "device_temperature_sensor_24" not in runtime.entities[EntityType.TEMPERATURE]
     assert "device_signal_strength_sensor_24" not in runtime.entities[EntityType.SIGNAL_STRENGTH]
+
+
+def test_api_runtime_device_type_override_restores_legacy_state_entity() -> None:
+    runtime = Jablotron(
+        _FakeHass(),
+        "entry-1",
+        {CONF_SERVER_URL: "https://panel.local", CONF_API_TOKEN: "token"},
+        {CONF_DEVICE_TYPE_OVERRIDES: {"24": "thermostat"}},
+    )
+    runtime._central_unit = JablotronCentralUnit(
+        unique_id="panel-1",
+        model="JA-107K",
+        hardware_version="MD6112.09.1",
+        firmware_version="MD12007",
+    )
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "name": "Thermostat 24",
+                    "inferred_device_type": "custom",
+                    "inferred_entity_type": "device_state_custom",
+                }
+            ],
+            "users": [],
+        }
+    )
+    runtime._apply_status(
+        {
+            "service_mode": False,
+            "sections": [],
+            "pgs": [],
+            "devices": [{"id": 24, "state": "on", "temperature": 23.3}],
+            "central": {},
+        }
+    )
+
+    assert "device_sensor_24" in runtime.entities[EntityType.DEVICE_STATE_THERMOSTAT]
+    assert runtime.entities_states["device_sensor_24"] == "on"
+    assert "device_temperature_sensor_24" in runtime.entities[EntityType.TEMPERATURE]
+
+
+def test_api_runtime_device_type_override_can_ignore_device() -> None:
+    runtime = Jablotron(
+        _FakeHass(),
+        "entry-1",
+        {CONF_SERVER_URL: "https://panel.local", CONF_API_TOKEN: "token"},
+        {CONF_DEVICE_TYPE_OVERRIDES: {"35": "other"}},
+    )
+    runtime._central_unit = JablotronCentralUnit(
+        unique_id="panel-1",
+        model="JA-107K",
+        hardware_version="MD6112.09.1",
+        firmware_version="MD12007",
+    )
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 35,
+                    "name": "Module channel 1",
+                    "inferred_device_type": "door_opening_detector",
+                    "inferred_entity_type": "device_state_door",
+                }
+            ],
+            "users": [],
+        }
+    )
+
+    for bucket in runtime.entities.values():
+        assert "device_sensor_35" not in bucket
+        assert "device_problem_sensor_35" not in bucket
 
 
 def test_api_client_ws_connect_uses_heartbeat_and_receive_timeout(monkeypatch) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import logging
+import re
 
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.core import callback
@@ -12,6 +13,7 @@ from .api_client import JablotronApiClient, JablotronApiError
 from .const import (
     CONF_API_TOKEN,
     CONF_CONTROL_CODE,
+    CONF_DEVICE_TYPE_OVERRIDES,
     CONF_REQUIRE_CODE_TO_ARM,
     CONF_REQUIRE_CODE_TO_DISARM,
     CONF_SERVER_URL,
@@ -21,6 +23,7 @@ from .const import (
     DEFAULT_CONF_REQUIRE_CODE_TO_ARM,
     DEFAULT_CONF_REQUIRE_CODE_TO_DISARM,
     DOMAIN,
+    DeviceType,
     PartiallyArmingMode,
 )
 
@@ -32,6 +35,35 @@ PASSWORD_SELECTOR = selector.TextSelector(
 URL_SELECTOR = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.URL)
 )
+AUTOMATIC_DEVICE_TYPE = "automatic"
+DEVICE_OVERRIDE_LABEL_PATTERN = re.compile(r"^(\d+): ")
+DEVICE_TYPE_OPTION_LABELS = {
+    AUTOMATIC_DEVICE_TYPE: "Automatic",
+    DeviceType.KEYPAD.value: "Keypad",
+    DeviceType.KEYPAD_WITH_DOOR_OPENING_DETECTOR.value: "Keypad with door opening detector",
+    DeviceType.SIREN_OUTDOOR.value: "Outdoor siren",
+    DeviceType.SIREN_INDOOR.value: "Indoor siren",
+    DeviceType.MOTION_DETECTOR.value: "Motion detector",
+    DeviceType.WINDOW_OPENING_DETECTOR.value: "Window opening detector",
+    DeviceType.DOOR_OPENING_DETECTOR.value: "Door opening detector",
+    DeviceType.GARAGE_DOOR_OPENING_DETECTOR.value: "Garage door opening detector",
+    DeviceType.GLASS_BREAK_DETECTOR.value: "Glass break detector",
+    DeviceType.SMOKE_DETECTOR.value: "Smoke detector",
+    DeviceType.FLOOD_DETECTOR.value: "Flood detector",
+    DeviceType.GAS_DETECTOR.value: "Gas detector",
+    DeviceType.THERMOSTAT.value: "Thermostat",
+    DeviceType.THERMOMETER.value: "Thermometer",
+    DeviceType.LOCK.value: "Lock",
+    DeviceType.TAMPER.value: "Tamper",
+    DeviceType.BUTTON.value: "Button",
+    DeviceType.KEY_FOB.value: "Key fob",
+    DeviceType.ELECTRICITY_METER_WITH_PULSE_OUTPUT.value: "Electricity meter with pulse output",
+    DeviceType.RADIO_MODULE.value: "Radio module",
+    DeviceType.VALVE.value: "Valve",
+    DeviceType.CUSTOM.value: "Custom",
+    DeviceType.OTHER.value: "Other",
+    DeviceType.EMPTY.value: "Empty",
+}
 
 
 class JablotronConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -100,11 +132,59 @@ class JablotronOptionsFlow(OptionsFlow):
         self._config_entry = config_entry
         self._options = dict(config_entry.options)
 
+    def _current_api_token(self) -> str:
+        return self._options.get(CONF_API_TOKEN, self._config_entry.data[CONF_API_TOKEN])
+
+    def _device_override_field_key(self, device: dict) -> str:
+        device_id = int(device["id"])
+        name = str(device.get("name") or f"Device {device_id}")
+        inferred = str(device.get("inferred_device_type") or "unknown")
+        return f"{device_id:03d}: {name} ({inferred})"
+
+    async def _load_catalog_devices(self) -> list[dict]:
+        try:
+            client = JablotronApiClient(
+                self.hass,
+                server_url=self._config_entry.data[CONF_SERVER_URL],
+                api_token=self._current_api_token(),
+                ca_cert=self._config_entry.data.get(CONF_TLS_CA_CERT) or None,
+                client_cert=self._config_entry.data.get(CONF_TLS_CLIENT_CERT) or None,
+                client_key=self._config_entry.data.get(CONF_TLS_CLIENT_KEY) or None,
+            )
+            catalog = await client.get("/v1/export/catalog")
+        except Exception as err:
+            LOGGER.warning("Could not load catalog for device-type override options: %s", err)
+            return []
+
+        device_last_id = ((catalog.get("initial_setup") or {}).get("devices") or {}).get("last_id")
+        devices = []
+        for device in catalog.get("devices", []):
+            try:
+                device_id = int(device.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if device_last_id is not None and device_id > int(device_last_id):
+                continue
+            devices.append(device)
+        return sorted(devices, key=lambda item: int(item["id"]))
+
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
+        devices = await self._load_catalog_devices()
+        current_overrides = dict(self._options.get(CONF_DEVICE_TYPE_OVERRIDES, {}))
         if user_input is not None:
             data = dict(user_input)
             api_token = data.pop(CONF_API_TOKEN, "")
             control_code = data.pop(CONF_CONTROL_CODE, "")
+            overrides = dict(current_overrides)
+            for field_key in [key for key in list(data) if DEVICE_OVERRIDE_LABEL_PATTERN.match(key)]:
+                match = DEVICE_OVERRIDE_LABEL_PATTERN.match(field_key)
+                if match is None:
+                    continue
+                selected_type = data.pop(field_key)
+                if selected_type == AUTOMATIC_DEVICE_TYPE:
+                    overrides.pop(match.group(1), None)
+                else:
+                    overrides[match.group(1)] = selected_type
             if isinstance(api_token, str) and api_token.strip():
                 data[CONF_API_TOKEN] = api_token.strip()
             elif CONF_API_TOKEN in self._options:
@@ -113,6 +193,10 @@ class JablotronOptionsFlow(OptionsFlow):
                 data[CONF_CONTROL_CODE] = control_code.strip()
             elif CONF_CONTROL_CODE in self._options:
                 data[CONF_CONTROL_CODE] = self._options[CONF_CONTROL_CODE]
+            if overrides:
+                data[CONF_DEVICE_TYPE_OVERRIDES] = overrides
+            elif CONF_DEVICE_TYPE_OVERRIDES in self._options:
+                data.pop(CONF_DEVICE_TYPE_OVERRIDES, None)
             return self.async_create_entry(title="", data=data)
 
         fields = OrderedDict()
@@ -123,5 +207,8 @@ class JablotronOptionsFlow(OptionsFlow):
         fields[vol.Optional(CONF_CONTROL_CODE, default="")] = PASSWORD_SELECTOR
         fields[vol.Required(CONF_REQUIRE_CODE_TO_DISARM, default=self._options.get(CONF_REQUIRE_CODE_TO_DISARM, DEFAULT_CONF_REQUIRE_CODE_TO_DISARM))] = bool
         fields[vol.Required(CONF_REQUIRE_CODE_TO_ARM, default=self._options.get(CONF_REQUIRE_CODE_TO_ARM, DEFAULT_CONF_REQUIRE_CODE_TO_ARM))] = bool
+        for device in devices:
+            field_key = self._device_override_field_key(device)
+            fields[vol.Optional(field_key, default=current_overrides.get(str(device["id"]), AUTOMATIC_DEVICE_TYPE))] = vol.In(DEVICE_TYPE_OPTION_LABELS)
 
         return self.async_show_form(step_id="init", data_schema=vol.Schema(fields))
