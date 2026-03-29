@@ -263,6 +263,25 @@ Notes:
     - the stronger "another F-Link already owns config channels" signal is `73 09 ... 94 A0 00`
     - the failing F-Link trace logs `All config channels in use flag set` immediately after that packet
   - see `research/notes/2026-03-25_configuration-mode-signal.txt`
+- New 2026-03-29 F-Link traces added a first-pass map of the steady configuration-mode background traffic:
+  - archived raw comm logs:
+    - `research/traces/f_link_logs/2026-03-29_base-no-login-enter-code-dialog/comm.log.htm`
+    - `research/traces/f_link_logs/2026-03-29_config-mode-keepalive-pg15-toggle-after-60s/comm.log.htm`
+  - matching USB captures:
+    - `research/captures/usb/f_link/2026-03-29_base-no-login-enter-code-dialog.pcapng`
+    - `research/captures/usb/f_link/2026-03-29_config-mode-keepalive-pg15-toggle-after-60s.pcapng`
+  - derived exports:
+    - `research/exports/f_link_comm_logs_text/2026-03-29_base-no-login-enter-code-dialog.txt`
+    - `research/exports/f_link_comm_logs_text/2026-03-29_config-mode-keepalive-pg15-toggle-after-60s.txt`
+    - `research/exports/f_link_event_exports/2026-03-29_config-mode-keepalive-pg15-toggle-after-60s.csv`
+  - current interpretation:
+    - `52 01 02` is only a transport/session keepalive
+    - `80 01 02` and `80 01 02 52 01 0E 72 01 00` are periodic liveness/status polls while config mode is active
+    - `52 02 28 <id>` plus `52 .. A8 <id> ...` look like the main per-object/peripheral live-state query/reply family
+    - `94 02 <id> ...`, `96 03 ...`, `96 04 ... 6A 01 <subcode>`, and `90 ... 6B ...` look like layered detail/diagnostic reads for specific objects
+  - see:
+    - `research/notes/2026-03-29_f-link-config-mode-keepalive.txt`
+    - `research/notes/2026-03-29_f-link-background-traffic-first-pass.txt`
 - A later transport-review validation on 2026-03-10 re-ran the refactored tooling live after low-level changes:
   - add user `89` as `transport89`
   - edit user `89` comment to `cleanup89`

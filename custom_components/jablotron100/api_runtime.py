@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,6 +105,7 @@ class Jablotron:
         self.last_update_success = False
         self.in_service_mode = False
         self._ws_task: asyncio.Task | None = None
+        self._dirty_entity_ids: set[str] = set()
 
     def _device_type_overrides(self) -> dict[int, str]:
         raw = self._options.get(CONF_DEVICE_TYPE_OVERRIDES, {})
@@ -221,6 +223,20 @@ class Jablotron:
         else:
             self._hass.add_job(_refresh)
 
+    def _mark_entity_dirty(self, entity_id: str) -> None:
+        if entity_id in self.hass_entities:
+            self._dirty_entity_ids.add(entity_id)
+
+    def _flush_dirty_hass_entities(self) -> None:
+        if not self._dirty_entity_ids:
+            return
+        dirty_ids = tuple(self._dirty_entity_ids)
+        self._dirty_entity_ids.clear()
+        for entity_id in dirty_ids:
+            hass_entity = self.hass_entities.get(entity_id)
+            if hass_entity is not None:
+                hass_entity.refresh_state()
+
     def _set_connection_health(self, success: bool) -> None:
         if self.last_update_success == success:
             return
@@ -243,7 +259,7 @@ class Jablotron:
                 async for msg in ws:
                     if msg.type.name != "TEXT":
                         continue
-                    payload = msg.json(loads=__import__("json").loads)
+                    payload = msg.json(loads=json.loads)
                     topic = payload.get("topic")
                     if topic == "status":
                         added = self._apply_status(payload.get("payload", {}))
@@ -367,8 +383,11 @@ class Jablotron:
     ) -> bool:
         bucket = self.entities[entity_type]
         if control_id in bucket:
-            bucket[control_id].hass_device = hass_device
-            bucket[control_id].name = name
+            control = bucket[control_id]
+            if control.hass_device != hass_device or control.name != name:
+                control.hass_device = hass_device
+                control.name = name
+                self._mark_entity_dirty(control_id)
             return False
         bucket[control_id] = JablotronControl(self.central_unit(), hass_device, control_id, name)
         return True
@@ -378,8 +397,10 @@ class Jablotron:
         bucket = self.entities[EntityType.ALARM_CONTROL_PANEL]
         if control_id in bucket:
             control = bucket[control_id]
-            control.hass_device = hass_device
-            control.name = None
+            if control.hass_device != hass_device or control.name is not None:
+                control.hass_device = hass_device
+                control.name = None
+                self._mark_entity_dirty(control_id)
             return False
         bucket[control_id] = JablotronAlarmControlPanel(
             central_unit=self.central_unit(),
@@ -395,8 +416,10 @@ class Jablotron:
         bucket = self.entities[EntityType.PROGRAMMABLE_OUTPUT]
         if control_id in bucket:
             control = bucket[control_id]
-            control.hass_device = hass_device
-            control.name = None
+            if control.hass_device != hass_device or control.name is not None:
+                control.hass_device = hass_device
+                control.name = None
+                self._mark_entity_dirty(control_id)
             return False
         bucket[control_id] = JablotronProgrammableOutput(
             central_unit=self.central_unit(),
@@ -519,6 +542,7 @@ class Jablotron:
                 added_any = self._ensure_control(EntityType.BATTERY_STANDBY_VOLTAGE, self._legacy_device_battery_standby_voltage_id(device_no), hass_device=hass_device) or added_any
                 added_any = self._ensure_control(EntityType.BATTERY_LOAD_VOLTAGE, self._legacy_device_battery_load_voltage_id(device_no), hass_device=hass_device) or added_any
 
+        self._flush_dirty_hass_entities()
         return added_any
 
     def _remove_device_controls(self, device_no: int) -> None:
@@ -654,6 +678,7 @@ class Jablotron:
             for pulse_no, pulse_value in enumerate(device.get("pulses") or []):
                 self._update_entity_state(self._legacy_pulse_id(device_no, pulse_no), pulse_value)
 
+        self._flush_dirty_hass_entities()
         return added_any
 
     def _send_signal_entities_added(self) -> None:
@@ -669,9 +694,11 @@ class Jablotron:
     def _update_entity_state(self, entity_id: str, state: StateType | AlarmControlPanelState | None) -> None:
         if state is None and entity_id not in self.entities_states:
             return
+        previous = self.entities_states.get(entity_id)
+        if entity_id in self.entities_states and previous == state:
+            return
         self.entities_states[entity_id] = state
-        if entity_id in self.hass_entities:
-            self.hass_entities[entity_id].update_state(state)
+        self._mark_entity_dirty(entity_id)
 
     def _trigger_wrong_code(self) -> None:
         def _fire() -> None:
@@ -797,7 +824,7 @@ class JablotronEntity(Entity):
 
     def refresh_state(self) -> None:
         self._update_attributes()
-        self.schedule_update_ha_state()
+        self.async_write_ha_state()
 
     def update_state(self, state: StateType | AlarmControlPanelState | None) -> None:
         self._jablotron.entities_states[self._control.id] = state
