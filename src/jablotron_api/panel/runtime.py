@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -54,6 +55,8 @@ from jablotron_api.domain.models import (
 from jablotron_api.protocol.legacy import (
     PersistentSnapshotSession,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 StatusListener = Callable[[str, dict], Awaitable[None]]
@@ -488,10 +491,20 @@ class PanelRuntime:
             )
 
     async def start(self) -> None:
+        LOGGER.info(
+            "Starting panel runtime: port=%s flexi_cfg=%s flexi_log=%s poll_interval=%.1fs full_refresh_interval=%.1fs",
+            self._config.port,
+            self._config.flexi_cfg_device,
+            self._config.flexi_log_device,
+            self._config.poll_interval_seconds,
+            self._config.full_refresh_interval_seconds,
+        )
         await self.refresh_all()
         self._poller_task = asyncio.create_task(self._poll_loop(), name="jablotron-panel-poller")
+        LOGGER.info("Panel runtime started")
 
     async def close(self) -> None:
+        LOGGER.info("Stopping panel runtime")
         self._closed = True
         if self._poller_task is not None:
             self._poller_task.cancel()
@@ -504,6 +517,7 @@ class PanelRuntime:
             await self._close_status_session_locked()
             if had_status_session:
                 await self._cleanup_shutdown_session_locked()
+        LOGGER.info("Panel runtime stopped")
 
     def add_listener(self, listener: StatusListener) -> None:
         self._listeners.append(listener)
@@ -516,8 +530,8 @@ class PanelRuntime:
         while not self._closed:
             try:
                 await self.refresh_status()
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.warning("Background panel status refresh failed: %s", exc, exc_info=True)
             await asyncio.sleep(self._config.poll_interval_seconds)
 
     async def refresh_all(self) -> None:
@@ -536,6 +550,12 @@ class PanelRuntime:
                     "panel_hardware_version": info.hardware_version,
                     "panel_firmware_version": info.firmware_version,
                 }
+            )
+            LOGGER.info(
+                "Panel system info refreshed: model=%s hardware=%s firmware=%s",
+                info.model,
+                info.hardware_version,
+                info.firmware_version,
             )
             return dict(self._system_info)
 
@@ -568,6 +588,15 @@ class PanelRuntime:
                 service_mode=snapshot.service_mode,
             )
             self._status = status
+            LOGGER.debug(
+                "Panel status refreshed: sections=%s pgs=%s devices=%s service_mode=%s include_full=%s include_diagnostics=%s",
+                len(status.sections),
+                len(status.pgs),
+                len(status.devices),
+                status.service_mode,
+                include_full_refresh,
+                include_diagnostics,
+            )
             if include_diagnostics:
                 unresolved_wireless_temperatures = any(
                     device.wireless
@@ -587,6 +616,14 @@ class PanelRuntime:
         async with self._lock:
             catalog = await self._pull_catalog_snapshot("api-server-catalog")
             self._catalog = _catalog_to_model(catalog)
+            LOGGER.info(
+                "Panel catalog refreshed: sections=%s pgs=%s devices=%s users=%s initial_setup_exact=%s",
+                len(self._catalog.sections),
+                len(self._catalog.pgs),
+                len(self._catalog.devices),
+                len(self._catalog.users),
+                None if self._catalog.initial_setup is None else self._catalog.initial_setup.exact,
+            )
         await self._emit("catalog", self._catalog.model_dump(mode="json"))
         return self._catalog
 
@@ -618,6 +655,13 @@ class PanelRuntime:
         kinds: str | None = None,
         exclude_kinds: str | None = None,
     ) -> list[EventRecordModel]:
+        LOGGER.info(
+            "Reading recent events: limit=%s include_raw=%s include_kinds=%s exclude_kinds=%s",
+            limit,
+            include_raw,
+            kinds,
+            exclude_kinds,
+        )
         async with self._lock:
             await self._close_status_session_locked()
             args = SimpleNamespace(
@@ -735,6 +779,7 @@ class PanelRuntime:
         return await self._pull_catalog_snapshot("api-server-export")
 
     async def _pull_catalog_snapshot(self, output_prefix: str) -> ExportCatalogSnapshot:
+        LOGGER.info("Pulling export catalog snapshot: prefix=%s reset=%s cleanup_mode=%s", output_prefix, self._config.reset, self._config.read_cleanup_mode)
         await self._close_status_session_locked()
         output = default_export_output(output_prefix)
         export_snapshot = await asyncio.to_thread(
@@ -754,6 +799,7 @@ class PanelRuntime:
             and not catalog.objects_by_id
             and not catalog.users
         ):
+            LOGGER.warning("Initial export catalog pull was empty; retrying without reset")
             await asyncio.sleep(0.8)
             retry_output = default_export_output(f"{output_prefix}-retry")
             export_snapshot = await asyncio.to_thread(
@@ -766,12 +812,28 @@ class PanelRuntime:
                 cleanup_mode=self._config.read_cleanup_mode,
             )
             catalog = await asyncio.to_thread(extract_export_catalog, export_snapshot.path)
+        LOGGER.debug(
+            "Export catalog snapshot ready: sections=%s pgs=%s devices=%s users=%s path=%s",
+            len(catalog.sections_by_id),
+            len(catalog.pgs_by_id),
+            len(catalog.objects_by_id),
+            len(catalog.users),
+            getattr(export_snapshot, "path", None),
+        )
         return catalog
 
     async def arm_section(self, section_id: int, mode: ArmMode, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
         effective_code = await self._effective_control_code(code)
+        user = await self._find_user_for_code(effective_code)
         await self._ensure_code_can_control_section(effective_code, section_id)
+        LOGGER.info(
+            "Panel arm_section requested: section=%s mode=%s code_source=%s resolved_user=%s",
+            section_id,
+            mode.value,
+            "explicit" if code and code.strip() else "service_default",
+            None if user is None else user.id,
+        )
         action = {
             ArmMode.AWAY: "arm_away",
             ArmMode.HOME: "arm_home",
@@ -788,12 +850,20 @@ class PanelRuntime:
                 action=action,
                 code=effective_code,
             )
+        LOGGER.info("Panel arm_section completed: section=%s mode=%s", section_id, mode.value)
         return await self.refresh_status()
 
     async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
         effective_code = await self._effective_control_code(code)
+        user = await self._find_user_for_code(effective_code)
         await self._ensure_code_can_control_section(effective_code, section_id)
+        LOGGER.info(
+            "Panel disarm_section requested: section=%s code_source=%s resolved_user=%s",
+            section_id,
+            "explicit" if code and code.strip() else "service_default",
+            None if user is None else user.id,
+        )
         async with self._lock:
             session = self._status_session
             if session is None:
@@ -805,6 +875,7 @@ class PanelRuntime:
                 action="disarm",
                 code=effective_code,
             )
+        LOGGER.info("Panel disarm_section completed: section=%s", section_id)
         return await self.refresh_status()
 
     async def set_pg(
@@ -819,8 +890,16 @@ class PanelRuntime:
         effective_code = (code or "").strip()
         if not effective_code:
             raise PermissionError("PG control requires an explicit panel code.")
+        user = await self._find_user_for_code(effective_code)
         await self._ensure_code_allowed_for_token(effective_code, allowed_user_ids)
         await self._ensure_code_can_control_pg(effective_code, pg_id)
+        LOGGER.info(
+            "Panel set_pg requested: pg=%s enabled=%s resolved_user=%s allowed_user_ids=%s",
+            pg_id,
+            enabled,
+            None if user is None else user.id,
+            allowed_user_ids,
+        )
         async with self._lock:
             session = self._status_session
             if session is None:
@@ -832,6 +911,7 @@ class PanelRuntime:
                 enabled=enabled,
                 code=effective_code,
             )
+        LOGGER.info("Panel set_pg completed: pg=%s enabled=%s", pg_id, enabled)
         return await self.refresh_status()
 
     async def _effective_control_code(self, code: str | None) -> str:
@@ -843,6 +923,7 @@ class PanelRuntime:
         if user is None:
             return
         if section_id not in user.section_ids:
+            LOGGER.warning("Section control denied by user rights: user=%s section=%s", user.id, section_id)
             raise PermissionError(
                 f"Code is known as user {user.id} and is not allowed to control section {section_id}."
             )
@@ -852,6 +933,7 @@ class PanelRuntime:
         if user is None:
             return
         if pg_id not in user.pg_ids:
+            LOGGER.warning("PG control denied by user rights: user=%s pg=%s", user.id, pg_id)
             raise PermissionError(
                 f"Code is known as user {user.id} and is not allowed to control PG {pg_id}."
             )
@@ -861,8 +943,10 @@ class PanelRuntime:
             return
         user = await self._find_user_for_code(code)
         if user is None:
+            LOGGER.warning("PG/control impersonation denied: supplied code did not resolve to an exported user allowed by token binding")
             raise PermissionError("Supplied code does not match an exported Jablotron user allowed by this token.")
         if user.id not in allowed_user_ids:
+            LOGGER.warning("PG/control impersonation denied: user=%s not in allowed_user_ids=%s", user.id, allowed_user_ids)
             raise PermissionError(f"Code is known as user {user.id} and is not allowed by this token.")
 
     async def _find_user_for_code(self, code: str) -> UserModel | None:
@@ -1052,6 +1136,7 @@ class PanelRuntime:
         return dict(self._system_info)
 
     def _create_status_session(self) -> PersistentSnapshotSession:
+        LOGGER.debug("Creating persistent panel status session")
         return PersistentSnapshotSession(
             port=self._config.port,
             code=self._config.auth_code,
@@ -1062,10 +1147,12 @@ class PanelRuntime:
         session = self._status_session
         self._status_session = None
         if session is not None:
+            LOGGER.debug("Closing persistent panel status session")
             await asyncio.to_thread(session.close)
 
     async def _cleanup_shutdown_session_locked(self) -> None:
         try:
+            LOGGER.debug("Running shutdown panel cleanup session")
             await asyncio.to_thread(
                 cleanup_read_session,
                 port=self._config.port,
@@ -1073,5 +1160,6 @@ class PanelRuntime:
                 cleanup_mode="exit-only",
                 verbose=False,
             )
-        except Exception:
+        except Exception as exc:
+            LOGGER.warning("Shutdown panel cleanup session failed: %s", exc)
             return

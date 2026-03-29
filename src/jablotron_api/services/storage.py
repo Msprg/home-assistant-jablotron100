@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Iterator
 
 from jablotron_api.domain.models import DEFAULT_ADMIN_SCOPES, AuthenticatedToken, TokenInfoModel
+
+LOGGER = logging.getLogger(__name__)
 
 
 def utc_now_iso() -> str:
@@ -107,6 +110,14 @@ class TokenStore:
                 ),
             )
             conn.commit()
+        LOGGER.info(
+            "Token created: token=%s (%s) scopes=%s allowed_user_ids=%s fingerprint_bound=%s",
+            label,
+            token_id,
+            ",".join(effective_scopes),
+            effective_allowed_user_ids,
+            bool(certificate_fingerprint),
+        )
         return token_value, TokenInfoModel(
             id=token_id,
             label=label,
@@ -128,6 +139,7 @@ class TokenStore:
                 (utc_now_iso(), token_id),
             )
             conn.commit()
+        LOGGER.info("Token revoked: token_id=%s", token_id)
 
     def authenticate(
         self,
@@ -141,17 +153,21 @@ class TokenStore:
                 (token_hash(token_value),),
             ).fetchone()
             if row is None:
+                LOGGER.debug("Token authentication miss")
                 return None
             if row["revoked_at"] is not None:
+                LOGGER.warning("Token authentication rejected: token_id=%s revoked", row["id"])
                 return None
             expected_fingerprint = row["certificate_fingerprint"]
             if expected_fingerprint and expected_fingerprint != certificate_fingerprint:
+                LOGGER.warning("Token authentication rejected: token_id=%s certificate fingerprint mismatch", row["id"])
                 return None
             conn.execute(
                 "UPDATE tokens SET last_used_at = ? WHERE id = ?",
                 (utc_now_iso(), row["id"]),
             )
             conn.commit()
+        LOGGER.debug("Token authentication ok: token=%s (%s)", row["label"], row["id"])
         return AuthenticatedToken(
             id=row["id"],
             label=row["label"],

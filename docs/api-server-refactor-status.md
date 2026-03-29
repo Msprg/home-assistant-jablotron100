@@ -428,3 +428,25 @@
   - the Home Assistant options flow now loads the exported catalog and offers per-device manual type overrides, so unusual hardware or ambiguous names can be corrected without editing YAML or server code
   - overrides are applied locally in the Home Assistant runtime on top of the server’s inferred catalog, preserving the automatic setup path while allowing precise legacy-type restoration for systems we cannot physically test
   - `other` / `empty` overrides now suppress stale entities entirely, mirroring the old integration’s ignored-device behavior
+- Improved operational logging on the API server without exposing secrets:
+  - server startup and shutdown now log runtime mode, bind host/port, mTLS requirement, poll intervals, and resolved panel model/hardware/firmware once available
+  - HTTP bearer-token authentication now logs missing-token and invalid-token/certificate-binding failures with request method/path and a shortened client-certificate fingerprint, while successful auth is logged at debug level with token label/id and granted scopes
+  - mutating API routes now log high-signal request/deny/complete entries for:
+    - section arm/disarm
+    - PG on/off
+    - user add/edit/delete
+    - token create/revoke
+  - those logs intentionally record only booleans for `code_supplied` and token/user metadata; they do not log bearer tokens or panel codes
+  - websocket lifecycle is now visible in logs:
+    - connect/disconnect
+    - subscription acceptance / denied topics
+    - manager-side close-all during shutdown
+    - debug-level broadcast delivery counts and dead-connection cleanup
+  - panel runtime now logs:
+    - runtime start/stop
+    - system-info refresh
+    - catalog refresh counts
+    - export retry when the first read comes back empty
+    - control-action intent/completion with section/PG id, mode, and resolved exported user id when known
+    - permission denials caused by Jablotron user rights or token-bound `allowed_user_ids`
+    - persistent status-session creation/close and shutdown cleanup failures

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+import logging
 
 from fastapi import WebSocket
 
 from jablotron_api.domain.models import WebSocketEnvelope
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ConnectionManager:
@@ -19,14 +22,17 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self._connections[websocket] = set()
+        LOGGER.debug("WebSocket accepted: active_connections=%s", len(self._connections))
 
     async def disconnect(self, websocket: WebSocket) -> None:
         self._connections.pop(websocket, None)
+        LOGGER.debug("WebSocket removed: active_connections=%s", len(self._connections))
 
     async def close_all(self, *, code: int = 1001, reason: str = "server shutdown") -> None:
         async with self._lock:
             connections = list(self._connections)
             self._connections.clear()
+        LOGGER.info("Closing all websocket clients: count=%s code=%s reason=%s", len(connections), code, reason)
         for websocket in connections:
             try:
                 await websocket.close(code=code, reason=reason)
@@ -35,18 +41,29 @@ class ConnectionManager:
 
     async def subscribe(self, websocket: WebSocket, topics: list[str]) -> None:
         self._connections.setdefault(websocket, set()).update(topics)
+        LOGGER.debug("WebSocket topic update: topics=%s", sorted(self._connections.get(websocket, set())))
 
     async def broadcast(self, topic: str, event: str, payload: dict) -> None:
         async with self._lock:
             self._sequence += 1
             envelope = WebSocketEnvelope(sequence=self._sequence, topic=topic, event=event, payload=payload)
             dead: list[WebSocket] = []
+            delivered = 0
             for websocket, topics in self._connections.items():
                 if topic not in topics:
                     continue
                 try:
                     await websocket.send_json(envelope.model_dump(mode="json"))
+                    delivered += 1
                 except Exception:
                     dead.append(websocket)
             for websocket in dead:
                 self._connections.pop(websocket, None)
+            LOGGER.debug(
+                "WebSocket broadcast: topic=%s event=%s sequence=%s delivered=%s removed_dead=%s",
+                topic,
+                event,
+                self._sequence,
+                delivered,
+                len(dead),
+            )
