@@ -699,6 +699,11 @@ def test_persistent_snapshot_session_control_reuses_existing_login(monkeypatch) 
     monkeypatch.setattr(legacy, "perform_login", fake_login)
     monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
     monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_pg_control_confirmation_locked",
+        lambda self, client, *, pg_id, enabled: True,
+    )
     monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
 
     session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
@@ -713,6 +718,111 @@ def test_persistent_snapshot_session_control_reuses_existing_login(monkeypatch) 
     assert client_creations == 1
     assert login_calls == 1
     assert close_calls == 1
+
+
+def test_persistent_snapshot_session_retries_pg_control_with_auth_refresh_after_missing_confirmation(monkeypatch) -> None:
+    sent_packets: list[bytes] = []
+    confirmations = iter([False, True])
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            sent_packets.append(packet)
+
+        def send_packets(self, packets) -> None:
+            sent_packets.extend(list(packets))
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", lambda client, code, *, reset: None)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy, "_await_login_success", lambda client, timeout=0.8: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_pg_control_confirmation_locked",
+        lambda self, client, *, pg_id, enabled: next(confirmations),
+    )
+    monkeypatch.setattr(PersistentSnapshotSession, "_drain_packets_locked", lambda self, client, *, timeout: [])
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        with session._io_lock:
+            session._ensure_client_locked()
+        session.control_pg(pg_id=17, enabled=True, code="4458")
+    finally:
+        session.close()
+
+    assert legacy.Jablotron.create_packet_authorisation_code("4458") in sent_packets
+    assert legacy.Jablotron.create_packet_enable_device_states() in sent_packets
+    assert sent_packets.count(legacy.Jablotron.create_packet_ui_control(legacy.UI_CONTROL_TOGGLE_PG_OUTPUT, b"\x10\x01")) == 2
+
+
+def test_persistent_snapshot_session_does_not_refresh_authorization_when_pg_control_is_confirmed(monkeypatch) -> None:
+    sent_packets: list[bytes] = []
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            sent_packets.append(packet)
+
+        def send_packets(self, packets) -> None:
+            sent_packets.extend(list(packets))
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", lambda client, code, *, reset: None)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy, "_await_login_success", lambda client, timeout=0.8: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_pg_control_confirmation_locked",
+        lambda self, client, *, pg_id, enabled: True,
+    )
+    monkeypatch.setattr(PersistentSnapshotSession, "_drain_packets_locked", lambda self, client, *, timeout: [])
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        with session._io_lock:
+            session._ensure_client_locked()
+        session.control_pg(pg_id=17, enabled=True, code="4458")
+    finally:
+        session.close()
+
+    assert sent_packets.count(legacy.Jablotron.create_packet_authorisation_code("4458")) == 0
+    assert legacy.Jablotron.create_packet_ui_control(legacy.UI_CONTROL_TOGGLE_PG_OUTPUT, b"\x10\x01") in sent_packets
+
+
+def test_pg_control_confirmation_requires_target_pg_to_reach_requested_state(monkeypatch) -> None:
+    class FakeClient:
+        def read_packets(self, *, timeout=None):
+            return iter([bytes.fromhex("820300")])
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    monotonic_values = iter([0.0, 0.1, 0.2, 0.8])
+
+    monkeypatch.setattr(legacy.time, "monotonic", lambda: next(monotonic_values))
+
+    assert session._await_pg_control_confirmation_locked(FakeClient(), pg_id=1, enabled=True) is False
 
 
 def test_persistent_snapshot_session_switches_codes_without_reopening(monkeypatch) -> None:

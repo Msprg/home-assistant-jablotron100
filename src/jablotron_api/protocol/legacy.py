@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from jablotron_usb_debug import (
 )
 
 from jablotron_api.domain.models import BusStatusModel, CentralStatusModel, DeviceStatusModel, PGStatusModel, SectionStatusModel
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WrongCodeError(ValueError):
@@ -106,6 +109,7 @@ EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
 DEVICE_STATE_RENEWAL_SECONDS = 240.0
 DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS = 0.5
 WIRELESS_TEMPERATURE_DIAGNOSTICS_TIMEOUT_SECONDS = 5.0
+CONTROL_CONFIRMATION_TIMEOUT_SECONDS = 0.7
 
 
 def _diagnostics_timeout_for_device(device: DeviceStatusModel) -> float:
@@ -463,9 +467,15 @@ class PersistentSnapshotSession:
             try:
                 client = self._ensure_client_locked(auth_code=requested_code)
                 self._ensure_authorized_code_locked(client, requested_code)
-                payload = Jablotron.int_to_bytes(pg_id - 1) + (b"\x01" if enabled else b"\x00")
-                client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_TOGGLE_PG_OUTPUT, payload))
-                time.sleep(0.3)
+                if self._send_pg_control_locked(client, pg_id=pg_id, enabled=enabled):
+                    return
+                LOGGER.warning(
+                    "PG control received no panel confirmation on the existing session; refreshing authorization and retrying once."
+                )
+                self._force_authorization_refresh_locked(client, requested_code)
+                if self._send_pg_control_locked(client, pg_id=pg_id, enabled=enabled):
+                    return
+                raise RuntimeError("PG control was not acknowledged by the panel.")
             except Exception:
                 self._restore_previous_authorization_locked(previous_code)
                 raise
@@ -567,6 +577,46 @@ class PersistentSnapshotSession:
             return
         perform_enable_device_states(client)
         self._last_enable_device_states_at = now
+
+    def _force_authorization_refresh_locked(self, client: JablotronUSBClient, code: str) -> None:
+        client.send_packets(
+            [
+                Jablotron.create_packet_authorisation_code(code),
+                Jablotron.create_packet_enable_device_states(),
+            ]
+        )
+        _await_login_success(client)
+        time.sleep(0.5)
+        self._last_enable_device_states_at = time.monotonic()
+
+    def _send_pg_control_locked(self, client: JablotronUSBClient, *, pg_id: int, enabled: bool) -> bool:
+        payload = Jablotron.int_to_bytes(pg_id - 1) + (b"\x01" if enabled else b"\x00")
+        client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_TOGGLE_PG_OUTPUT, payload))
+        time.sleep(0.15)
+        perform_sections_query(client)
+        return self._await_pg_control_confirmation_locked(client, pg_id=pg_id, enabled=enabled)
+
+    def _await_pg_control_confirmation_locked(self, client: JablotronUSBClient, *, pg_id: int, enabled: bool) -> bool:
+        deadline = time.monotonic() + CONTROL_CONFIRMATION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            batch = list(client.read_packets(timeout=min(0.1, remaining)))
+            if not batch:
+                continue
+            for packet in batch:
+                if Jablotron._is_login_error_packet(packet):
+                    raise WrongCodeError("Wrong code.")
+                if Jablotron._is_pg_output_toggle_packet(packet):
+                    return True
+                if Jablotron._is_pg_outputs_states_packet(packet):
+                    states_start = 2
+                    states_end = states_start + Jablotron.bytes_to_int(packet[1:2])
+                    states = Jablotron._bytes_to_reverse_binary(packet[states_start:states_end])
+                    if pg_id - 1 < len(states):
+                        state = states[(pg_id - 1):pg_id]
+                        if (state == "1") is enabled:
+                            return True
+        return False
 
     def _drain_packets_locked(self, client: JablotronUSBClient, *, timeout: float) -> list[bytes]:
         packets: list[bytes] = []

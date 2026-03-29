@@ -106,7 +106,7 @@
   - restored thermostat/thermometer state entities
   - restored legacy device-type inference for glass-break / garage-door / valve-style devices
   - Home Assistant-side per-device type overrides, including ignored `other` devices
-- Current local result after the latest implementation pass: `51 passed` via `venv/bin/pytest -q`
+- Current local result after the latest implementation pass: `53 passed` via `venv/bin/pytest -q`
 - Remaining test gaps:
   - runtime integration against mocked RE helper failures
   - Home Assistant integration behavior
@@ -198,6 +198,42 @@
 6. Decide whether the legacy `custom_components/jablotron100` tree in the main repo should stay as an internal development copy or be reduced once the submodule-based HACS package is the only supported install path.
 
 ## Progress Log
+### 2026-03-29
+- Investigated an intermittent live-panel PG control failure where:
+  - the API returned `200 OK`
+  - the panel never executed the PG action
+  - no matching event record appeared in F-Link
+  - restarting the API server temporarily restored PG control
+- Narrowed the issue to the long-lived HID session in `PersistentSnapshotSession`:
+  - steady-state reads kept working because the raw HID session heartbeat stayed alive
+  - privileged panel authorization on that same session could silently expire after idle time
+  - when that happened, PG/section control packets were sent on a still-open HID handle but were ignored by the panel
+  - the previous implementation only refreshed authorization when switching to a different code, not when reusing the same code after idle time
+- Refined the fix in `src/jablotron_api/protocol/legacy.py` to avoid reintroducing idle-time authorization noise:
+  - the first attempt at a fix refreshed same-code authorization proactively after idle time, which restored PG reliability but also brought back repeated `Autorizácia OK` events on ordinary control actions
+  - the current implementation instead keeps the ordinary same-code path quiet and treats stale authorization as a retryable miss
+  - PG control now:
+    - sends the control packet on the existing long-lived HID session
+    - actively requests section/PG state once
+    - waits briefly for PG-related confirmation packets (`ui_toggle_pg_output` or `pg_outputs_states`)
+    - only if no confirmation arrives does it refresh authorization once and retry the PG action
+  - if the retry still produces no panel confirmation, the server now raises an error instead of returning a false `200 OK`
+  - switched-code actions still use the existing explicit auth-end + auth-code path
+- Added focused regression coverage for:
+  - retrying PG control with one forced auth refresh after a missing confirmation
+  - not refreshing authorization when PG control is confirmed on the first attempt
+  - preserving the existing single-login/no-reopen behavior for ordinary control calls
+- Validation:
+  - `venv/bin/pytest -q tests/test_api_server.py tests/test_api_runtime_parity.py` -> `43 passed`
+  - `venv/bin/pytest -q` -> `53 passed`
+- Remaining live validation:
+  - retest the previously reproduced scenario on the real panel:
+    1. fresh server start
+    2. one successful PG toggle
+    3. wait a few minutes
+    4. second PG toggle
+  - expected result now: the second action should execute normally, with a single refreshed authorization if the session was idle long enough
+
 ### 2026-03-25
 - Fixed API-backed Home Assistant `problem` binary sensors showing `unknown` for most devices:
   - server-side `DeviceStatusModel.problem` now defaults to `False` instead of `None`
