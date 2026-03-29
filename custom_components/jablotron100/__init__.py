@@ -6,15 +6,13 @@ from homeassistant.const import Platform
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
-from typing import Final, TYPE_CHECKING
+from typing import Final
 
 from .const import (
 	DOMAIN,
 	LOGGER,
 )
-
-if TYPE_CHECKING:
-	from .api_runtime import Jablotron
+from .jablotron import Jablotron
 
 
 type JablotronConfigEntry = ConfigEntry[Jablotron]
@@ -29,8 +27,6 @@ PLATFORMS: Final = [
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: JablotronConfigEntry) -> bool:
-	from .api_runtime import Jablotron
-
 	hass.data.setdefault(DOMAIN, {})
 
 	jablotron_instance: Jablotron = Jablotron(hass, config_entry.entry_id, config_entry.data, config_entry.options)
@@ -38,7 +34,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: JablotronConfigEn
 
 	config_entry.runtime_data = jablotron_instance
 	config_entry.async_on_unload(config_entry.add_update_listener(options_update_listener))
-	jablotron_instance.start_background_tasks(config_entry)
 
 	central_unit = jablotron_instance.central_unit()
 	device_registry = dr.async_get(hass)

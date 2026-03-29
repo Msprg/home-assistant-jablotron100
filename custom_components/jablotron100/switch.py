@@ -8,7 +8,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import JablotronConfigEntry
 from .const import EntityType
-from .api_runtime import Jablotron, JablotronProgrammableOutput, JablotronEntity
+from .jablotron import Jablotron, JablotronProgrammableOutput, JablotronEntity
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: JablotronConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -36,7 +36,7 @@ class JablotronProgrammableOutputEntity(JablotronEntity, SwitchEntity):
 	_control: JablotronProgrammableOutput
 
 	_attr_device_class = SwitchDeviceClass.SWITCH
-	_attr_name = None
+	_attr_translation_key = "pg_output"
 
 	def __init__(
 		self,
@@ -45,6 +45,10 @@ class JablotronProgrammableOutputEntity(JablotronEntity, SwitchEntity):
 	) -> None:
 		super().__init__(jablotron, control)
 
+		self._attr_translation_placeholders = {
+			"pgOutputNo": control.pg_output_number,
+		}
+
 	def _update_attributes(self) -> None:
 		super()._update_attributes()
 
@@ -52,12 +56,8 @@ class JablotronProgrammableOutputEntity(JablotronEntity, SwitchEntity):
 
 	def turn_on(self, **kwargs) -> None:
 		self._jablotron.toggle_pg_output(self._control.pg_output_number, STATE_ON)
+		self.update_state(STATE_ON)
 
 	def turn_off(self, **kwargs) -> None:
 		self._jablotron.toggle_pg_output(self._control.pg_output_number, STATE_OFF)
-
-	async def async_turn_on(self, **kwargs) -> None:
-		await self._jablotron.async_toggle_pg_output(self._control.pg_output_number, STATE_ON)
-
-	async def async_turn_off(self, **kwargs) -> None:
-		await self._jablotron.async_toggle_pg_output(self._control.pg_output_number, STATE_OFF)
+		self.update_state(STATE_OFF)

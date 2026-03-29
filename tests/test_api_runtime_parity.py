@@ -4,10 +4,10 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import custom_components.jablotron100.api_client as api_client_module
-from custom_components.jablotron100.api_runtime import Jablotron, JablotronCentralUnit
-from custom_components.jablotron100.api_client import JablotronApiClient
-from custom_components.jablotron100.const import (
+import custom_components.jablotron100_api_hass.api_client as api_client_module
+from custom_components.jablotron100_api_hass.api_runtime import Jablotron, JablotronCentralUnit
+from custom_components.jablotron100_api_hass.api_client import JablotronApiClient
+from custom_components.jablotron100_api_hass.const import (
     CONF_API_TOKEN,
     CONF_CONTROL_CODE,
     CONF_DEVICE_TYPE_OVERRIDES,
@@ -16,7 +16,7 @@ from custom_components.jablotron100.const import (
     EntityType,
     EventLoginType,
 )
-from custom_components.jablotron100.errors import ControlDenied
+from custom_components.jablotron100_api_hass.errors import ControlDenied
 
 
 class _FakeBus:

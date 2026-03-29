@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from . import JablotronConfigEntry
 from .const import EntityType, PartiallyArmingMode
-from .api_runtime import Jablotron, JablotronEntity, JablotronAlarmControlPanel
+from .jablotron import Jablotron, JablotronEntity, JablotronAlarmControlPanel
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: JablotronConfigEntry, async_add_entities: AddEntitiesCallback) -> None:

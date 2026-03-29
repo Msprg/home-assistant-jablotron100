@@ -24,7 +24,3 @@ class ShouldNotHappen(JablotronException):
 
 class InvalidBatteryLevel(JablotronException):
 	"""Unknown battery level."""
-
-
-class ControlDenied(JablotronException):
-	"""A control action was denied."""

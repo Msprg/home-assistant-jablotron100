@@ -38,9 +38,8 @@
 - `src/jablotron_api/server/ws.py`: WebSocket connection manager
 - `src/jablotron_api/client/api.py`: reference async client
 - `src/jablotron_api/cli/main.py`: server/bootstrap/reference client CLI
-- `custom_components/jablotron100/api_runtime.py`: Home Assistant runtime backed by the API server
-- `custom_components/jablotron100/api_client.py`: Home Assistant HTTP/WebSocket client
-- `jablotron100-api-HASS/custom_components/jablotron100_api_hass/`: HACS-installable API-backed Home Assistant integration under a non-conflicting domain
+- `jablotron100-api-HASS/custom_components/jablotron100_api_hass/`: authoritative HACS-installable API-backed Home Assistant integration under a non-conflicting domain
+- `custom_components/jablotron100/`: legacy direct-HID/reference Home Assistant integration retained in the main repo for comparison and historical context
 - `Dockerfile`, `docker-compose.yml`: container-first deployment artifacts
 
 ## Implemented Endpoints / Features
@@ -81,7 +80,7 @@
 - Repo-root reverse-engineering tools are not yet reduced to thin wrappers.
 - No known Home Assistant entity/control parity gaps remain against the legacy integration surface; rare hardware now depends on server heuristics plus per-device manual override options in the Home Assistant integration.
 - The remaining major validation task is broader live alpha coverage across more panel/device combinations, not a currently known missing parity feature in the integration code.
-- The HACS-facing API integration now lives in the `jablotron100-api-HASS` git submodule and still needs the usual downstream release/tag flow in that repo once the first alpha packaging round is accepted.
+- The HACS-facing API integration now lives in the `jablotron100-api-HASS` git submodule and is the only maintained API-backed Home Assistant integration codebase; the root `custom_components/jablotron100` tree is legacy/reference only.
 - Development/deployment docs now cover a low-friction local mTLS path, but the first real Home Assistant alpha installation against that path still needs to be exercised end to end.
 
 ## Testing Status
@@ -195,10 +194,15 @@
 3. Perform Home Assistant alpha testing against the server-backed integration and record any real-world parity gaps here.
 4. Decide whether the remaining root-level reverse-engineering CLIs should become thin wrappers or stay as explicitly low-level tooling outside the server package.
 5. Add a documented migration step for any users who tested the earlier alpha API runtime with the pre-parity control IDs.
-6. Decide whether the legacy `custom_components/jablotron100` tree in the main repo should stay as an internal development copy or be reduced once the submodule-based HACS package is the only supported install path.
+6. Keep future API-backed Home Assistant fixes in the `jablotron100-api-HASS` submodule only; do not mirror them into the root `custom_components/jablotron100` legacy/reference tree.
 
 ## Progress Log
 ### 2026-03-29
+- De-duplicated the Home Assistant integration codebases:
+  - removed the duplicated API-backed runtime/client from the root `custom_components/jablotron100` tree
+  - restored the root `custom_components/jablotron100` package to a legacy direct-HID/reference role
+  - retargeted API-backed Home Assistant tests to the submodule package `custom_components.jablotron100_api_hass`
+  - updated docs so the `jablotron100-api-HASS` submodule is the only supported API-backed install/debug path
 - Investigated an intermittent live-panel PG control failure where:
   - the API returned `200 OK`
   - the panel never executed the PG action
@@ -238,10 +242,9 @@
 - Fixed API-backed Home Assistant `problem` binary sensors showing `unknown` for most devices:
   - server-side `DeviceStatusModel.problem` now defaults to `False` instead of `None`
   - the HACS integration runtime now seeds newly created section-problem, device-problem, and fire entities with `STATE_OFF` so they do not sit in `unknown` while waiting for a later state packet
-  - mirrored the same runtime fix into the in-repo development copy of the integration
   - focused validation:
     - `venv/bin/pytest -q tests/test_api_server.py tests/test_jablotron_re_tools.py` -> `19 passed`
-    - `python3 -m compileall jablotron100-api-HASS/custom_components/jablotron100_api_hass/api_runtime.py custom_components/jablotron100/api_runtime.py src/jablotron_api/domain/models.py` passed
+    - `python3 -m compileall jablotron100-api-HASS/custom_components/jablotron100_api_hass src/jablotron_api/domain/models.py` passed
 - Tightened status responsiveness without turning every cycle into a full device sweep:
   - `PanelRuntimeConfig.poll_interval_seconds` now defaults to `2.0s` instead of `15.0s`
   - added `full_refresh_interval_seconds` (default `15.0s`) so sections/PGs refresh quickly while full device-info sweeps remain slower

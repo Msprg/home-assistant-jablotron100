@@ -17,7 +17,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from typing import Dict
 from . import JablotronConfigEntry
 from .const import EntityType
-from .api_runtime import (
+from .jablotron import (
 	Jablotron,
 	JablotronControl,
 	JablotronEntity,
@@ -129,7 +129,7 @@ class JablotronSensor(JablotronEntity, SensorEntity):
 		description: SensorEntityDescription,
 	) -> None:
 		self.entity_description = description
-		self._attr_translation_key = description.key
+		self._attr_translation_key = description.key if control.name is None else control.name.lower().replace(" ", "_")
 
 		super().__init__(jablotron, control)
 

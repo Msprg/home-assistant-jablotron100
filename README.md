@@ -72,8 +72,9 @@ python3 jablotron_api_client_tool.py status \
 
 - The integration now connects to the API server instead of direct USB/HID access.
 - Section names, PG names, and discovered peripheral metadata are pulled from `/v1/export/catalog`; they no longer need to be counted and named manually in the config flow.
-- The integration config flow now asks for `server_url`, `api_token`, and optional CA/client certificate paths.
-- The HACS-installable API integration now lives in the `jablotron100-api-HASS` git submodule under the non-conflicting domain `jablotron100_api_hass`, so it can be installed alongside the original `jablotron100` integration.
+- The integration config flow now asks for `server_url`, `api_token`, optional CA/client certificate paths, and an optional default control code.
+- The HACS-installable API integration now lives only in the `jablotron100-api-HASS` git submodule under the non-conflicting domain `jablotron100_api_hass`, so it can be installed alongside the original `jablotron100` integration.
+- The root `custom_components/jablotron100` tree in this repo is the legacy direct-HID/reference integration, not the maintained API-backed integration.
 
 ### Home Assistant install, test, and debug
 
@@ -102,21 +103,22 @@ scripts/generate-dev-certs.sh .dev-certs \
 
 3. Create a client certificate and token for Home Assistant. Use scopes at least `system:read`, `status:read`, `config:read`, `events:read`, `sections:control`, and `pgs:control`.
 
-4. Install the custom component into the Home Assistant config directory as a symlink or copy. During active development, a symlink is the fastest option:
+4. Install the API-backed custom component from the submodule into the Home Assistant config directory as a symlink or copy. During active development, a symlink is the fastest option:
 
 ```bash
-ln -s /home/administrator/home-assistant-jablotron100/custom_components/jablotron100 \
-  /path/to/home-assistant-config/custom_components/jablotron100
+ln -s /home/administrator/home-assistant-jablotron100/jablotron100-api-HASS/custom_components/jablotron100_api_hass \
+  /path/to/home-assistant-config/custom_components/jablotron100_api_hass
 ```
 
 5. Put the CA certificate, Home Assistant client certificate, and Home Assistant client key somewhere the Home Assistant process can read them.
 
-6. Restart Home Assistant, add the `Jablotron 100+` integration, and enter:
+6. Restart Home Assistant, add the `jablotron100-api-HASS` integration, and enter:
    - `server_url`: `https://HOST:8443`
    - `api_token`
    - `tls_ca_cert`
    - `tls_client_cert`
    - `tls_client_key`
+   - optional `Default control code`
 
 7. Test the parity-critical paths first:
    - arm and disarm each section
@@ -131,16 +133,16 @@ ln -s /home/administrator/home-assistant-jablotron100/custom_components/jablotro
 ```yaml
 logger:
   logs:
-    custom_components.jablotron100: debug
+    custom_components.jablotron100_api_hass: debug
 ```
 
 9. Attach your debugger to the Home Assistant `debugpy` port you already enabled in `configuration.yaml`. The most useful breakpoints are usually in:
-   - `custom_components/jablotron100/api_runtime.py`
-   - `custom_components/jablotron100/api_client.py`
-   - `custom_components/jablotron100/alarm_control_panel.py`
-   - `custom_components/jablotron100/binary_sensor.py`
-   - `custom_components/jablotron100/sensor.py`
-   - `custom_components/jablotron100/switch.py`
+   - `jablotron100-api-HASS/custom_components/jablotron100_api_hass/api_runtime.py`
+   - `jablotron100-api-HASS/custom_components/jablotron100_api_hass/api_client.py`
+   - `jablotron100-api-HASS/custom_components/jablotron100_api_hass/alarm_control_panel.py`
+   - `jablotron100-api-HASS/custom_components/jablotron100_api_hass/binary_sensor.py`
+   - `jablotron100-api-HASS/custom_components/jablotron100_api_hass/sensor.py`
+   - `jablotron100-api-HASS/custom_components/jablotron100_api_hass/switch.py`
 
 10. If you also want to debug the server side, run the server under `debugpy` separately from Home Assistant:
 
@@ -207,6 +209,8 @@ $ dmesg | grep hid
 
 The cable should be connected as `/dev/hidraw[x]`, `/dev/ttyUSB0` or similar.
 
+The `HACS` and `Manual` sections below are for the legacy direct-HID `jablotron100` integration that remains in this repo for reference. They are not the API-backed install path. The API-backed install path is the `jablotron100-api-HASS` submodule described above.
+
 
 ### HACS
 
@@ -218,7 +222,7 @@ The cable should be connected as `/dev/hidraw[x]`, `/dev/ttyUSB0` or similar.
 ### Manual
 
 1. [Download integration](https://github.com/kukulich/home-assistant-jablotron100/releases/)
-2. Copy the folder `custom_components/jablotron100` from the zip to your config directory
+2. Copy the folder `custom_components/jablotron100` from the zip to your config directory for the legacy direct-HID integration
 3. Restart Home Assistant
 4. Jablotron integration should be available in the integrations UI
 

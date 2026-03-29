@@ -12,7 +12,7 @@ from .const import (
 	EntityType,
 	EventLoginType,
 )
-from .api_runtime import Jablotron, JablotronControl, JablotronEntity
+from .jablotron import Jablotron, JablotronControl, JablotronEntity
 
 EVENT_TYPES: Dict[EntityType, EventEntityDescription] = {
 	EntityType.EVENT_LOGIN: EventEntityDescription(
