@@ -489,3 +489,16 @@
     - control-action intent/completion with section/PG id, mode, and resolved exported user id when known
     - permission denials caused by Jablotron user rights or token-bound `allowed_user_ids`
     - persistent status-session creation/close and shutdown cleanup failures
+- Refactored the API-backed Home Assistant runtime to stop doing expensive dynamic-entity removal on every websocket `status` frame:
+  - device optional-entity cleanup is now catalog/reload-time reconciliation work instead of steady-state status work
+  - steady-state `status` processing is now add-only for optional per-device entities such as signal strength, battery, temperature, pulse, and siren-voltage entities
+  - stale optional entities are still removed when the catalog/device type proves they are structurally unsupported, or when the device disappears/gets ignored
+  - focused regression coverage now expects optional entities to persist across later status frames that omit those values, while still allowing catalog-time cleanup on device-type changes
+  - temporary websocket profiling remains in place until live Home Assistant validation confirms that the `jablotron100_api_hass_ws` asyncio warning regression is resolved; only after that should the earlier micro-optimizations be reconsidered or rolled back one by one
+- After live Home Assistant validation on 2026-04-01 showed the websocket warning regression resolved in steady state:
+  - first rollback candidate completed: removed the `status`/`catalog` identical-payload short-circuit because it was not materially contributing on the live system (`skipped_status=0`)
+  - compile and targeted regression tests remained green after that rollback
+  - second rollback candidate completed: reverted deferred/coalesced dirty-entity flush scheduling back to immediate in-path flushes
+  - compile and targeted regression tests remained green after that rollback as well
+  - final cleanup completed: removed the temporary websocket profiling scaffolding after the live checks stayed clean
+  - the final rollback candidate (`_registry_remove_attempted_ids`) was intentionally kept, because it is directly tied to the original dynamic-entity removal hotspot and there was no evidence it was harming responsiveness

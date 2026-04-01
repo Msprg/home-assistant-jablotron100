@@ -4,9 +4,11 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from homeassistant.components.alarm_control_panel import AlarmControlPanelState
 import custom_components.jablotron100_api_hass.api_client as api_client_module
+from custom_components.jablotron100_api_hass.alarm_control_panel import JablotronAlarmControlPanelEntity
 from custom_components.jablotron100_api_hass.api_runtime import Jablotron, JablotronCentralUnit
-from custom_components.jablotron100_api_hass.api_client import JablotronApiClient
+from custom_components.jablotron100_api_hass.api_client import JablotronApiClient, JablotronApiError
 from custom_components.jablotron100_api_hass.const import (
     CONF_API_TOKEN,
     CONF_CONTROL_CODE,
@@ -185,6 +187,47 @@ def test_api_runtime_triggers_wrong_code_event() -> None:
     assert runtime._hass.bus.events == [EVENT_WRONG_CODE]
 
 
+def test_api_runtime_section_control_raises_control_denied_on_wrong_code() -> None:
+    runtime = _build_runtime()
+    runtime._apply_catalog({"sections": [], "pgs": [], "devices": [], "users": []})
+    event_entity = _FakeEventEntity()
+    runtime.hass_entities["login"] = event_entity
+    runtime._api = SimpleNamespace(
+        post=AsyncMock(side_effect=JablotronApiError(400, "Wrong code."))
+    )
+
+    async def _run() -> None:
+        try:
+            await runtime.async_modify_alarm_control_panel_section_state(1, AlarmControlPanelState.DISARMED, "1812")
+        except ControlDenied as exc:
+            assert str(exc) == "The entered code was rejected by the panel."
+        else:
+            raise AssertionError("Expected ControlDenied")
+
+    asyncio.run(_run())
+
+    assert event_entity.events == [EventLoginType.WRONG_CODE.value]
+    assert runtime._hass.bus.events == [EVENT_WRONG_CODE]
+
+
+def test_api_runtime_section_control_raises_control_denied_on_forbidden() -> None:
+    runtime = _build_runtime()
+    runtime._apply_catalog({"sections": [], "pgs": [], "devices": [], "users": []})
+    runtime._api = SimpleNamespace(
+        post=AsyncMock(side_effect=JablotronApiError(403, "Token is not allowed to impersonate this panel user."))
+    )
+
+    async def _run() -> None:
+        try:
+            await runtime.async_modify_alarm_control_panel_section_state(1, AlarmControlPanelState.DISARMED, "1812")
+        except ControlDenied as exc:
+            assert str(exc) == "Token is not allowed to impersonate this panel user."
+        else:
+            raise AssertionError("Expected ControlDenied")
+
+    asyncio.run(_run())
+
+
 def test_api_runtime_seeds_legacy_central_fallback_states() -> None:
     runtime = _build_runtime()
 
@@ -238,7 +281,16 @@ def test_api_runtime_removes_stale_device_state_entity_when_mapping_drops_state(
         assert "device_sensor_35" not in bucket
 
 
-def test_api_runtime_removes_stale_dynamic_entities_when_status_data_disappears() -> None:
+def test_alarm_control_panel_clean_code_strips_frontend_placeholder_prefixes() -> None:
+    assert JablotronAlarmControlPanelEntity._clean_code("") is None
+    assert JablotronAlarmControlPanelEntity._clean_code("undefined") is None
+    assert JablotronAlarmControlPanelEntity._clean_code("null") is None
+    assert JablotronAlarmControlPanelEntity._clean_code("undefined1812") == "1812"
+    assert JablotronAlarmControlPanelEntity._clean_code("null4458") == "4458"
+    assert JablotronAlarmControlPanelEntity._clean_code("  1812  ") == "1812"
+
+
+def test_api_runtime_keeps_dynamic_entities_when_status_data_disappears() -> None:
     runtime = _build_runtime()
 
     runtime._apply_catalog(
@@ -299,10 +351,72 @@ def test_api_runtime_removes_stale_dynamic_entities_when_status_data_disappears(
         }
     )
 
-    assert "device_battery_level_sensor_24" not in runtime.entities[EntityType.BATTERY_LEVEL]
-    assert "device_battery_problem_sensor_24" not in runtime.entities[EntityType.BATTERY_PROBLEM]
+    assert "device_battery_level_sensor_24" in runtime.entities[EntityType.BATTERY_LEVEL]
+    assert "device_battery_problem_sensor_24" in runtime.entities[EntityType.BATTERY_PROBLEM]
+    assert "device_temperature_sensor_24" in runtime.entities[EntityType.TEMPERATURE]
+    assert "device_signal_strength_sensor_24" in runtime.entities[EntityType.SIGNAL_STRENGTH]
+
+
+def test_api_runtime_catalog_reconciliation_removes_structurally_unsupported_dynamic_entities() -> None:
+    runtime = _build_runtime()
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "name": "Thermostat 24",
+                    "inferred_device_type": "thermostat",
+                    "inferred_entity_type": None,
+                }
+            ],
+            "users": [],
+        }
+    )
+    runtime._apply_status(
+        {
+            "service_mode": False,
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "battery_level": 60,
+                    "battery_problem": False,
+                    "temperature": 23.3,
+                    "wireless": True,
+                    "signal_strength": 55,
+                }
+            ],
+            "central": {},
+        }
+    )
+
+    assert "device_temperature_sensor_24" in runtime.entities[EntityType.TEMPERATURE]
+    assert "device_signal_strength_sensor_24" in runtime.entities[EntityType.SIGNAL_STRENGTH]
+    assert "device_battery_level_sensor_24" in runtime.entities[EntityType.BATTERY_LEVEL]
+
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [],
+            "devices": [
+                {
+                    "id": 24,
+                    "name": "Module 24",
+                    "inferred_device_type": "io_module",
+                    "inferred_entity_type": None,
+                }
+            ],
+            "users": [],
+        }
+    )
+
     assert "device_temperature_sensor_24" not in runtime.entities[EntityType.TEMPERATURE]
-    assert "device_signal_strength_sensor_24" not in runtime.entities[EntityType.SIGNAL_STRENGTH]
+    assert "device_signal_strength_sensor_24" in runtime.entities[EntityType.SIGNAL_STRENGTH]
+    assert "device_battery_level_sensor_24" in runtime.entities[EntityType.BATTERY_LEVEL]
 
 
 def test_api_runtime_device_type_override_restores_legacy_state_entity() -> None:

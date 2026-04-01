@@ -110,6 +110,10 @@ DEVICE_STATE_RENEWAL_SECONDS = 240.0
 DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS = 0.5
 WIRELESS_TEMPERATURE_DIAGNOSTICS_TIMEOUT_SECONDS = 5.0
 CONTROL_CONFIRMATION_TIMEOUT_SECONDS = 0.7
+FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS = 0.25
+AUTHORIZATION_REFRESH_SETTLE_SECONDS = 0.12
+PG_CONTROL_QUERY_SETTLE_SECONDS = 0.05
+CONTROL_AUTHORIZATION_IDLE_SECONDS = 60.0
 
 
 def _diagnostics_timeout_for_device(device: DeviceStatusModel) -> float:
@@ -385,6 +389,7 @@ class PersistentSnapshotSession:
         self._keepalive_thread: threading.Thread | None = None
         self._last_enable_device_states_at = 0.0
         self._authorized_code: str | None = None
+        self._last_control_authorized_at = 0.0
 
     def close(self) -> None:
         self._stop_event.set()
@@ -456,6 +461,7 @@ class PersistentSnapshotSession:
                 modify_packet = Jablotron.int_to_bytes(int_packets[action] + section_id)
                 client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_MODIFY_SECTION, modify_packet))
                 time.sleep(0.3)
+                self._last_control_authorized_at = time.monotonic()
             except Exception:
                 self._restore_previous_authorization_locked(previous_code)
                 raise
@@ -467,13 +473,27 @@ class PersistentSnapshotSession:
             try:
                 client = self._ensure_client_locked(auth_code=requested_code)
                 self._ensure_authorized_code_locked(client, requested_code)
-                if self._send_pg_control_locked(client, pg_id=pg_id, enabled=enabled):
+                if self._should_refresh_control_authorization_locked(requested_code):
+                    self._force_authorization_refresh_locked(client, requested_code)
+                if self._send_pg_control_locked(
+                    client,
+                    pg_id=pg_id,
+                    enabled=enabled,
+                    confirmation_timeout=FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+                ):
+                    self._last_control_authorized_at = time.monotonic()
                     return
                 LOGGER.warning(
                     "PG control received no panel confirmation on the existing session; refreshing authorization and retrying once."
                 )
                 self._force_authorization_refresh_locked(client, requested_code)
-                if self._send_pg_control_locked(client, pg_id=pg_id, enabled=enabled):
+                if self._send_pg_control_locked(
+                    client,
+                    pg_id=pg_id,
+                    enabled=enabled,
+                    confirmation_timeout=CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+                ):
+                    self._last_control_authorized_at = time.monotonic()
                     return
                 raise RuntimeError("PG control was not acknowledged by the panel.")
             except Exception:
@@ -499,6 +519,7 @@ class PersistentSnapshotSession:
 
         self._client = client
         self._authorized_code = active_code
+        self._last_control_authorized_at = time.monotonic()
         self._ensure_keepalive_thread_locked()
         return client
 
@@ -518,6 +539,7 @@ class PersistentSnapshotSession:
         self._client = None
         self._last_enable_device_states_at = 0.0
         self._authorized_code = None
+        self._last_control_authorized_at = 0.0
         if client is None:
             return
         try:
@@ -537,6 +559,7 @@ class PersistentSnapshotSession:
         _await_login_success(client)
         time.sleep(0.5)
         self._authorized_code = code
+        self._last_control_authorized_at = time.monotonic()
 
     def _restore_previous_authorization_locked(self, previous_code: str | None) -> None:
         client = self._client
@@ -586,18 +609,43 @@ class PersistentSnapshotSession:
             ]
         )
         _await_login_success(client)
-        time.sleep(0.5)
+        self._drain_packets_locked(client, timeout=AUTHORIZATION_REFRESH_SETTLE_SECONDS)
         self._last_enable_device_states_at = time.monotonic()
+        self._last_control_authorized_at = self._last_enable_device_states_at
 
-    def _send_pg_control_locked(self, client: JablotronUSBClient, *, pg_id: int, enabled: bool) -> bool:
+    def _should_refresh_control_authorization_locked(self, code: str) -> bool:
+        if self._authorized_code != code or self._last_control_authorized_at <= 0.0:
+            return False
+        return (time.monotonic() - self._last_control_authorized_at) > CONTROL_AUTHORIZATION_IDLE_SECONDS
+
+    def _send_pg_control_locked(
+        self,
+        client: JablotronUSBClient,
+        *,
+        pg_id: int,
+        enabled: bool,
+        confirmation_timeout: float,
+    ) -> bool:
         payload = Jablotron.int_to_bytes(pg_id - 1) + (b"\x01" if enabled else b"\x00")
         client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_TOGGLE_PG_OUTPUT, payload))
-        time.sleep(0.15)
+        time.sleep(PG_CONTROL_QUERY_SETTLE_SECONDS)
         perform_sections_query(client)
-        return self._await_pg_control_confirmation_locked(client, pg_id=pg_id, enabled=enabled)
+        return self._await_pg_control_confirmation_locked(
+            client,
+            pg_id=pg_id,
+            enabled=enabled,
+            timeout=confirmation_timeout,
+        )
 
-    def _await_pg_control_confirmation_locked(self, client: JablotronUSBClient, *, pg_id: int, enabled: bool) -> bool:
-        deadline = time.monotonic() + CONTROL_CONFIRMATION_TIMEOUT_SECONDS
+    def _await_pg_control_confirmation_locked(
+        self,
+        client: JablotronUSBClient,
+        *,
+        pg_id: int,
+        enabled: bool,
+        timeout: float = CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             remaining = max(0.0, deadline - time.monotonic())
             batch = list(client.read_packets(timeout=min(0.1, remaining)))
