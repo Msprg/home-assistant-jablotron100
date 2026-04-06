@@ -1147,6 +1147,7 @@ def decode_rights_name(
     phone: str,
     code: str,
     card: str,
+    time_limited_group_raw: Optional[int],
 ) -> str:
     mapping = {
         0: "coNoAccess",
@@ -1154,13 +1155,19 @@ def decode_rights_name(
         2: "coPGOnly",
         256: "coArmOnly",
         799: "coUserGuard",
+        827: "coUser",
         2875: "coService",
         4639: "coPCOGuard",
+        6971: "coPCO",
         1851: "coMaster",
         811: "coUserNoSelfedit",
     }
     if permissions_raw == 827 and user_id is not None and 603 <= user_id <= 610 and name.startswith("User ") and not code and not card:
         return "WPPPhone"
+    if permissions_raw == 811 and (time_limited_group_raw or 0) > 0:
+        return "coUserTimeLimitedNoSelfedit"
+    if permissions_raw == 827 and (time_limited_group_raw or 0) > 0:
+        return "coUserTimeLimited"
     if permissions_raw in mapping:
         return mapping[permissions_raw]
     if permissions_raw is None:
@@ -1272,6 +1279,7 @@ def extract_users(path: Path, *, dedupe: str = "raw") -> list[UserRecord]:
                     phone=phone,
                     code=code,
                     card=cards[0] if cards else "",
+                    time_limited_group_raw=time_limited_group_raw,
                 ),
                 enabled=decode_user_enabled(flags_raw),
                 section_access_mask_raw=section_access_mask_raw,

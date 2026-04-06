@@ -168,8 +168,10 @@ Notes:
   - `--user-mode dedupe` for operator-safe summaries and CRUD verification
   - `--user-mode raw` for reverse engineering when repeated record-shaped hits matter
 - Current user-listing output now also prints:
-  - rights label inferred from export field `1` (`0 -> coNoAccess`, `1 -> coPanic`, `2 -> coPGOnly`, `256 -> coArmOnly`, `799 -> coUserGuard`, `811 -> coUserNoSelfedit`, `1851 -> coMaster`, `2875 -> coService`, `4639 -> coPCOGuard`)
-  - the remaining live non-user value `827` is now labelled `WPPPhone` for IDs `603-610`, because those records line up with the communicator `WPPPhones` list in the unpacked `.fdb` XML rather than normal keypad users
+  - rights label inferred from export field `1`
+    - known direct mappings now include `0 -> coNoAccess`, `1 -> coPanic`, `2 -> coPGOnly`, `256 -> coArmOnly`, `799 -> coUserGuard`, `811 -> coUserNoSelfedit`, `1851 -> coMaster`, `2875 -> coService`, `4639 -> coPCOGuard`, `6971 -> coPCO`
+    - `827` is treated as `coUser` for ordinary panel users, but still relabelled as `WPPPhone` for IDs `603-610` because those records line up with the communicator `WPPPhones` list in the unpacked `.fdb` XML rather than normal keypad users
+    - the time-limited user names from F-Link's RTTI enum are currently derived from the separate `time_limited_group` field rather than a distinct raw `access` value: `811 + time_limited_group>0 -> coUserTimeLimitedNoSelfedit`, `827 + time_limited_group>0 -> coUserTimeLimited`
   - enabled/disabled state inferred from `cfg_user_t.flags` bit `0` (`CFG_USER_F_OFF` / blocked)
   - user flags, section access, PG access, and time-limit binding from the full 12-field `cfg_user_t` map (`flags`, `access`, `section_access`, `pg_access`, `name`, `phone`, `code`, `rfid`, `pg_num_if_ring`, `time_limited_group`, `comment`, `parent_user_no`)
 - `EXPORT.CFG` collection `0x08` now decodes as `cfg_data_t.users_time_limit` / `cfg_user_time_limit_week_t`:
