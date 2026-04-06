@@ -627,6 +627,7 @@ def test_read_into_parser_can_wait_through_quiet_gap_for_late_packets(monkeypatc
             return iter(())
 
     parser = type("Parser", (), {"seen": [], "parse_packet": lambda self, packet, *, pg_count: self.seen.append(packet)})()
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
     session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
     client = FakeClient()
 
@@ -706,6 +707,7 @@ def test_persistent_snapshot_session_control_reuses_existing_login(monkeypatch) 
     )
     monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
 
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
     session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
     try:
         session.query_snapshot(panel_model=None, pg_count=0, timeout=0.01)
@@ -880,6 +882,7 @@ def test_pg_control_confirmation_requires_target_pg_to_reach_requested_state(mon
         def read_packets(self, *, timeout=None):
             return iter([bytes.fromhex("820300")])
 
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
     session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
     monotonic_values = iter([0.0, 0.1, 0.2, 0.8])
 

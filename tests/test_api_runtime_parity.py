@@ -4,10 +4,12 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from homeassistant.components.alarm_control_panel import AlarmControlPanelState
+from homeassistant.components.alarm_control_panel import AlarmControlPanelEntityFeature, AlarmControlPanelState, CodeFormat
 import custom_components.jablotron100_api_hass.api_client as api_client_module
+from custom_components.jablotron100_api_hass.api_runtime import JablotronAlarmControlPanel
 from custom_components.jablotron100_api_hass.alarm_control_panel import JablotronAlarmControlPanelEntity
-from custom_components.jablotron100_api_hass.api_runtime import Jablotron, JablotronCentralUnit
+from homeassistant.const import ATTR_BATTERY_LEVEL
+from custom_components.jablotron100_api_hass.api_runtime import Jablotron, JablotronCentralUnit, JablotronControl, JablotronEntity, JablotronHassDevice
 from custom_components.jablotron100_api_hass.api_client import JablotronApiClient, JablotronApiError
 from custom_components.jablotron100_api_hass.const import (
     CONF_API_TOKEN,
@@ -288,6 +290,63 @@ def test_alarm_control_panel_clean_code_strips_frontend_placeholder_prefixes() -
     assert JablotronAlarmControlPanelEntity._clean_code("undefined1812") == "1812"
     assert JablotronAlarmControlPanelEntity._clean_code("null4458") == "4458"
     assert JablotronAlarmControlPanelEntity._clean_code("  1812  ") == "1812"
+
+
+def test_alarm_control_panel_entity_populates_cached_alarm_attrs() -> None:
+    runtime = _build_runtime()
+    runtime._code_prefix_enabled = False
+    runtime.entities_states["section_1"] = AlarmControlPanelState.DISARMED
+
+    entity = JablotronAlarmControlPanelEntity(
+        runtime,
+        JablotronAlarmControlPanel(
+            central_unit=runtime.central_unit(),
+            hass_device=None,
+            id="section_1",
+            name="Section 1",
+            section=1,
+        ),
+    )
+
+    assert entity._attr_alarm_state == AlarmControlPanelState.DISARMED
+    assert entity._attr_code_arm_required is False
+    assert entity._attr_code_format is None
+    assert entity._attr_supported_features == (
+        AlarmControlPanelEntityFeature.ARM_AWAY | AlarmControlPanelEntityFeature.ARM_NIGHT
+    )
+    assert entity._attr_changed_by is None
+
+
+def test_base_entity_populates_cached_available_and_clears_extra_attrs() -> None:
+    class _TestEntity(JablotronEntity):
+        pass
+
+    runtime = _build_runtime()
+    control = JablotronControl(
+        central_unit=runtime.central_unit(),
+        hass_device=JablotronHassDevice(id="device-1", name="Device 1", battery_level=42),
+        id="device_sensor_1",
+        name="Device 1",
+    )
+
+    entity = _TestEntity(runtime, control)
+
+    assert entity._attr_available is False
+    assert entity._attr_extra_state_attributes == {ATTR_BATTERY_LEVEL: 42}
+
+    runtime.last_update_success = True
+    runtime.entities_states["device_sensor_1"] = "on"
+    entity._update_attributes()
+    assert entity._attr_available is True
+
+    runtime.in_service_mode = True
+    entity._update_attributes()
+    assert entity._attr_available is False
+
+    runtime.in_service_mode = False
+    control.hass_device.battery_level = None
+    entity._update_attributes()
+    assert entity._attr_extra_state_attributes is None
 
 
 def test_api_runtime_keeps_dynamic_entities_when_status_data_disappears() -> None:
