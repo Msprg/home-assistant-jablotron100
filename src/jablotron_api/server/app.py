@@ -223,6 +223,15 @@ def create_app(
                 exc,
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning(
+                "Section arm failed: token=%s section=%s mode=%s reason=%s",
+                _token_log_label(token),
+                section_id,
+                mode.value,
+                exc,
+            )
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="arm_section", resource=f"section:{section_id}", details={"mode": mode.value, "code_supplied": bool(code)})
         LOGGER.info(
             "Section arm completed: token=%s section=%s mode=%s resulting_state=%s",
@@ -262,6 +271,14 @@ def create_app(
                 exc,
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning(
+                "Section disarm failed: token=%s section=%s reason=%s",
+                _token_log_label(token),
+                section_id,
+                exc,
+            )
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="disarm_section", resource=f"section:{section_id}", details={"code_supplied": bool(code)})
         LOGGER.info(
             "Section disarm completed: token=%s section=%s resulting_state=%s",
@@ -292,6 +309,9 @@ def create_app(
         except ValueError as exc:
             LOGGER.warning("PG on rejected: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning("PG on failed: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="pg_on", resource=f"pg:{pg_id}", details={"code_supplied": bool(code)})
         LOGGER.info(
             "PG on completed: token=%s pg=%s resulting_state=%s",
@@ -322,6 +342,9 @@ def create_app(
         except ValueError as exc:
             LOGGER.warning("PG off rejected: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning("PG off failed: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="pg_off", resource=f"pg:{pg_id}", details={"code_supplied": bool(code)})
         LOGGER.info(
             "PG off completed: token=%s pg=%s resulting_state=%s",
@@ -353,6 +376,9 @@ def create_app(
         except ValueError as exc:
             LOGGER.warning("User add rejected: token=%s user=%s reason=%s", _token_log_label(token), payload.id, exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning("User add failed: token=%s user=%s reason=%s", _token_log_label(token), payload.id, exc)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="add_user", resource=f"user:{payload.id}", details=payload.model_dump(mode="json"))
         LOGGER.info("User add completed: token=%s user=%s", _token_log_label(token), payload.id)
         return result
@@ -366,6 +392,9 @@ def create_app(
         except ValueError as exc:
             LOGGER.warning("User edit rejected: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning("User edit failed: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="edit_user", resource=f"user:{user_id}", details=payload.model_dump(exclude_unset=True, mode="json"))
         LOGGER.info("User edit completed: token=%s user=%s", _token_log_label(token), user_id)
         return result
@@ -379,6 +408,9 @@ def create_app(
         except ValueError as exc:
             LOGGER.warning("User delete rejected: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            LOGGER.warning("User delete failed: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         token_store.write_audit(token_id=token.id, action="delete_user", resource=f"user:{user_id}", details={})
         LOGGER.info("User delete completed: token=%s user=%s", _token_log_label(token), user_id)
         return {"status": "deleted", "user_id": user_id}

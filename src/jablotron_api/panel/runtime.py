@@ -1014,6 +1014,47 @@ class PanelRuntime:
             format="json",
         )
 
+    @staticmethod
+    def _user_first_card(user: UserModel) -> str:
+        return user.cards[0] if user.cards else ""
+
+    def _verify_added_user(self, user: UserModel, payload: UserCreateModel) -> None:
+        checks = {
+            "name": user.name == payload.name,
+            "phone": user.phone == payload.phone,
+            "code": user.code == payload.code,
+            "card1": self._user_first_card(user) == payload.card1,
+            "comment": user.comment == payload.comment,
+            "flags_raw": user.flags_raw == payload.flags_raw,
+            "access_raw": user.access_raw == payload.access_raw,
+            "sections": user.section_ids == payload.sections,
+            "pgs": user.pg_ids == payload.pgs,
+            "time_limited_group_raw": user.time_limited_group_raw == payload.time_limited_group_raw,
+        }
+        mismatches = [field for field, ok in checks.items() if not ok]
+        if mismatches:
+            raise RuntimeError(
+                f"User {payload.id} post-add verification failed for: {', '.join(mismatches)}."
+            )
+
+    def _verify_edited_user(self, user: UserModel, payload: UserPatchModel) -> None:
+        expected = payload.model_dump(exclude_unset=True)
+        checks: dict[str, bool] = {}
+        for field, value in expected.items():
+            if field == "sections":
+                checks[field] = user.section_ids == value
+            elif field == "pgs":
+                checks[field] = user.pg_ids == value
+            elif field == "card1":
+                checks[field] = self._user_first_card(user) == value
+            else:
+                checks[field] = getattr(user, field) == value
+        mismatches = [field for field, ok in checks.items() if not ok]
+        if mismatches:
+            raise RuntimeError(
+                f"User {user.id} post-edit verification failed for: {', '.join(mismatches)}."
+            )
+
     async def add_user(self, payload: UserCreateModel) -> UserModel:
         self._ensure_usable_user_id(payload.id)
         args = self._user_args(command="add", user_id=payload.id, payload=payload)
@@ -1043,6 +1084,7 @@ class PanelRuntime:
         user = await self.get_user(payload.id)
         if user is None:
             raise RuntimeError(f"User {payload.id} was not present after add.")
+        self._verify_added_user(user, payload)
         await self._emit("users", {"action": "added", "user": user.model_dump(mode="json")})
         return user
 
@@ -1100,6 +1142,7 @@ class PanelRuntime:
         user = await self.get_user(user_id)
         if user is None:
             raise RuntimeError(f"User {user_id} disappeared after edit.")
+        self._verify_edited_user(user, payload)
         await self._emit("users", {"action": "edited", "user": user.model_dump(mode="json")})
         return user
 
@@ -1129,6 +1172,8 @@ class PanelRuntime:
                 if cleanup_sector and sector_path.exists():
                     sector_path.unlink()
         await self.refresh_catalog()
+        if await self.get_user(user_id) is not None:
+            raise RuntimeError(f"User {user_id} was still present after delete.")
         await self._emit("users", {"action": "deleted", "user_id": user_id})
 
     @property

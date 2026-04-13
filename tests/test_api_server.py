@@ -705,6 +705,11 @@ def test_persistent_snapshot_session_control_reuses_existing_login(monkeypatch) 
         "_await_pg_control_confirmation_locked",
         lambda self, client, *, pg_id, enabled, timeout=legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS: True,
     )
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_section_control_confirmation_locked",
+        lambda self, client, *, section_id, action, timeout=legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS: True,
+    )
     monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
 
     monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
@@ -924,6 +929,11 @@ def test_persistent_snapshot_session_switches_codes_without_reopening(monkeypatc
     monkeypatch.setattr(legacy, "perform_login", fake_login)
     monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
     monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_section_control_confirmation_locked",
+        lambda self, client, *, section_id, action, timeout=legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS: True,
+    )
     monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
 
     session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
@@ -937,6 +947,187 @@ def test_persistent_snapshot_session_switches_codes_without_reopening(monkeypatc
     assert client_creations == 1
     assert login_calls == 1
     assert close_calls == 1
+
+
+def test_persistent_snapshot_session_retries_section_control_with_auth_refresh_after_missing_confirmation(monkeypatch) -> None:
+    sent_packets: list[bytes] = []
+    confirmations = iter([False, True])
+    confirmation_timeouts: list[float] = []
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            sent_packets.append(packet)
+
+        def send_packets(self, packets) -> None:
+            sent_packets.extend(list(packets))
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", lambda client, code, *, reset: None)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy, "_await_login_success", lambda client, timeout=0.8: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_section_control_confirmation_locked",
+        lambda self, client, *, section_id, action, timeout=legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS: (
+            confirmation_timeouts.append(timeout) or next(confirmations)
+        ),
+    )
+    monkeypatch.setattr(PersistentSnapshotSession, "_drain_packets_locked", lambda self, client, *, timeout: [])
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        with session._io_lock:
+            session._ensure_client_locked()
+        session.control_section(section_id=4, action="arm_away", code="4458")
+    finally:
+        session.close()
+
+    assert legacy.Jablotron.create_packet_authorisation_code("4458") in sent_packets
+    assert legacy.Jablotron.create_packet_enable_device_states() in sent_packets
+    assert sent_packets.count(legacy.Jablotron.create_packet_ui_control(legacy.UI_CONTROL_MODIFY_SECTION, b"\xa3")) == 2
+    assert confirmation_timeouts == [
+        legacy.FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+        legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+    ]
+
+
+def test_persistent_snapshot_session_does_not_refresh_authorization_when_section_control_is_confirmed(monkeypatch) -> None:
+    sent_packets: list[bytes] = []
+    confirmation_timeouts: list[float] = []
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            sent_packets.append(packet)
+
+        def send_packets(self, packets) -> None:
+            sent_packets.extend(list(packets))
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", lambda client, code, *, reset: None)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy, "_await_login_success", lambda client, timeout=0.8: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_section_control_confirmation_locked",
+        lambda self, client, *, section_id, action, timeout=legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS: (
+            confirmation_timeouts.append(timeout) or True
+        ),
+    )
+    monkeypatch.setattr(PersistentSnapshotSession, "_drain_packets_locked", lambda self, client, *, timeout: [])
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        with session._io_lock:
+            session._ensure_client_locked()
+        session.control_section(section_id=4, action="arm_away", code="4458")
+    finally:
+        session.close()
+
+    assert sent_packets.count(legacy.Jablotron.create_packet_authorisation_code("4458")) == 0
+    assert legacy.Jablotron.create_packet_ui_control(legacy.UI_CONTROL_MODIFY_SECTION, b"\xa3") in sent_packets
+    assert confirmation_timeouts == [legacy.FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS]
+
+
+def test_persistent_snapshot_session_skips_first_section_attempt_after_control_auth_idle_timeout(monkeypatch) -> None:
+    sent_packets: list[bytes] = []
+    confirmation_timeouts: list[float] = []
+
+    class FakeClient:
+        def __init__(self, serial_port: str) -> None:
+            self.serial_port = serial_port
+
+        def send_packet(self, packet: bytes) -> None:
+            sent_packets.append(packet)
+
+        def send_packets(self, packets) -> None:
+            sent_packets.extend(list(packets))
+
+        def read_packets(self, *, timeout=None):
+            return iter(())
+
+        def close(self) -> None:
+            return None
+
+    monotonic_values = iter([100.0, 100.0, 161.0, 162.0, 163.0])
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy, "JablotronUSBClient", FakeClient)
+    monkeypatch.setattr(legacy, "perform_login", lambda client, code, *, reset: None)
+    monkeypatch.setattr(legacy, "perform_enable_device_states", lambda client: None)
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda client: None)
+    monkeypatch.setattr(legacy, "_await_login_success", lambda client, timeout=0.8: None)
+    monkeypatch.setattr(
+        PersistentSnapshotSession,
+        "_await_section_control_confirmation_locked",
+        lambda self, client, *, section_id, action, timeout=legacy.CONTROL_CONFIRMATION_TIMEOUT_SECONDS: (
+            confirmation_timeouts.append(timeout) or True
+        ),
+    )
+    monkeypatch.setattr(PersistentSnapshotSession, "_drain_packets_locked", lambda self, client, *, timeout: [])
+    monkeypatch.setattr(legacy.time, "sleep", lambda _: None)
+    monkeypatch.setattr(legacy.time, "monotonic", lambda: next(monotonic_values))
+
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    try:
+        with session._io_lock:
+            session._ensure_client_locked()
+        session.control_section(section_id=4, action="arm_away", code="4458")
+    finally:
+        session.close()
+
+    assert sent_packets.count(legacy.Jablotron.create_packet_authorisation_code("4458")) == 1
+    assert sent_packets.count(legacy.Jablotron.create_packet_ui_control(legacy.UI_CONTROL_MODIFY_SECTION, b"\xa3")) == 1
+    assert confirmation_timeouts == [legacy.FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS]
+
+
+def test_section_control_confirmation_requires_target_section_to_reach_requested_state(monkeypatch) -> None:
+    class _SectionState:
+        pending = False
+        arming = False
+        triggered = False
+        state = SimpleNamespace(name="OFF")
+
+    class FakeClient:
+        def read_packets(self, *, timeout=None):
+            return iter([b"\x81\x00"])
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy.Jablotron, "_is_sections_states_packet", lambda packet: True)
+    monkeypatch.setattr(
+        legacy.Jablotron,
+        "_convert_sections_states_packet_to_sections_states",
+        lambda packet: {4: _SectionState()},
+    )
+    session = PersistentSnapshotSession(port="auto", code="4458", reset=True)
+    monotonic_values = iter([0.0, 0.1, 0.2, 0.8])
+
+    monkeypatch.setattr(legacy.time, "monotonic", lambda: next(monotonic_values))
+
+    assert session._await_section_control_confirmation_locked(FakeClient(), section_id=4, action="arm_away") is False
 
 
 def test_persistent_snapshot_session_system_info_reuses_existing_login(monkeypatch) -> None:
@@ -1021,6 +1212,82 @@ def test_scope_denial_revocation_and_certificate_binding(tmp_path: Path) -> None
         },
     )
     assert matching_fingerprint.status_code == 200
+
+
+def test_section_control_ack_failure_returns_conflict(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+
+    async def fail_arm(section_id, mode, code=None):
+        raise RuntimeError("Section control was not acknowledged by the panel.")
+
+    runtime.arm_section = fail_arm
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="controller",
+        scopes=[Scope.SECTIONS_CONTROL.value, Scope.CODES_IMPERSONATE.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/sections/1/arm?mode=away&code=1812",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Section control was not acknowledged by the panel."
+
+
+def test_user_mutation_verification_failures_return_conflict(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+
+    async def fail_add(payload):
+        raise RuntimeError("User 81 post-add verification failed for: name.")
+
+    async def fail_edit(user_id, payload):
+        raise RuntimeError("User 81 post-edit verification failed for: name.")
+
+    async def fail_delete(user_id):
+        raise RuntimeError("User 81 was still present after delete.")
+
+    runtime.add_user = fail_add
+    runtime.edit_user = fail_edit
+    runtime.delete_user = fail_delete
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="controller",
+        scopes=[Scope.USERS_WRITE.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    add_response = client.post(
+        "/v1/users",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"id": 81, "name": "User 81"},
+    )
+    assert add_response.status_code == 409
+
+    edit_response = client.patch(
+        "/v1/users/81",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "Edited 81"},
+    )
+    assert edit_response.status_code == 409
+
+    delete_response = client.delete(
+        "/v1/users/81",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert delete_response.status_code == 409
 
 
 def test_scope_tls_extension_certificate_binding(tmp_path: Path) -> None:

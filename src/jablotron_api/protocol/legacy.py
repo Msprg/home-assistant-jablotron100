@@ -446,22 +446,35 @@ class PersistentSnapshotSession:
     def control_section(self, *, section_id: int, action: str, code: str | None = None) -> None:
         if action not in {"disarm", "arm_away", "arm_home", "arm_night"}:
             raise ValueError(f"Unsupported section action: {action}")
-        int_packets = {
-            "disarm": 143,
-            "arm_away": 159,
-            "arm_home": 175,
-            "arm_night": 175,
-        }
         with self._io_lock:
             previous_code = self._authorized_code
             requested_code = code or self._code
             try:
                 client = self._ensure_client_locked(auth_code=requested_code)
                 self._ensure_authorized_code_locked(client, requested_code)
-                modify_packet = Jablotron.int_to_bytes(int_packets[action] + section_id)
-                client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_MODIFY_SECTION, modify_packet))
-                time.sleep(0.3)
-                self._last_control_authorized_at = time.monotonic()
+                if self._should_refresh_control_authorization_locked(requested_code):
+                    self._force_authorization_refresh_locked(client, requested_code)
+                if self._send_section_control_locked(
+                    client,
+                    section_id=section_id,
+                    action=action,
+                    confirmation_timeout=FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+                ):
+                    self._last_control_authorized_at = time.monotonic()
+                    return
+                LOGGER.warning(
+                    "Section control received no panel confirmation on the existing session; refreshing authorization and retrying once."
+                )
+                self._force_authorization_refresh_locked(client, requested_code)
+                if self._send_section_control_locked(
+                    client,
+                    section_id=section_id,
+                    action=action,
+                    confirmation_timeout=CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+                ):
+                    self._last_control_authorized_at = time.monotonic()
+                    return
+                raise RuntimeError("Section control was not acknowledged by the panel.")
             except Exception:
                 self._restore_previous_authorization_locked(previous_code)
                 raise
@@ -637,6 +650,32 @@ class PersistentSnapshotSession:
             timeout=confirmation_timeout,
         )
 
+    def _send_section_control_locked(
+        self,
+        client: JablotronUSBClient,
+        *,
+        section_id: int,
+        action: str,
+        confirmation_timeout: float,
+    ) -> bool:
+        int_packets = {
+            "disarm": 143,
+            "arm_away": 159,
+            "arm_home": 175,
+            "arm_night": 175,
+        }
+        modify_packet = Jablotron.int_to_bytes(int_packets[action] + section_id)
+        self._drain_packets_locked(client, timeout=0.05)
+        client.send_packet(Jablotron.create_packet_ui_control(UI_CONTROL_MODIFY_SECTION, modify_packet))
+        time.sleep(PG_CONTROL_QUERY_SETTLE_SECONDS)
+        perform_sections_query(client)
+        return self._await_section_control_confirmation_locked(
+            client,
+            section_id=section_id,
+            action=action,
+            timeout=confirmation_timeout,
+        )
+
     def _await_pg_control_confirmation_locked(
         self,
         client: JablotronUSBClient,
@@ -664,6 +703,39 @@ class PersistentSnapshotSession:
                         state = states[(pg_id - 1):pg_id]
                         if (state == "1") is enabled:
                             return True
+        return False
+
+    def _await_section_control_confirmation_locked(
+        self,
+        client: JablotronUSBClient,
+        *,
+        section_id: int,
+        action: str,
+        timeout: float = CONTROL_CONFIRMATION_TIMEOUT_SECONDS,
+    ) -> bool:
+        confirmation_states = {
+            "disarm": {"disarmed", "off"},
+            "arm_away": {"armed_away", "arming", "pending"},
+            "arm_home": {"armed_night", "arming", "pending"},
+            "arm_night": {"armed_night", "arming", "pending"},
+        }[action]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            batch = list(client.read_packets(timeout=min(0.1, remaining)))
+            if not batch:
+                continue
+            for packet in batch:
+                if Jablotron._is_login_error_packet(packet):
+                    raise WrongCodeError("Wrong code.")
+                if not Jablotron._is_sections_states_packet(packet):
+                    continue
+                section_states = Jablotron._convert_sections_states_packet_to_sections_states(packet)
+                state = section_states.get(section_id)
+                if state is None:
+                    continue
+                if _section_state_to_name(state) in confirmation_states:
+                    return True
         return False
 
     def _drain_packets_locked(self, client: JablotronUSBClient, *, timeout: float) -> list[bytes]:
