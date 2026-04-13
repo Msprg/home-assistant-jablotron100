@@ -578,7 +578,7 @@ def test_api_runtime_reads_default_control_code_from_entry_data() -> None:
     assert runtime.default_control_code() == "2468"
 
 
-def test_api_runtime_reads_api_token_from_options_override() -> None:
+def test_api_runtime_reads_api_token_from_entry_data() -> None:
     runtime = Jablotron(
         _FakeHass(),
         "entry-1",
@@ -586,7 +586,7 @@ def test_api_runtime_reads_api_token_from_options_override() -> None:
         {CONF_API_TOKEN: "options-token"},
     )
 
-    assert runtime._api._api_token == "options-token"
+    assert runtime._api._api_token == "entry-token"
 
 
 def test_api_runtime_refreshes_all_entities_on_service_mode_change() -> None:

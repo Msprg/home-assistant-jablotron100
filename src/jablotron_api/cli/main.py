@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
+import logging.config
 import ssl
 from pathlib import Path
 
 import uvicorn
+from uvicorn.config import LOGGING_CONFIG
 
 from jablotron_api.client.api import JablotronApiClient
 from jablotron_api.domain.models import DEFAULT_ADMIN_SCOPES
@@ -64,6 +67,11 @@ def cmd_server(_args: argparse.Namespace) -> None:
 
     settings = ServerSettings()
     app = create_app(settings=settings)
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s %(levelprefix)s %(message)s"
+    log_config["formatters"]["access"]["fmt"] = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    log_config["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
     uvicorn.run(
         app,
         host=settings.host,
@@ -75,6 +83,7 @@ def cmd_server(_args: argparse.Namespace) -> None:
         ssl_ca_certs=settings.tls_ca_certs,
         ssl_cert_reqs=ssl.CERT_REQUIRED,
         timeout_graceful_shutdown=15,
+        log_config=log_config,
     )
 
 
