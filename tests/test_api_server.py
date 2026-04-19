@@ -78,7 +78,7 @@ class FakeRuntime:
                     "inferred_entity_type": "device_state_motion",
                 }
             ],
-            users=[UserModel(id=80, name="User 80", rights="coUserNoSelfedit")],
+            users=[UserModel(id=80, name="User 80", code="1812", rights="coUserNoSelfedit")],
             initial_setup=InitialSetupModel(
                 source="inferred_catalog",
                 exact=False,
@@ -111,6 +111,9 @@ class FakeRuntime:
         return self.catalog
 
     async def get_users(self):
+        return self.catalog.users
+
+    async def get_export_users(self):
         return self.catalog.users
 
     async def get_user(self, user_id: int):
@@ -230,6 +233,96 @@ def test_user_crud_and_scope_enforcement(tmp_path: Path) -> None:
     delete_response = client.delete("/v1/users/81", headers={"Authorization": f"Bearer {token}"})
     assert delete_response.status_code == 200
     assert delete_response.json()["status"] == "deleted"
+
+
+def test_user_reads_redact_codes_without_users_codes_scope(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(label="users-readonly", scopes=[Scope.USERS_READ.value])
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    users_response = client.get("/v1/users", headers={"Authorization": f"Bearer {token}"})
+    assert users_response.status_code == 200
+    assert users_response.json()[0]["code"] == ""
+
+    export_response = client.get("/v1/export/users", headers={"Authorization": f"Bearer {token}"})
+    assert export_response.status_code == 200
+    assert export_response.json()[0]["code"] == ""
+
+
+def test_user_reads_include_codes_with_explicit_sensitive_scope(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="users-sensitive",
+        scopes=[Scope.USERS_READ.value, Scope.USERS_CODES_READ.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/users", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()[0]["code"] == "1812"
+
+
+def test_catalog_read_is_separate_and_redacts_users_by_default(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(label="catalog-only", scopes=[Scope.CATALOG_READ.value])
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/export/catalog", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["users"] == []
+
+
+def test_catalog_read_with_users_read_redacts_codes_without_sensitive_scope(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="catalog-users",
+        scopes=[Scope.CATALOG_READ.value, Scope.USERS_READ.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/export/catalog", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["users"][0]["code"] == ""
+
+
+def test_config_read_remains_backward_compatible_for_catalog_endpoint(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(label="legacy-config-reader", scopes=[Scope.CONFIG_READ.value])
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/export/catalog", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["users"] == []
 
 
 def test_control_endpoints_forward_supplied_code(tmp_path: Path) -> None:
@@ -1346,6 +1439,29 @@ def test_websocket_subscription(tmp_path: Path) -> None:
         snapshot = websocket.receive_json()
         assert snapshot["event"] == "snapshot"
         assert snapshot["topic"] == "status"
+
+
+def test_websocket_catalog_snapshot_redacts_users_without_sensitive_scopes(tmp_path: Path) -> None:
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="catalog-ws",
+        scopes=[Scope.CATALOG_READ.value, Scope.USERS_READ.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    with client.websocket_connect(f"/v1/ws?token={token}") as websocket:
+        websocket.receive_json()
+        websocket.send_json({"action": "subscribe", "topics": ["catalog"]})
+        snapshot = websocket.receive_json()
+        assert snapshot["event"] == "snapshot"
+        assert snapshot["topic"] == "catalog"
+        assert snapshot["payload"]["users"][0]["code"] == ""
 
 
 def test_connection_manager_close_all_closes_connected_websockets() -> None:

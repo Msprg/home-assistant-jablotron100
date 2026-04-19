@@ -18,3 +18,14 @@ def require_scopes(token: AuthenticatedToken, *required: str) -> None:
             },
         )
 
+
+def require_any_scope(token: AuthenticatedToken, *allowed: str) -> None:
+    if any(scope in token.scopes for scope in allowed):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": "missing_scopes",
+            "missing_any_of": list(allowed),
+        },
+    )

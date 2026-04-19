@@ -23,6 +23,7 @@ from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
 from jablotron_api.server.ws import ConnectionManager
 from jablotron_api.services.auth import require_scopes
+from jablotron_api.services.auth import require_any_scope
 from jablotron_api.services.storage import TokenStore
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,52 @@ def create_app(
     token_store = token_store or TokenStore(settings.db_path)
     ws_manager = ConnectionManager()
 
+    def _has_scope(token: AuthenticatedToken, scope: str) -> bool:
+        return scope in token.scopes
+
+    def _can_read_catalog(token: AuthenticatedToken) -> bool:
+        return _has_scope(token, Scope.CATALOG_READ.value) or _has_scope(token, Scope.CONFIG_READ.value)
+
+    def _can_read_users(token: AuthenticatedToken) -> bool:
+        return _has_scope(token, Scope.USERS_READ.value)
+
+    def _can_read_user_codes(token: AuthenticatedToken) -> bool:
+        return _has_scope(token, Scope.USERS_CODES_READ.value)
+
+    def _serialize_users(users: list, token: AuthenticatedToken) -> list[dict]:
+        include_codes = _can_read_user_codes(token)
+        return [
+            user.model_dump(mode="json") if include_codes else user.model_copy(update={"code": ""}).model_dump(mode="json")
+            for user in users
+        ]
+
+    def _serialize_catalog(catalog, token: AuthenticatedToken) -> dict:
+        users_payload = []
+        if _can_read_users(token):
+            users_payload = _serialize_users(catalog.users, token)
+        return catalog.model_dump(mode="json", exclude={"users"}) | {"users": users_payload}
+
+    def _authorize_topic(token: AuthenticatedToken, topic: str) -> bool:
+        if topic == "catalog":
+            return _can_read_catalog(token)
+        required_scope = topic_scopes.get(topic)
+        return required_scope is None or _has_scope(token, required_scope)
+
+    def _serialize_ws_payload(token: AuthenticatedToken, topic: str, payload: dict) -> dict:
+        if topic == "catalog":
+            users_payload = []
+            if _can_read_users(token):
+                users_payload = [
+                    user_payload if _can_read_user_codes(token) else {**user_payload, "code": ""}
+                    for user_payload in payload.get("users", [])
+                ]
+            return {**payload, "users": users_payload}
+        if topic == "users":
+            if _can_read_user_codes(token):
+                return payload
+            return [{**user_payload, "code": ""} for user_payload in payload]
+        return payload
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         LOGGER.info(
@@ -57,7 +104,18 @@ def create_app(
             settings.panel.full_refresh_interval_seconds,
             settings.panel.port,
         )
-        runtime.add_listener(lambda topic, payload: ws_manager.broadcast(topic, "update", payload))
+        runtime.add_listener(
+            lambda topic, payload: ws_manager.broadcast(
+                topic,
+                "update",
+                payload,
+                transform=lambda metadata, broadcast_topic, broadcast_payload: _serialize_ws_payload(
+                    metadata["token"],
+                    broadcast_topic,
+                    broadcast_payload,
+                ),
+            )
+        )
         await runtime.start()
         LOGGER.info(
             "Jablotron API server started: panel_model=%s panel_hw=%s panel_fw=%s panel_id=%s",
@@ -82,7 +140,7 @@ def create_app(
         "status": Scope.STATUS_READ.value,
         "events": Scope.EVENTS_READ.value,
         "users": Scope.USERS_READ.value,
-        "catalog": Scope.CONFIG_READ.value,
+        "catalog": Scope.CATALOG_READ.value,
         "system": Scope.SYSTEM_READ.value,
     }
 
@@ -357,7 +415,7 @@ def create_app(
     @app.get("/v1/users")
     async def users(token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.USERS_READ.value)
-        return await runtime.get_users()
+        return _serialize_users(await runtime.get_users(), token)
 
     @app.get("/v1/users/{user_id}")
     async def user(user_id: int, token: AuthenticatedToken = Depends(require_token)):
@@ -365,7 +423,7 @@ def create_app(
         result = await runtime.get_user(user_id)
         if result is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-        return result
+        return _serialize_users([result], token)[0]
 
     @app.post("/v1/users")
     async def add_user(payload: UserCreateModel, token: AuthenticatedToken = Depends(require_token)):
@@ -429,13 +487,13 @@ def create_app(
 
     @app.get("/v1/export/users")
     async def export_users(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.CONFIG_READ.value)
-        return await runtime.get_export_users()
+        require_scopes(token, Scope.USERS_READ.value)
+        return _serialize_users(await runtime.get_export_users(), token)
 
     @app.get("/v1/export/catalog")
     async def export_catalog(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.CONFIG_READ.value)
-        return await runtime.get_catalog()
+        require_any_scope(token, Scope.CATALOG_READ.value, Scope.CONFIG_READ.value)
+        return _serialize_catalog(await runtime.get_catalog(), token)
 
     @app.get("/v1/export/time-limits")
     async def export_time_limits(token: AuthenticatedToken = Depends(require_token)):
@@ -495,7 +553,7 @@ def create_app(
             )
             await websocket.close(code=4401)
             return
-        await ws_manager.connect(websocket)
+        await ws_manager.connect(websocket, metadata={"token": authenticated})
         LOGGER.info(
             "WebSocket connected: token=%s fingerprint=%s",
             _token_log_label(authenticated),
@@ -511,8 +569,7 @@ def create_app(
                     allowed_topics: list[str] = []
                     denied_topics: list[str] = []
                     for topic in topics:
-                        required_scope = topic_scopes.get(topic)
-                        if required_scope is None or required_scope in authenticated.scopes:
+                        if _authorize_topic(authenticated, topic):
                             allowed_topics.append(topic)
                         else:
                             denied_topics.append(topic)
@@ -536,11 +593,11 @@ def create_app(
                         if topic == "status":
                             await websocket.send_json({"event": "snapshot", "topic": "status", "payload": (await runtime.get_status()).model_dump(mode="json")})
                         elif topic == "catalog":
-                            await websocket.send_json({"event": "snapshot", "topic": "catalog", "payload": (await runtime.get_catalog()).model_dump(mode="json")})
+                            await websocket.send_json({"event": "snapshot", "topic": "catalog", "payload": _serialize_catalog(await runtime.get_catalog(), authenticated)})
                         elif topic == "system":
                             await websocket.send_json({"event": "snapshot", "topic": "system", "payload": (await build_system_payload(authenticated)).model_dump(mode="json")})
                         elif topic == "users":
-                            await websocket.send_json({"event": "snapshot", "topic": "users", "payload": [user.model_dump(mode="json") for user in await runtime.get_users()]})
+                            await websocket.send_json({"event": "snapshot", "topic": "users", "payload": _serialize_users(await runtime.get_users(), authenticated)})
                         elif topic == "events":
                             await websocket.send_json({"event": "snapshot", "topic": "events", "payload": [event.model_dump(mode="json") for event in await runtime.get_events_recent(limit=20)]})
                 elif action == "ping":

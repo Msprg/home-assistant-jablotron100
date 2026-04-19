@@ -17,8 +17,10 @@ class Scope(StrEnum):
     SYSTEM_READ = "system:read"
     STATUS_READ = "status:read"
     EVENTS_READ = "events:read"
+    CATALOG_READ = "catalog:read"
     CONFIG_READ = "config:read"
     USERS_READ = "users:read"
+    USERS_CODES_READ = "users:codes:read"
     USERS_WRITE = "users:write"
     SECTIONS_CONTROL = "sections:control"
     PGS_CONTROL = "pgs:control"
@@ -32,8 +34,10 @@ DEFAULT_ADMIN_SCOPES = [
         Scope.SYSTEM_READ,
         Scope.STATUS_READ,
         Scope.EVENTS_READ,
+        Scope.CATALOG_READ,
         Scope.CONFIG_READ,
         Scope.USERS_READ,
+        Scope.USERS_CODES_READ,
         Scope.USERS_WRITE,
         Scope.SECTIONS_CONTROL,
         Scope.PGS_CONTROL,
