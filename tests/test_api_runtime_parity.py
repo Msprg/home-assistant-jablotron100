@@ -8,6 +8,7 @@ from homeassistant.components.alarm_control_panel import AlarmControlPanelState
 import custom_components.jablotron100_api_hass.api_client as api_client_module
 from custom_components.jablotron100_api_hass.api_runtime import Jablotron, JablotronCentralUnit
 from custom_components.jablotron100_api_hass.api_client import JablotronApiClient, JablotronApiError
+from custom_components.jablotron100_api_hass.switch import JablotronProgrammableOutputEntity
 from custom_components.jablotron100_api_hass.const import (
     CONF_API_TOKEN,
     CONF_CONTROL_CODE,
@@ -587,6 +588,23 @@ def test_api_runtime_reads_api_token_from_entry_data() -> None:
     )
 
     assert runtime._api._api_token == "entry-token"
+
+
+def test_pg_switch_uses_stable_suggested_object_id() -> None:
+    runtime = _build_runtime()
+    runtime._apply_catalog(
+        {
+            "sections": [],
+            "pgs": [{"id": 0, "display_id": 1, "name": "Gate Relay"}],
+            "devices": [],
+            "users": [],
+        }
+    )
+
+    control = runtime.entities[EntityType.PROGRAMMABLE_OUTPUT]["pg_output_1"]
+    entity = JablotronProgrammableOutputEntity(runtime, control)
+
+    assert entity._attr_suggested_object_id == "jablotron100_pg1"
 
 
 def test_api_runtime_refreshes_all_entities_on_service_mode_change() -> None:
