@@ -7,7 +7,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 SCHEMA_MARKER = b'{\r\n    "README": ['
@@ -187,6 +187,222 @@ def cmd_show(args: argparse.Namespace) -> None:
     print(json.dumps(node, indent=2, ensure_ascii=False))
 
 
+DEV_COMMENT_FIELDS: Tuple[str, ...] = ("info", "text", "comment")
+
+
+@dataclass(frozen=True)
+class DevCommentEntry:
+    path: Tuple[str, ...]
+    node_class: Optional[str]
+    flrecname: Optional[str]
+    node_id: Optional[str]
+    default: Any
+    info: List[str]
+    text: Optional[str]
+    comment: Optional[str]
+    from_enum: Optional[str]
+    access_read: Optional[str]
+    access_write: Optional[str]
+
+    @property
+    def path_display(self) -> str:
+        return " > ".join(self.path)
+
+    @property
+    def has_any_comment(self) -> bool:
+        return bool(self.info or self.text or self.comment)
+
+
+def _normalise_info(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, list):
+        out: List[str] = []
+        for element in value:
+            if isinstance(element, str):
+                stripped = element.strip()
+                if stripped:
+                    out.append(stripped)
+        return out
+    return [json.dumps(value, ensure_ascii=False)]
+
+
+def _stringify(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def iter_dev_comments(schema: Dict[str, Any]) -> Iterable[DevCommentEntry]:
+    def walk(node: Any, path: Tuple[str, ...]) -> Iterable[DevCommentEntry]:
+        if isinstance(node, dict):
+            info = _normalise_info(node.get("info"))
+            text = _stringify(node.get("text"))
+            comment_value = node.get("comment")
+            comment_str = _stringify(comment_value) if isinstance(comment_value, str) else None
+            if info or text or comment_str:
+                yield DevCommentEntry(
+                    path=path,
+                    node_class=_stringify(node.get("class")),
+                    flrecname=_stringify(node.get("flrecname")),
+                    node_id=_stringify(node.get("id")),
+                    default=node.get("def"),
+                    info=info,
+                    text=text,
+                    comment=comment_str,
+                    from_enum=_stringify(node.get("from")),
+                    access_read=_stringify(node.get("r_access")),
+                    access_write=_stringify(node.get("w_access")),
+                )
+            for key, value in node.items():
+                if key in DEV_COMMENT_FIELDS:
+                    continue
+                yield from walk(value, path + (str(key),))
+        elif isinstance(node, list):
+            for index, element in enumerate(node):
+                yield from walk(element, path + (f"[{index}]",))
+
+    yield from walk(schema, tuple())
+
+
+def _format_default(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def format_dev_comments_text(entries: Iterable[DevCommentEntry]) -> str:
+    lines: List[str] = []
+    lines.append("F-Link Embedded Schema Dev-Comment Index")
+    lines.append("")
+    count = 0
+    for entry in entries:
+        count += 1
+        lines.append(entry.path_display)
+        meta_bits: List[str] = []
+        if entry.node_class:
+            meta_bits.append(f"class={entry.node_class}")
+        if entry.flrecname:
+            meta_bits.append(f"flrecname={entry.flrecname}")
+        if entry.node_id:
+            meta_bits.append(f"id={entry.node_id}")
+        default_str = _format_default(entry.default)
+        if default_str is not None:
+            meta_bits.append(f"def={default_str}")
+        if entry.from_enum:
+            meta_bits.append(f"from={entry.from_enum}")
+        if entry.access_read:
+            meta_bits.append(f"r_access={entry.access_read}")
+        if entry.access_write:
+            meta_bits.append(f"w_access={entry.access_write}")
+        if meta_bits:
+            lines.append("  " + " | ".join(meta_bits))
+        if entry.text:
+            lines.append(f"  text: {entry.text}")
+        for paragraph in entry.info:
+            lines.append(f"  info: {paragraph}")
+        if entry.comment:
+            lines.append(f"  comment: {entry.comment}")
+        lines.append("")
+    lines.insert(1, f"entries: {count}")
+    lines.insert(2, "")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def dev_comments_to_json_records(entries: Iterable[DevCommentEntry]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for entry in entries:
+        record: Dict[str, Any] = {"path": list(entry.path)}
+        if entry.node_class:
+            record["class"] = entry.node_class
+        if entry.flrecname:
+            record["flrecname"] = entry.flrecname
+        if entry.node_id:
+            record["id"] = entry.node_id
+        if entry.default is not None:
+            record["def"] = entry.default
+        if entry.from_enum:
+            record["from"] = entry.from_enum
+        if entry.access_read:
+            record["r_access"] = entry.access_read
+        if entry.access_write:
+            record["w_access"] = entry.access_write
+        if entry.text:
+            record["text"] = entry.text
+        if entry.info:
+            record["info"] = list(entry.info)
+        if entry.comment:
+            record["comment"] = entry.comment
+        records.append(record)
+    return records
+
+
+def _filter_entries(
+    entries: Iterable[DevCommentEntry],
+    *,
+    path_filter: Optional[str],
+    search: Optional[str],
+) -> Iterable[DevCommentEntry]:
+    needle_path = path_filter.lower() if path_filter else None
+    needle_search = search.lower() if search else None
+    for entry in entries:
+        if needle_path and needle_path not in entry.path_display.lower():
+            continue
+        if needle_search:
+            haystack_parts: List[str] = [entry.path_display]
+            if entry.flrecname:
+                haystack_parts.append(entry.flrecname)
+            if entry.node_id:
+                haystack_parts.append(entry.node_id)
+            if entry.text:
+                haystack_parts.append(entry.text)
+            haystack_parts.extend(entry.info)
+            if entry.comment:
+                haystack_parts.append(entry.comment)
+            haystack = "\n".join(haystack_parts).lower()
+            if needle_search not in haystack:
+                continue
+        yield entry
+
+
+def cmd_dev_comments(args: argparse.Namespace) -> None:
+    schema = load_schema(Path(args.input))
+    entries = list(
+        _filter_entries(
+            iter_dev_comments(schema.obj),
+            path_filter=args.path,
+            search=args.search,
+        )
+    )
+
+    if args.format == "json":
+        payload = {
+            "source": str(schema.source),
+            "entry_count": len(entries),
+            "entries": dev_comments_to_json_records(entries),
+        }
+        body = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    else:
+        body = format_dev_comments_text(entries)
+
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(body, encoding="utf-8")
+        print(f"wrote {output}")
+        print(f"entries {len(entries)}")
+        return
+    print(body, end="")
+
+
 def cmd_access_report(args: argparse.Namespace) -> None:
     schema = load_schema(Path(args.input))
     report = build_access_report(schema.obj)
@@ -220,6 +436,28 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("input", help="Path to a dump or schema JSON file.")
     report_parser.add_argument("--output", help="Optional output path for the generated report.")
     report_parser.set_defaults(func=cmd_access_report)
+
+    dev_parser = subparsers.add_parser(
+        "dev-comments",
+        help="Flatten every developer comment (info/text/comment) into a browsable index.",
+    )
+    dev_parser.add_argument("input", help="Path to a dump or schema JSON file.")
+    dev_parser.add_argument("--output", help="Optional output path; writes to stdout when omitted.")
+    dev_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text).",
+    )
+    dev_parser.add_argument(
+        "--path",
+        help="Only include entries whose dotted path contains this substring (case-insensitive).",
+    )
+    dev_parser.add_argument(
+        "--search",
+        help="Only include entries whose metadata or comment text contains this substring (case-insensitive).",
+    )
+    dev_parser.set_defaults(func=cmd_dev_comments)
 
     return parser
 
