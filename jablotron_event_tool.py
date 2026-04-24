@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -88,6 +89,7 @@ EVENT_TEXT_BY_CODE = {
     "48": "Zmena konfigurácie",
     "119": "Neplatná autorizace",
     "123": "Kontrolný prenos na PCO 1",
+    "132": "Porucha začiatok",
     "150": "Autorizácia OK",
     "156": "Spojenie nadviazané",
     "157": "Spojenie ukončené",
@@ -143,6 +145,9 @@ class EventArchiveSnapshot:
     index_points: list[LogPoint]
     crlf_part_lengths: list[int]
     printable_preview: list[str]
+    last_nonzero_offset: int | None = None
+    populated_bytes: int | None = None
+    trailing_zero_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +227,21 @@ def read_log_index_points(path: Path) -> list[LogPoint]:
                 continue
             points.append(LogPoint(timestamp=timestamp, offset=file_offset))
     return points
+
+
+def find_last_nonzero_offset(data: bytes) -> int | None:
+    """Return the index of the last non-zero byte in ``data`` or ``None``.
+
+    FLEXILOG files are fixed-size preallocated archives where unused tail bytes
+    are zero. Knowing the last non-zero offset tells callers how much of the
+    archive actually contains events and how much is pre-erased flash padding.
+    """
+    if not data:
+        return None
+    stripped = data.rstrip(b"\x00")
+    if not stripped:
+        return None
+    return len(stripped) - 1
 
 
 def read_combined_log_range(*, old_path: Path, current_path: Path, start: int, length: int) -> bytes:
@@ -777,6 +797,8 @@ def normalize_event_label(*, event_code: str | None, event_text: str, catalog: D
     pg_text = decode_pg_event_text(event_code, catalog)
     if pg_text:
         return pg_text
+    if event_code in EVENT_TEXT_BY_CODE:
+        return EVENT_TEXT_BY_CODE[event_code]
     if catalog and event_code in catalog.event_text_by_code:
         return catalog.event_text_by_code[event_code]
     return event_text
@@ -918,7 +940,16 @@ def canonicalize_decoded_records(
         section = record.section
         event_text = record.event_text
 
-        if event_text == "No text" and record.event_code:
+        if record.event_code and (
+            record.event_code in EVENT_TEXT_BY_CODE
+            or (catalog is not None and record.event_code in catalog.event_text_by_code)
+        ):
+            event_text = normalize_event_label(
+                event_code=record.event_code,
+                event_text=event_text or "No text",
+                catalog=catalog,
+            )
+        elif event_text == "No text" and record.event_code:
             event_text = normalize_event_label(
                 event_code=record.event_code,
                 event_text=event_text,
@@ -1356,7 +1387,9 @@ def load_decoded_records_from_jsonl(path: Path) -> list[DecodedEventRecord]:
             if not parsed:
                 continue
             records.append(DecodedEventRecord(**parsed))
-    return records
+    # Keep JSONL-loaded rows consistent with live decode paths (event-label
+    # normalization, source/channel prettification, rebuilt text payload).
+    return canonicalize_decoded_records(records)
 
 
 def parse_flink_export_xml(path: Path) -> list[FLinkExportRow]:
@@ -1554,6 +1587,366 @@ def emit_decoded_records(records: list[DecodedEventRecord], fmt: str) -> None:
     print_decoded_table(records)
 
 
+# --- Pretty / colorized rendering for the `show` subcommand ----------------
+
+_ANSI = {
+    "reset": "\x1b[0m",
+    "bold": "\x1b[1m",
+    "dim": "\x1b[2m",
+    "red": "\x1b[31m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "blue": "\x1b[34m",
+    "magenta": "\x1b[35m",
+    "cyan": "\x1b[36m",
+    "white": "\x1b[37m",
+    "bright_red": "\x1b[91m",
+    "bright_green": "\x1b[92m",
+    "bright_yellow": "\x1b[93m",
+    "bright_blue": "\x1b[94m",
+    "bright_magenta": "\x1b[95m",
+    "bright_cyan": "\x1b[96m",
+    "bg_red": "\x1b[41m",
+}
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Keyword-driven highlight rules for EVENT/INFO messages. Order matters; the
+# first matching rule wins. Patterns match on the upper-cased message text.
+# Keywords cover EN plus the CZ/SK localizations this panel uses.
+_EVENT_STYLE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Alarm clear / restore wins over the alarm rules below ("Zrušenie poplachu"
+    # contains both "ZRUŠEN" and "POPLACH" — the clear rule must match first).
+    (re.compile(r"ZRUŠEN|ZRUSEN|RESTORE|CLEAR|OBNOV"), "bright_green"),
+    # Alarms / panic / sabotage (both EN and SK/CZ).
+    (re.compile(r"ALARM|PANIC|BURGLAR|SABOT|TAMPER|POPLACH"), "bright_red"),
+    (re.compile(r"FIRE|SMOKE|GAS|FLOOD|POŽIAR|POZIAR|ZAPLAV"), "bright_red"),
+    # Faults / low battery / failures.
+    (re.compile(r"FAULT|FAILURE|LOW BATTERY|BATTERY FAIL|PORUCHA|AKUMUL|BATÉRI|BATERI"), "bright_yellow"),
+    # Unset / disarm.
+    (re.compile(r"UNSET|DISARM|ODSTREZ|ODSTREŽ|ODJIST"), "green"),
+    # Set / arm / partial set.
+    (re.compile(r"\bSET\b|\bARM(?:ED|ING)?\b|PARTIAL|ZASTREZ|ZASTREŽ|ZAJIST"), "yellow"),
+    # Entry / exit.
+    (re.compile(r"ENTRY|EXIT|VSTUP|ODCHOD|PRÍCHOD|PRICHOD"), "cyan"),
+    # Power / mains / AC.
+    (re.compile(r"MAINS|POWER|AC LOSS|AC RESTORE|STRATA SIET|SIET OBNOV|SIEŤ|VÝPADOK|VYPADOK"), "magenta"),
+    # Communication / connection / GSM / LAN.
+    (re.compile(r"COMMUNICATION|\bLINE\b|GSM|\bLAN\b|\bARC\b|SPOJEN|KOMUNIK|PRENOS"), "blue"),
+    (re.compile(r"EVENT (?:NOT )?DELIVERED|ODOSLAN|DORUCEN|DORUČEN"), "dim"),
+    # Authorization / user activity.
+    (re.compile(r"AUTORIZ|AUTHORIZ|LOGIN|LOGOUT"), "bright_cyan"),
+    # PG outputs (Jablotron programmable outputs).
+    (re.compile(r"^PG \d+:"), "dim"),
+)
+
+# Jablotron event code -> style fallback when keyword rules do not match.
+def _code_style_fallback(event_code: str | None) -> str | None:
+    if not event_code:
+        return None
+    try:
+        code = int(event_code)
+    except ValueError:
+        return None
+    if code in (13, 15, 25, 26, 27, 28, 29, 30):  # alarms / panic / fire
+        return "bright_red"
+    if code == 14:  # alarm clear
+        return "bright_green"
+    if 40 <= code <= 49:  # tampers / sabotage
+        return "bright_red"
+    if 50 <= code <= 74:  # arm/set operations
+        return "yellow"
+    if 75 <= code <= 99:  # PG / auxiliary output operations
+        return None
+    if 100 <= code <= 149:  # faults / low battery / service
+        return "bright_yellow"
+    if 150 <= code <= 199:  # authorization / communication
+        return "blue"
+    return None
+
+
+def _ansi_supported(stream: TextIO) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    isatty = getattr(stream, "isatty", None)
+    try:
+        return bool(isatty and isatty())
+    except Exception:
+        return False
+
+
+def _visual_width(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+
+def _pad(text: str, width: int) -> str:
+    padding = width - _visual_width(text)
+    return text + (" " * padding if padding > 0 else "")
+
+
+class _Palette:
+    __slots__ = ("enabled",)
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def paint(self, text: str, *styles: str) -> str:
+        if not self.enabled or not text:
+            return text
+        prefix = "".join(_ANSI[s] for s in styles if s in _ANSI)
+        if not prefix:
+            return text
+        return f"{prefix}{text}{_ANSI['reset']}"
+
+
+def _prettify_timestamp(prefix: str | None) -> str:
+    if not prefix:
+        return ""
+    prefix = prefix.strip()
+    m = re.match(r"^(\d{2})(\d{2})(\d{2}) (\d{2}:\d{2}:\d{2})$", prefix)
+    if m:
+        yy, mm, dd, hms = m.groups()
+        return f"20{yy}-{mm}-{dd} {hms}"
+    return prefix
+
+
+def _record_kind_style(kind: str | None) -> tuple[str, ...]:
+    if kind == "EVENT":
+        return ("bright_cyan",)
+    if kind == "INFO":
+        return ("dim",)
+    return ("dim", "magenta")
+
+
+def _message_style(
+    message: str,
+    kind: str | None,
+    *,
+    event_code: str | None = None,
+) -> tuple[str, ...]:
+    if not message:
+        return ()
+    upper = message.upper()
+    for pattern, style in _EVENT_STYLE_RULES:
+        if pattern.search(upper):
+            return (style, "bold") if style.startswith("bright_red") else (style,)
+    fallback = _code_style_fallback(event_code)
+    if fallback:
+        return (fallback, "bold") if fallback.startswith("bright_red") else (fallback,)
+    if kind == "EVENT":
+        return ("white",)
+    return ("dim",)
+
+
+def _filter_by_date(
+    records: list[DecodedEventRecord],
+    *,
+    since: str | None,
+    until: str | None,
+) -> list[DecodedEventRecord]:
+    if not since and not until:
+        return records
+
+    def _to_key(value: str) -> str:
+        # accept YYYY-MM-DD, YYYYMMDD, or YYMMDD -> normalize to YYYYMMDD
+        s = value.replace("-", "").replace("/", "")
+        if len(s) == 6:
+            s = "20" + s
+        return s
+
+    since_key = _to_key(since) if since else None
+    until_key = _to_key(until) if until else None
+    filtered: list[DecodedEventRecord] = []
+    for record in records:
+        prefix = (record.timestamp_prefix or "").strip()
+        m = re.match(r"^(\d{2})(\d{2})(\d{2}) ", prefix)
+        if not m:
+            continue
+        yy, mm, dd = m.groups()
+        key = f"20{yy}{mm}{dd}"
+        if since_key and key < since_key:
+            continue
+        if until_key and key > until_key:
+            continue
+        filtered.append(record)
+    return filtered
+
+
+def _filter_by_grep(
+    records: list[DecodedEventRecord],
+    pattern: str | None,
+    *,
+    ignore_case: bool = True,
+) -> list[DecodedEventRecord]:
+    if not pattern:
+        return records
+    flags = re.IGNORECASE if ignore_case else 0
+    regex = re.compile(pattern, flags)
+    filtered: list[DecodedEventRecord] = []
+    for record in records:
+        blob = " ".join(
+            filter(
+                None,
+                (
+                    record.text or "",
+                    record.event_text or "",
+                    record.info_subject or "",
+                    record.info_message or "",
+                    record.source_name or "",
+                    record.channel or "",
+                    record.section or "",
+                ),
+            )
+        )
+        if regex.search(blob):
+            filtered.append(record)
+    return filtered
+
+
+def print_colorized_history(
+    records: list[DecodedEventRecord],
+    *,
+    stream: TextIO | None = None,
+    color: str = "auto",
+    pretty_timestamp: bool = True,
+    show_header: bool = True,
+    group_by_day: bool = False,
+) -> None:
+    stream = stream or sys.stdout
+    if color == "always":
+        enabled = True
+    elif color == "never":
+        enabled = False
+    else:
+        enabled = _ansi_supported(stream)
+    palette = _Palette(enabled)
+
+    header = ("Timestamp", "Kind", "ID", "Code", "Event / Info", "Source", "Channel", "Sect")
+    rows: list[tuple[str, ...]] = []
+    for record in records:
+        message = record.event_text or record.info_message or record.text or ""
+        source = record.source_name or record.info_subject or ""
+        ts = _prettify_timestamp(record.timestamp_prefix) if pretty_timestamp else (record.timestamp_prefix or "")
+        rows.append(
+            (
+                ts,
+                record.kind or "RAW",
+                record.event_id or "",
+                record.event_code or "",
+                message,
+                source,
+                record.channel or "",
+                record.section or "",
+            )
+        )
+
+    widths = [len(h) for h in header]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], _visual_width(cell))
+
+    def _emit(cells: list[str]) -> None:
+        stream.write("  ".join(_pad(cells[i], widths[i]) for i in range(len(cells))).rstrip() + "\n")
+
+    if show_header:
+        painted_header = [palette.paint(h, "bold", "white") for h in header]
+        _emit(painted_header)
+        _emit([palette.paint("-" * widths[i], "dim") for i in range(len(header))])
+
+    current_day = ""
+    for record, row in zip(records, rows):
+        if group_by_day:
+            day = row[0][:10] if pretty_timestamp else row[0][:6]
+            if day and day != current_day:
+                current_day = day
+                banner_label = day if pretty_timestamp else f"20{day[:2]}-{day[2:4]}-{day[4:6]}"
+                line = palette.paint(f"── {banner_label} ", "bold", "bright_blue")
+                stream.write(line + "\n")
+
+        ts = palette.paint(row[0], "dim")
+        kind_styles = _record_kind_style(record.kind)
+        kind = palette.paint(row[1], *kind_styles)
+        event_id = palette.paint(row[2], "dim")
+        code = palette.paint(row[3], "dim") if record.kind == "INFO" else palette.paint(row[3], "yellow")
+        message_styles = _message_style(row[4], record.kind, event_code=record.event_code)
+        message = palette.paint(row[4], *message_styles) if message_styles else row[4]
+        source = palette.paint(row[5], "magenta") if row[5] else ""
+        channel = palette.paint(row[6], "cyan") if row[6] else ""
+        section = palette.paint(row[7], "bright_yellow") if row[7] else ""
+
+        _emit([ts, kind, event_id, code, message, source, channel, section])
+
+    stream.flush()
+
+
+def _iter_decoded_from_archive(
+    *,
+    archive_path: Path,
+    metadata_path: Path | None,
+    base_offset: int,
+    catalog: DecoderCatalog | None,
+) -> list[DecodedEventRecord]:
+    data = archive_path.read_bytes()
+    window_start = base_offset
+    if metadata_path is not None:
+        try:
+            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+            window_start = int(meta.get("window_start", window_start))
+        except Exception:
+            pass
+    records = split_crlf_records(data, base_offset=window_start)
+    return build_decoded_records(records, data, catalog=catalog)
+
+
+def load_history_records(
+    *,
+    records_jsonl: Path | None = None,
+    archive: Path | None = None,
+    metadata: Path | None = None,
+    base_offset: int = 0,
+    catalog: DecoderCatalog | None = None,
+    files_dir: Path | None = None,
+) -> list[DecodedEventRecord]:
+    """Resolve decoded records from (in priority order):
+
+    1. A pre-decoded JSONL produced by ``--records-output --decode-records``.
+    2. A raw archive window file plus optional metadata.
+    3. A ``--copy-files-dir`` directory that contains ``FLEXILOG.OLD`` and
+       ``FLEXILOG.TXT`` (concatenated in that order).
+    """
+    if records_jsonl is not None:
+        return load_decoded_records_from_jsonl(records_jsonl)
+    if archive is not None:
+        return _iter_decoded_from_archive(
+            archive_path=archive,
+            metadata_path=metadata,
+            base_offset=base_offset,
+            catalog=catalog,
+        )
+    if files_dir is not None:
+        old_path = files_dir / "FLEXILOG.OLD"
+        new_path = files_dir / "FLEXILOG.TXT"
+        pieces: list[bytes] = []
+        if old_path.exists():
+            pieces.append(old_path.read_bytes())
+        if new_path.exists():
+            pieces.append(new_path.read_bytes())
+        if not pieces:
+            raise SystemExit(
+                f"No FLEXILOG.OLD/FLEXILOG.TXT found in {files_dir}. Pass --records or --archive instead."
+            )
+        data = b"".join(pieces)
+        last_nz = find_last_nonzero_offset(data)
+        if last_nz is not None:
+            data = data[: last_nz + 1]
+        records = split_crlf_records(data, base_offset=0)
+        return build_decoded_records(records, data, catalog=catalog)
+    raise SystemExit(
+        "show requires one of --records, --archive, or --files-dir to locate event data."
+    )
+
+
 def build_metadata(snapshot: EventArchiveSnapshot) -> dict[str, object]:
     metadata = asdict(snapshot)
     metadata["output"] = str(snapshot.output)
@@ -1590,6 +1983,12 @@ def emit_snapshot(snapshot: EventArchiveSnapshot) -> None:
     print(f"logical_end {snapshot.logical_end}")
     print(f"window_start {snapshot.window_start}")
     print(f"window_bytes {snapshot.window_bytes}")
+    if snapshot.populated_bytes is not None:
+        print(f"populated_bytes {snapshot.populated_bytes}")
+    if snapshot.last_nonzero_offset is not None:
+        print(f"last_nonzero_offset {snapshot.last_nonzero_offset}")
+    if snapshot.trailing_zero_bytes:
+        print(f"trailing_zero_bytes {snapshot.trailing_zero_bytes}")
     print(f"record_count {snapshot.record_count}")
     if snapshot.record_length_histogram:
         print(
@@ -1840,11 +2239,17 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
         logical_end = max((point.offset for point in index_points), default=physical_total)
         if args.end_mode == "physical":
             logical_end = physical_total
+        full_mode = bool(getattr(args, "full", False))
         copy_files_dir = getattr(args, "copy_files_dir", None)
         if copy_files_dir:
             copy_archive_files(mountpoint=mountpoint, output_dir=Path(copy_files_dir))
 
         if args.transport == "direct":
+            if full_mode:
+                raise SystemExit(
+                    "--full is not supported with --transport direct; the panel rejects JA100_READ_FILE "
+                    "reads that span the whole FLEXILOG.OLD+TXT archive. Use --transport archive."
+                )
             unmount_device(log_device, mount_tool=args.mount_tool)
             mounted = False
             logical_end = physical_total
@@ -1856,13 +2261,25 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
             )
             window_start = max(0, logical_end - len(data))
         else:
-            window_start = max(0, logical_end - args.window_bytes)
+            if full_mode:
+                logical_end = physical_total
+                window_start = 0
+                read_length = physical_total
+            else:
+                window_start = max(0, logical_end - args.window_bytes)
+                read_length = args.window_bytes
             data = read_combined_log_range(
                 old_path=old_path,
                 current_path=current_path,
                 start=window_start,
-                length=args.window_bytes,
+                length=read_length,
             )
+        if getattr(args, "strip_trailing_zeros", False):
+            last_nz = find_last_nonzero_offset(data)
+            if last_nz is None:
+                data = b""
+            else:
+                data = data[: last_nz + 1]
         records = split_crlf_records(data, base_offset=window_start)
 
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1878,6 +2295,13 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
             )
 
         sha256 = hashlib.sha256(data).hexdigest()
+        last_nonzero_offset = find_last_nonzero_offset(data)
+        if last_nonzero_offset is None:
+            populated_bytes = 0
+            trailing_zero_bytes = len(data)
+        else:
+            populated_bytes = last_nonzero_offset + 1
+            trailing_zero_bytes = len(data) - populated_bytes
         snapshot = EventArchiveSnapshot(
             output=output,
             metadata_output=metadata_output,
@@ -1896,6 +2320,11 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
             index_points=index_points[-args.index_preview_count :],
             crlf_part_lengths=[len(part) for part in data.split(b"\r\n")[: args.crlf_preview_count]],
             printable_preview=build_printable_preview(data, limit=args.preview_limit),
+            last_nonzero_offset=(
+                window_start + last_nonzero_offset if last_nonzero_offset is not None else None
+            ),
+            populated_bytes=populated_bytes,
+            trailing_zero_bytes=trailing_zero_bytes,
         )
         write_metadata(metadata_output, snapshot)
         return snapshot
@@ -1936,6 +2365,21 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
 def cmd_pull_live(args: argparse.Namespace) -> None:
     snapshot = pull_live_archive(args)
     emit_snapshot(snapshot)
+
+
+def cmd_pull_full(args: argparse.Namespace) -> None:
+    effective_args = argparse.Namespace(**vars(args))
+    if not getattr(effective_args, "strip_trailing_zeros", False):
+        effective_args.strip_trailing_zeros = not bool(
+            getattr(effective_args, "keep_trailing_zeros", False)
+        )
+    snapshot = pull_live_archive(effective_args)
+    emit_snapshot(snapshot)
+    if snapshot.populated_bytes is not None:
+        print(
+            f"populated_span {snapshot.window_start}..{snapshot.window_start + snapshot.populated_bytes} "
+            f"({snapshot.populated_bytes} bytes)"
+        )
 
 
 def cmd_recent(args: argparse.Namespace) -> None:
@@ -1996,6 +2440,73 @@ def cmd_recent(args: argparse.Namespace) -> None:
         print(f"records {records_output}")
     print(f"displayed {len(display_records)}")
     emit_decoded_records(display_records, args.format)
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    catalog = resolve_decoder_catalog(
+        fdb_path=getattr(args, "source_fdb", None),
+        export_cfg_path=getattr(args, "source_export_cfg", None),
+    )
+    records = load_history_records(
+        records_jsonl=Path(args.records) if args.records else None,
+        archive=Path(args.archive) if args.archive else None,
+        metadata=Path(args.metadata) if args.metadata else None,
+        base_offset=args.base_offset,
+        catalog=catalog,
+        files_dir=Path(args.files_dir) if args.files_dir else None,
+    )
+
+    include_kinds = parse_kind_filter(args.kinds)
+    exclude_kinds = parse_kind_filter(args.exclude_kinds)
+    if args.events_only:
+        include_kinds = {"EVENT"}
+
+    records = select_display_records(
+        records,
+        limit=0,
+        include_raw=args.include_raw,
+        include_kinds=include_kinds or None,
+        exclude_kinds=exclude_kinds or None,
+    )
+    records = _filter_by_date(records, since=args.since, until=args.until)
+    records = _filter_by_grep(records, args.grep, ignore_case=not args.case_sensitive)
+
+    if args.reverse:
+        records = list(reversed(records))
+    if args.limit and args.limit > 0:
+        records = records[: args.limit] if args.reverse else records[-args.limit :]
+
+    if args.format == "tsv":
+        print_decoded_tsv(records)
+        return
+    if args.format == "json":
+        print(json.dumps([asdict(r) for r in records], indent=2, ensure_ascii=False))
+        return
+    if args.format == "plain":
+        color_mode = "never"
+    else:
+        color_mode = args.color
+    print_colorized_history(
+        records,
+        stream=sys.stdout,
+        color=color_mode,
+        pretty_timestamp=not args.raw_timestamp,
+        show_header=not args.no_header,
+        group_by_day=args.group_by_day,
+    )
+    if not args.no_summary:
+        total = len(records)
+        kinds = sorted({r.kind or "RAW" for r in records})
+        first_ts = _prettify_timestamp(records[0].timestamp_prefix) if records else ""
+        last_ts = _prettify_timestamp(records[-1].timestamp_prefix) if records else ""
+        enabled = color_mode == "always" or (color_mode == "auto" and _ansi_supported(sys.stdout))
+        palette = _Palette(enabled)
+        summary = (
+            f"\n{palette.paint(f'{total} records', 'bold')} "
+            f"{palette.paint('[' + ','.join(kinds) + ']', 'dim')} "
+            f"{palette.paint(first_ts + '  ->  ' + last_ts, 'dim')}"
+        )
+        print(summary)
 
 
 def cmd_dump_index(args: argparse.Namespace) -> None:
@@ -2138,6 +2649,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pull_live.add_argument("--window-bytes", type=int, default=DEFAULT_WINDOW_BYTES, help="Combined archive window size.")
     pull_live.add_argument(
+        "--full",
+        action="store_true",
+        help="Pull the entire FLEXILOG.OLD+FLEXILOG.TXT archive (overrides --window-bytes and --end-mode).",
+    )
+    pull_live.add_argument(
+        "--strip-trailing-zeros",
+        action="store_true",
+        help="Trim the preallocated zero tail from the read archive before parsing/writing.",
+    )
+    pull_live.add_argument(
         "--end-mode",
         choices=("index", "physical"),
         default="index",
@@ -2160,6 +2681,83 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prefix for the auto-generated /tmp output file when OUTPUT is omitted.",
     )
     pull_live.set_defaults(func=cmd_pull_live)
+
+    pull_full = subparsers.add_parser(
+        "pull-full",
+        help=(
+            "Pull the entire FLEXILOG.OLD+FLEXILOG.TXT event archive at once. "
+            "This is the oldest history still retained by the panel (typically well beyond "
+            "what the F-Link UI shows). Use --copy-files-dir to also save the raw FLEXILOG "
+            "files and LOGINDEX.BIN for offline re-decoding."
+        ),
+    )
+    pull_full.add_argument(
+        "output",
+        nargs="?",
+        help="Where to write the raw combined archive. Defaults to a timestamped file in /tmp.",
+    )
+    pull_full.add_argument("--metadata-output", help="Optional JSON metadata output path.")
+    pull_full.add_argument(
+        "--copy-files-dir",
+        help="Directory to copy FLEXILOG.OLD/TXT and LOGINDEX.BIN into (recommended for full pulls).",
+    )
+    pull_full.add_argument("--records-output", help="Optional JSONL/TSV dump of the CRLF-delimited archive records.")
+    pull_full.add_argument(
+        "--source-fdb",
+        help="Optional F-Link .fdb snapshot used to enrich decoded source labels for user events.",
+    )
+    pull_full.add_argument(
+        "--source-export-cfg",
+        help="Optional EXPORT.CFG blob used to enrich decoded user labels without relying on .fdb name tables.",
+    )
+    pull_full.add_argument(
+        "--decode-records",
+        action="store_true",
+        help="Include decoded event text in --records-output when possible.",
+    )
+    pull_full.add_argument(
+        "--records-format",
+        choices=("jsonl", "tsv"),
+        default="jsonl",
+        help="Format for --records-output.",
+    )
+    add_flexi_log_device_argument(pull_full)
+    pull_full.add_argument("--mountpoint", default=str(DEFAULT_FLEXI_LOG_MOUNTPOINT), help="Temporary mountpoint.")
+    pull_full.add_argument("--port", default="auto", help="HID port (default: auto).")
+    pull_full.add_argument("--auth-code", default="1812", help="Authorisation code for the live session.")
+    pull_full.add_argument("--no-reset", action="store_true", help="Skip the initial auth-end reset packet.")
+    pull_full.add_argument("--mount-tool", choices=("sudo", "udisksctl"), default="sudo")
+    pull_full.add_argument(
+        "--cleanup-mode",
+        choices=("auto", "none", "exit-only", "login-exit"),
+        default="auto",
+        help="How to close the post-read session (default: auto).",
+    )
+    pull_full.add_argument("--index-preview-count", type=int, default=8, help="How many latest index points to store in metadata.")
+    pull_full.add_argument("--record-preview-count", type=int, default=12, help="How many parsed record summaries to store in metadata.")
+    pull_full.add_argument("--crlf-preview-count", type=int, default=16, help="How many CRLF split lengths to include.")
+    pull_full.add_argument("--preview-limit", type=int, default=10, help="How many printable snippets to show.")
+    pull_full.add_argument("--verbose", action="store_true", help="Print observed HID packets.")
+    pull_full.add_argument(
+        "--output-prefix",
+        default="full_events",
+        help="Prefix for the auto-generated /tmp output file when OUTPUT is omitted.",
+    )
+    pull_full.add_argument(
+        "--keep-trailing-zeros",
+        action="store_true",
+        help=(
+            "Keep the preallocated zero tail in the output. By default pull-full strips the "
+            "trailing zero region so the archive and record dump only contain populated bytes."
+        ),
+    )
+    pull_full.set_defaults(
+        func=cmd_pull_full,
+        full=True,
+        transport="archive",
+        window_bytes=0,
+        end_mode="physical",
+    )
 
     recent = subparsers.add_parser(
         "recent",
@@ -2218,6 +2816,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recent.add_argument("--window-bytes", type=int, default=DEFAULT_WINDOW_BYTES, help="Combined archive window size.")
     recent.add_argument(
+        "--full",
+        action="store_true",
+        help="Pull the entire FLEXILOG.OLD+FLEXILOG.TXT archive (overrides --window-bytes and --end-mode).",
+    )
+    recent.add_argument(
+        "--strip-trailing-zeros",
+        action="store_true",
+        help="Trim the preallocated zero tail from the read archive before parsing/writing.",
+    )
+    recent.add_argument(
         "--end-mode",
         choices=("index", "physical"),
         default="physical",
@@ -2240,6 +2848,84 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prefix for the auto-generated /tmp output file when --output is omitted.",
     )
     recent.set_defaults(func=cmd_recent)
+
+    show = subparsers.add_parser(
+        "show",
+        help=(
+            "Render decoded event history as a colorized, user-friendly table. "
+            "Reads from a records.jsonl produced by pull-full/pull-live/recent "
+            "(--records), a raw archive window (--archive [--metadata]), or a "
+            "copied FLEXILOG files directory (--files-dir)."
+        ),
+    )
+    show_source = show.add_mutually_exclusive_group(required=True)
+    show_source.add_argument(
+        "--records",
+        help="Decoded JSONL produced by pull-full/pull-live/recent with --records-output --decode-records.",
+    )
+    show_source.add_argument(
+        "--archive",
+        help="Raw archive window (e.g. from pull-full). Pair with --metadata when possible.",
+    )
+    show_source.add_argument(
+        "--files-dir",
+        help="Directory containing FLEXILOG.OLD and FLEXILOG.TXT (e.g. from pull-full --copy-files-dir).",
+    )
+    show.add_argument("--metadata", help="Optional metadata JSON for --archive (provides window_start).")
+    show.add_argument("--base-offset", type=int, default=0, help="Logical archive offset of archive byte 0.")
+    show.add_argument(
+        "--source-fdb",
+        help="Optional F-Link .fdb snapshot used to enrich decoded source labels for user events.",
+    )
+    show.add_argument(
+        "--source-export-cfg",
+        help="Optional EXPORT.CFG blob used to enrich decoded user labels.",
+    )
+    show.add_argument(
+        "--format",
+        choices=("pretty", "plain", "tsv", "json"),
+        default="pretty",
+        help="Output format (default: colorized pretty table).",
+    )
+    show.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Colorization policy for pretty output (default: auto; also honors NO_COLOR/FORCE_COLOR env).",
+    )
+    show.add_argument("--events-only", action="store_true", help="Shortcut for showing only EVENT rows.")
+    show.add_argument("--include-raw", action="store_true", help="Include undecoded rows.")
+    show.add_argument(
+        "--kinds",
+        help="Comma-separated kinds to include: EVENT, INFO, RAW.",
+    )
+    show.add_argument(
+        "--exclude-kinds",
+        help="Comma-separated kinds to exclude: EVENT, INFO, RAW.",
+    )
+    show.add_argument("--since", help="Only show events on/after this date (YYYY-MM-DD, YYYYMMDD, or YYMMDD).")
+    show.add_argument("--until", help="Only show events on/before this date (YYYY-MM-DD, YYYYMMDD, or YYMMDD).")
+    show.add_argument("--grep", help="Regex to filter events by text/source/channel/section.")
+    show.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Make --grep case-sensitive (default: case-insensitive).",
+    )
+    show.add_argument("--limit", type=int, default=0, help="Limit output (0 = all matching records).")
+    show.add_argument("--reverse", action="store_true", help="Print newest records first.")
+    show.add_argument(
+        "--group-by-day",
+        action="store_true",
+        help="Insert a day separator each time the date changes.",
+    )
+    show.add_argument(
+        "--raw-timestamp",
+        action="store_true",
+        help="Keep the compact YYMMDD HH:MM:SS timestamp instead of pretty-printing it as YYYY-MM-DD.",
+    )
+    show.add_argument("--no-header", action="store_true", help="Suppress the pretty table header.")
+    show.add_argument("--no-summary", action="store_true", help="Suppress the trailing summary line.")
+    show.set_defaults(func=cmd_show)
 
     dump_index = subparsers.add_parser("dump-index", help="Print parsed LOGINDEX.BIN points.")
     dump_index.add_argument("index_bin", help="Path to LOGINDEX.BIN.")

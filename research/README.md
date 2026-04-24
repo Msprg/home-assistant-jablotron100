@@ -635,6 +635,26 @@ does not support pre-auth reading of the full config or user table.
 - Operator-facing `recent` defaults to `--transport archive` plus
   `--end-mode physical` because `LOGINDEX.BIN` can lag far behind the physical tail
   (2026-03-12 live runs all ended at stale logical offset `95758528`).
+- For full-history acquisition, `pull-full` reads the entire combined
+  `FLEXILOG.OLD+FLEXILOG.TXT` archive from offset `0`. The archive files are
+  fixed-size preallocated blobs, so the real content is whatever comes before the
+  zero tail; `pull-full` reports `populated_bytes`, `last_nonzero_offset`, and
+  `trailing_zero_bytes` and trims the zero tail by default. This typically
+  recovers months more history than the F-Link events-memory UI ever displays. On
+  this panel a single full pull recovered ~9 months of continuous events
+  (2024-06-19 through 2025-03-07, 157,668 `EVENT` records plus 311,054 `INFO`
+  records, in ~33 MB of populated archive bytes out of ~99 MB of preallocated
+  FLEXILOG.OLD+FLEXILOG.TXT file space).
+- To browse the pulled archive after the fact, `jablotron_event_tool.py show`
+  renders decoded records as a colorized table (kind/code/keyword-based styling
+  with CZ/SK localization, pretty-printed `YYYY-MM-DD HH:MM:SS` timestamps, and
+  optional `--group-by-day` banners). It accepts the pulled JSONL directly
+  (`--records ...records.jsonl`), a saved archive window (`--archive ...bin
+  --metadata ...json`), or a copied files directory (`--files-dir`). Filters
+  include `--since`/`--until`, `--grep`, `--events-only`, `--kinds`/
+  `--exclude-kinds`, `--limit`, and `--reverse`. Output is `--format pretty`
+  (default), `plain`, `tsv`, or `json`; color mode follows `--color auto|always|
+  never` plus the usual `NO_COLOR` / `FORCE_COLOR` env variables.
 
 Payload decoding:
 
@@ -742,7 +762,14 @@ Top-level scripts (all in the repo root):
 - **`jablotron_arc_tool.py`** - communicator-side service-access gate. Subcommands:
   `build-sector`, `set-live` (both with `--mode full|off|read`).
 - **`jablotron_event_tool.py`** - events memory. Subcommands: `recent`, `pull-live`
-  (`--transport archive|direct`), `extract-records` (`--decode`, `--display-format
+  (`--transport archive|direct`, `--full`), `pull-full` (convenience wrapper that
+  pulls the whole FLEXILOG.OLD+FLEXILOG.TXT archive, auto-strips the preallocated
+  zero tail, and reports `populated_bytes` / `last_nonzero_offset` so it is clear
+  how much of the preallocated archive actually contains events), `show` (render
+  decoded history as a colorized, user-friendly table with `--since`/`--until`
+  date filters, `--grep`, `--events-only`, `--kinds`/`--exclude-kinds`,
+  `--group-by-day`, `--reverse`, and `--format pretty|plain|tsv|json`; honors
+  `NO_COLOR` / `FORCE_COLOR`), `extract-records` (`--decode`, `--display-format
   table|tsv|json`), `align-export`, `dump-index`.
 - **`f_link_user_tool.py`** - authoritative user extraction from F-Link process
   dumps (`list-snapshots`, `extract-users`, `diff-users`).
@@ -791,6 +818,19 @@ python3 jablotron_event_tool.py recent --auth-code 1812 --events-only
 python3 jablotron_event_tool.py recent --auth-code 1812 --exclude-kinds INFO
 python3 jablotron_event_tool.py recent --transport archive --format tsv --limit 30
 python3 jablotron_event_tool.py pull-live      /tmp/live_events_archive.bin --records-output /tmp/live_events_records.jsonl
+# Pull the entire retained FLEXILOG.OLD+FLEXILOG.TXT archive at once (goes well beyond
+# what the F-Link UI shows; typically back to whenever the panel last rotated its log).
+python3 jablotron_event_tool.py pull-full /tmp/full_events/archive.bin \
+    --copy-files-dir /tmp/full_events/files \
+    --records-output /tmp/full_events/records.jsonl --decode-records
+# Render the pulled history as a colorized, paginated table (pipe to `less -R`
+# to scroll colors). Supports date / regex / kind filters and day grouping.
+python3 jablotron_event_tool.py show --records /tmp/full_events/records.jsonl \
+    --events-only --group-by-day --reverse | less -R
+python3 jablotron_event_tool.py show --records /tmp/full_events/records.jsonl \
+    --since 2024-11-01 --until 2025-01-31 --grep 'poplach|alarm|sabot'
+python3 jablotron_event_tool.py show --files-dir /tmp/full_events/files --events-only --format tsv \
+    > /tmp/full_events/events.tsv
 python3 jablotron_event_tool.py extract-records /tmp/live_events_archive.bin --metadata /tmp/live_events_archive.bin.json \
                                                --source-export-cfg research/exports/2026-03-07_live-service_EXPORT.CFG.bin \
                                                --decode --display-format tsv
