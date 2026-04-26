@@ -43,6 +43,7 @@ def build_client(args: argparse.Namespace) -> JablotronApiClient:
         token=args.token,
         verify=parse_verify(args.verify),
         cert=parse_cert(args),
+        timeout=args.timeout,
     )
 
 
@@ -219,6 +220,7 @@ def _connection_parent() -> argparse.ArgumentParser:
     parent.add_argument("--verify", default=argparse.SUPPRESS)
     parent.add_argument("--client-cert", default=argparse.SUPPRESS)
     parent.add_argument("--client-key", default=argparse.SUPPRESS)
+    parent.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
     parent.add_argument("--format", dest="output_format", choices=["json", "pretty"], default=argparse.SUPPRESS)
     return parent
 
@@ -336,6 +338,7 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
     args.verify = getattr(args, "verify", True)
     args.client_cert = getattr(args, "client_cert", None)
     args.client_key = getattr(args, "client_key", None)
+    args.timeout = getattr(args, "timeout", 30.0)
     args.output_format = getattr(args, "output_format", "pretty")
     client = build_client(args)
     try:

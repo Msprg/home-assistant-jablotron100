@@ -91,6 +91,8 @@ def test_client_cli_user_payload_direct_flags_and_json_file(tmp_path: Path) -> N
             "http://api.test",
             "--token",
             "token",
+            "--timeout",
+            "180",
             "--json",
             f"@{json_path}",
             "--name",
@@ -105,6 +107,7 @@ def test_client_cli_user_payload_direct_flags_and_json_file(tmp_path: Path) -> N
     )
 
     payload = _user_payload(args, include_id=True)
+    assert args.timeout == 180
     assert payload == {
         "id": 90,
         "name": "API REF TEST 90",

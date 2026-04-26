@@ -177,6 +177,14 @@
   - live event pulls initially read the archive but returned HTTP 500 because post-read cleanup ended in `0x80`; `jablotron_event_tool.py` now treats that non-configuration cleanup miss as a warning after a successful archive read, matching the existing export-read behavior
   - live user-management writes were intentionally skipped because reserved validation user ID `90` was already occupied by a non-test user
   - live section/PG control was intentionally not exercised in this pass
+- Follow-up live user validation on 2026-04-26 after freeing slot `90`:
+  - reference client confirmed slot `90` was absent before testing
+  - API-backed `POST /v1/users` for slot `90` still returned `409` after import verification because the post-write export did not contain the new user
+  - lower-level `jablotron_user_tool.py add 90 --name ...` succeeded against the same live panel and authoritative refetch showed user `90`, proving the underlying import primitive still works
+  - API-backed `PATCH /v1/users/90` also failed verification when attempted against the low-level-created user
+  - lower-level `jablotron_user_tool.py delete 90` succeeded afterwards, and a final export confirmed `raw_matches_user90 0`
+  - live section/PG control remained intentionally untested
+  - the reference client now exposes `--timeout` so live write calls can wait longer than the default 30 seconds while this API write-path issue is investigated
 
 ## Latest Decisions / Assumptions
 - Use the current proven helper stack first, then progressively internalize logic into the new package.
@@ -215,6 +223,7 @@
 - Hardened live event-log reads so a successful archive read is not discarded solely because non-configuration cleanup ended in `0x80`.
 - Demo smoke validation passed for health/system/status/users/events/export/tokens/WebSocket plus demo user, section, and PG writes.
 - Live validation passed for read-only server/client paths and event pulling; user writes were skipped because reserved slot `90` was occupied.
+- Follow-up live validation found that API-backed user writes still fail verification for newly freed slot `90`, while the lower-level user tool can add and delete that slot successfully. The panel was left with user `90` absent.
 
 ### 2026-03-29
 - De-duplicated the Home Assistant integration codebases:
