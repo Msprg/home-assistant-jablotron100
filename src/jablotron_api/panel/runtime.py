@@ -1019,6 +1019,7 @@ class PanelRuntime:
         return user.cards[0] if user.cards else ""
 
     def _verify_added_user(self, user: UserModel, payload: UserCreateModel) -> None:
+        requested_fields = set(payload.model_fields_set) | {"name"}
         checks = {
             "name": user.name == payload.name,
             "phone": user.phone == payload.phone,
@@ -1031,7 +1032,7 @@ class PanelRuntime:
             "pgs": user.pg_ids == payload.pgs,
             "time_limited_group_raw": user.time_limited_group_raw == payload.time_limited_group_raw,
         }
-        mismatches = [field for field, ok in checks.items() if not ok]
+        mismatches = [field for field, ok in checks.items() if field in requested_fields and not ok]
         if mismatches:
             raise RuntimeError(
                 f"User {payload.id} post-add verification failed for: {', '.join(mismatches)}."

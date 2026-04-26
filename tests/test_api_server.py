@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
@@ -1381,6 +1382,24 @@ def test_user_mutation_verification_failures_return_conflict(tmp_path: Path) -> 
         headers={"Authorization": f"Bearer {token}"},
     )
     assert delete_response.status_code == 409
+
+
+def test_panel_runtime_add_user_verification_ignores_omitted_optional_fields() -> None:
+    runtime = object.__new__(PanelRuntime)
+    user = UserModel(
+        id=90,
+        name="API REF TEST 90",
+        flags_raw=0,
+        access_raw=0,
+        enabled=True,
+        rights="coNoAccess",
+        time_limited_group_raw=0,
+    )
+
+    runtime._verify_added_user(user, UserCreateModel(id=90, name="API REF TEST 90"))
+
+    with pytest.raises(RuntimeError, match="access_raw"):
+        runtime._verify_added_user(user, UserCreateModel(id=90, name="API REF TEST 90", access_raw=811))
 
 
 def test_scope_tls_extension_certificate_binding(tmp_path: Path) -> None:

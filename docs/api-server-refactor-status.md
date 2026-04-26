@@ -179,12 +179,18 @@
   - live section/PG control was intentionally not exercised in this pass
 - Follow-up live user validation on 2026-04-26 after freeing slot `90`:
   - reference client confirmed slot `90` was absent before testing
-  - API-backed `POST /v1/users` for slot `90` still returned `409` after import verification because the post-write export did not contain the new user
+  - API-backed `POST /v1/users` for slot `90` initially returned `409`
   - lower-level `jablotron_user_tool.py add 90 --name ...` succeeded against the same live panel and authoritative refetch showed user `90`, proving the underlying import primitive still works
-  - API-backed `PATCH /v1/users/90` also failed verification when attempted against the low-level-created user
+  - API-backed `PATCH /v1/users/90` also initially failed verification when attempted against the low-level-created user
   - lower-level `jablotron_user_tool.py delete 90` succeeded afterwards, and a final export confirmed `raw_matches_user90 0`
   - live section/PG control remained intentionally untested
-  - the reference client now exposes `--timeout` so live write calls can wait longer than the default 30 seconds while this API write-path issue is investigated
+  - the reference client now exposes `--timeout` so live write calls can wait longer than the default 30 seconds
+- Follow-up live user validation on 2026-04-27:
+  - root cause found in the server add verification path: `UserCreateModel` defaults were being compared as exact requested values, so omitted raw fields such as `flags_raw`, `access_raw`, and `time_limited_group_raw` caused a false `409` after the panel wrote concrete defaults
+  - `PanelRuntime._verify_added_user()` now verifies `name` plus only optional fields explicitly supplied by the API caller
+  - the server was run against the live panel on `https://127.0.0.1:9447` with `JABLOTRON_PANEL_AUTH_CODE=1812`
+  - reference client live user flow passed for reserved slot `90`: absent check, create, patch with `code=9090`, `access_raw=811`, sections `1,2`, PGs `1,2`, read-back verification, delete, and final absent check
+  - the panel was left with user `90` absent
 
 ## Latest Decisions / Assumptions
 - Use the current proven helper stack first, then progressively internalize logic into the new package.
@@ -211,6 +217,11 @@
 6. Keep future API-backed Home Assistant fixes in the `jablotron100-api-HASS` submodule only; do not mirror them into the root `custom_components/jablotron100` legacy/reference tree.
 
 ## Progress Log
+### 2026-04-27
+- Fixed the API-backed live user create verification bug by distinguishing omitted optional create fields from fields explicitly requested by the API caller.
+- Added regression coverage for create verification when the panel supplies concrete defaults for omitted raw fields.
+- Re-ran live reference-client user management against slot `90`; create, patch, read-back verification, delete, and final absent check passed, with no live section/PG control exercised.
+
 ### 2026-04-26
 - Expanded the reference API client from a smoke-test wrapper into a full `/v1` operator client:
   - structured non-2xx error handling
