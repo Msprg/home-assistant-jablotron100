@@ -191,6 +191,12 @@
   - the server was run against the live panel on `https://127.0.0.1:9447` with `JABLOTRON_PANEL_AUTH_CODE=1812`
   - reference client live user flow passed for reserved slot `90`: absent check, create, patch with `code=9090`, `access_raw=811`, sections `1,2`, PGs `1,2`, read-back verification, delete, and final absent check
   - the panel was left with user `90` absent
+- Live Rack/PG 15 control validation on 2026-04-27:
+  - the server was run against the live panel on `https://127.0.0.1:9448` with `JABLOTRON_PANEL_AUTH_CODE=1812`
+  - initial state was Rack section `5` = `armed_away` and PG `15` = `off`
+  - PG `15` was toggled `off -> on -> off` and each state was verified through the API status response
+  - Rack section `5` was toggled `armed_away -> disarmed -> armed_away` and each state was verified through the API status response
+  - final read-back confirmed Rack section `5` was restored to `armed_away` and PG `15` was restored to `off`
 
 ## Latest Decisions / Assumptions
 - Use the current proven helper stack first, then progressively internalize logic into the new package.
@@ -221,6 +227,7 @@
 - Fixed the API-backed live user create verification bug by distinguishing omitted optional create fields from fields explicitly requested by the API caller.
 - Added regression coverage for create verification when the panel supplies concrete defaults for omitted raw fields.
 - Re-ran live reference-client user management against slot `90`; create, patch, read-back verification, delete, and final absent check passed, with no live section/PG control exercised.
+- Re-ran live section/PG control validation during an approved maintenance window: Rack section `5` and PG `15` both changed state successfully and were restored to their original states.
 
 ### 2026-04-26
 - Expanded the reference API client from a smoke-test wrapper into a full `/v1` operator client:
