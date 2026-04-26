@@ -2356,9 +2356,11 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
             if final_mode != EXITED_SECTIONS_MODE:
                 if final_mode == CONFIGURATION_SECTIONS_MODE:
                     raise SystemExit(configuration_in_use_message())
-                raise SystemExit(
-                    "Event-session cleanup did not reach the exited state "
-                    f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {describe_sections_mode(final_mode)})."
+                print(
+                    "warning: event-session cleanup did not reach the exited state "
+                    f"(expected 0x{EXITED_SECTIONS_MODE:02x}, got {describe_sections_mode(final_mode)}); "
+                    "continuing because the event archive was already read successfully.",
+                    file=sys.stderr,
                 )
 
 

@@ -171,6 +171,12 @@
     - rebuilt the Docker container
     - performed an immediate `docker stop` followed by `docker start`
     - startup completed cleanly with no `configuration-active (0x94)` warning
+- Verified the expanded reference client against the connected live panel on 2026-04-26:
+  - live server started on `https://127.0.0.1:9446` using the local development mTLS certificates
+  - reference client successfully read `health`, `system`, `status`, `devices`, `export-catalog`, `users list`, `users get 90`, and `events recent`
+  - live event pulls initially read the archive but returned HTTP 500 because post-read cleanup ended in `0x80`; `jablotron_event_tool.py` now treats that non-configuration cleanup miss as a warning after a successful archive read, matching the existing export-read behavior
+  - live user-management writes were intentionally skipped because reserved validation user ID `90` was already occupied by a non-test user
+  - live section/PG control was intentionally not exercised in this pass
 
 ## Latest Decisions / Assumptions
 - Use the current proven helper stack first, then progressively internalize logic into the new package.
@@ -206,6 +212,9 @@
 - Reduced client CLI drift by delegating packaged server client usage through the shared client CLI module instead of separate `client-status` / `client-users` code paths.
 - Fixed demo runtime PG control parity with the live runtime call shape so FastAPI demo-mode PG routes accept the same `code` and token user-binding arguments.
 - Added regression coverage for the reference client, CLI payload parsing, and demo-mode PG control.
+- Hardened live event-log reads so a successful archive read is not discarded solely because non-configuration cleanup ended in `0x80`.
+- Demo smoke validation passed for health/system/status/users/events/export/tokens/WebSocket plus demo user, section, and PG writes.
+- Live validation passed for read-only server/client paths and event pulling; user writes were skipped because reserved slot `90` was occupied.
 
 ### 2026-03-29
 - De-duplicated the Home Assistant integration codebases:
