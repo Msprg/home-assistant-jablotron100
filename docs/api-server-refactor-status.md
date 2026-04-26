@@ -105,7 +105,7 @@
   - restored thermostat/thermometer state entities
   - restored legacy device-type inference for glass-break / garage-door / valve-style devices
   - Home Assistant-side per-device type overrides, including ignored `other` devices
-- Current local result after the latest implementation pass: `53 passed` via `venv/bin/pytest -q`
+- Current local result after the latest implementation pass: `75 passed` via `venv/bin/pytest -q`
 - Remaining test gaps:
   - runtime integration against mocked RE helper failures
   - Home Assistant integration behavior
@@ -197,6 +197,16 @@
 6. Keep future API-backed Home Assistant fixes in the `jablotron100-api-HASS` submodule only; do not mirror them into the root `custom_components/jablotron100` legacy/reference tree.
 
 ## Progress Log
+### 2026-04-26
+- Expanded the reference API client from a smoke-test wrapper into a full `/v1` operator client:
+  - structured non-2xx error handling
+  - users/events/export/token/control/WebSocket helpers
+  - packaged `jablotron-api-client` entrypoint
+  - root `jablotron_api_client_tool.py` retained as a compatibility launcher
+- Reduced client CLI drift by delegating packaged server client usage through the shared client CLI module instead of separate `client-status` / `client-users` code paths.
+- Fixed demo runtime PG control parity with the live runtime call shape so FastAPI demo-mode PG routes accept the same `code` and token user-binding arguments.
+- Added regression coverage for the reference client, CLI payload parsing, and demo-mode PG control.
+
 ### 2026-03-29
 - De-duplicated the Home Assistant integration codebases:
   - removed the duplicated API-backed runtime/client from the root `custom_components/jablotron100` tree

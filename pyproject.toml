@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 jablotron-api-server = "jablotron_api.cli.main:main"
+jablotron-api-client = "jablotron_api.cli.client:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

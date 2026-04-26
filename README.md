@@ -48,7 +48,7 @@ docker run --rm -p 8443:8443 \
 python3 jablotron_api_admin_tool.py --db-path ./data/jablotron-api.db --label alpha-admin
 ```
 
-5. Verify the API with the reference thin wrappers:
+5. Verify the API with the reference client:
 
 ```bash
 python3 jablotron_api_client_tool.py system \
@@ -65,6 +65,21 @@ python3 jablotron_api_client_tool.py status \
   --client-cert ./data/certs/client.crt \
   --client-key ./data/certs/client.key
 ```
+
+The packaged entrypoint is also available after installation:
+
+```bash
+jablotron-api-client events recent --limit 20 \
+  --base-url https://127.0.0.1:8443 \
+  --token YOUR_TOKEN \
+  --verify ./data/certs/ca.crt \
+  --client-cert ./data/certs/client.crt \
+  --client-key ./data/certs/client.key
+```
+
+The reference client covers the full `/v1` API surface, including `users list|get|create|patch|delete`,
+`tokens list|create|revoke`, `export-catalog`, `export-time-limits`, `export-communications`,
+section/PG control, and WebSocket subscriptions.
 
 6. Switch `JABLOTRON_API_RUNTIME_MODE=live` and provide the panel USB/block devices to start validating the real hardware path.
 

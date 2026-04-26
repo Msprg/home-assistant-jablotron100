@@ -320,7 +320,15 @@ class DemoPanelRuntime:
         self._events.insert(0, EventRecordModel(timestamp=_utc_now(), kind="EVENT", text=f"Section {section_id} disarmed", source="demo", section=str(section_id)))
         return await self.refresh_status()
 
-    async def set_pg(self, pg_id: int, enabled: bool) -> PanelStatusModel:
+    async def set_pg(
+        self,
+        pg_id: int,
+        enabled: bool,
+        code: str | None = None,
+        *,
+        allowed_user_ids: list[int] | None = None,
+    ) -> PanelStatusModel:
+        del code, allowed_user_ids
         self._ensure_usable_pg_id(pg_id)
         for pg in self._status.pgs:
             if pg.id == pg_id:

@@ -1,6 +1,5 @@
 """Reference client."""
 
-from .api import JablotronApiClient
+from .api import JablotronApiClient, JablotronApiError
 
-__all__ = ["JablotronApiClient"]
-
+__all__ = ["JablotronApiClient", "JablotronApiError"]
