@@ -10,3 +10,4 @@ DEVELOPMENT_SETUP.md
 /.env
 .gitmodules
 /data/
+/docker-compose.yml
