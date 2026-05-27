@@ -11,3 +11,4 @@ DEVELOPMENT_SETUP.md
 .gitmodules
 /data/
 /docker-compose.yml
+/.vscode/
