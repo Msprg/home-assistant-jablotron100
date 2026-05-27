@@ -240,6 +240,23 @@ def ensure_serial_port(port: str | None) -> str:
             raise SystemExit("Unable to auto-detect Jablotron USB interface. Use --port with /dev/hidrawX.")
         _LOGGER.info("Detected Jablotron USB port at %s", detected)
         return detected
+    # Configured path: trust if it exists on disk. This covers Docker bind
+    # mounts and udev symlinks (e.g. /dev/jablotron) which cannot be
+    # verified via sysfs. If the path is missing, fall back to autodetection
+    # so the runtime survives a /dev/hidrawN renumbering across reboots.
+    if not os.path.exists(port):
+        _LOGGER.warning(
+            "Configured serial port %s does not exist; attempting auto-detection",
+            port,
+        )
+        detected = Jablotron.detect_serial_port()
+        if detected is None:
+            raise SystemExit(
+                f"Configured serial port {port} is missing and auto-detection "
+                "found no Jablotron USB device."
+            )
+        _LOGGER.warning("Using auto-detected serial port %s instead of configured %s", detected, port)
+        return detected
     return port
 
 

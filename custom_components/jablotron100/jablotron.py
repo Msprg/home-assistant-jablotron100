@@ -22,7 +22,6 @@ from homeassistant.helpers.typing import StateType
 from homeassistant.helpers import entity_registry as er
 import math
 import os
-import sys
 import threading
 import time
 from .const import (
@@ -96,6 +95,7 @@ from .const import (
 	STREAM_MAX_WORKERS,
 	STREAM_PACKET_SIZE,
 	STREAM_TIMEOUT,
+	SYSTEM_DEVICE_NUMBER_RESERVED_MIN,
 	SectionPrimaryState,
 	SystemInfo,
 	TIMEOUT_FOR_DEVICE_STATE_PACKETS,
@@ -279,6 +279,28 @@ class Jablotron:
 		else:
 			self._serial_port = self._config[CONF_SERIAL_PORT]
 
+			# The hidraw device numbering can change across reboots when other
+			# USB HID devices are connected. If the configured path no longer
+			# exists, transparently fall back to autodetection by USB
+			# vendor/product ID so the user does not have to reconfigure. We
+			# only trigger the fallback when the configured device node is
+			# missing — custom paths (e.g. Docker bind-mounts like
+			# /dev/jablotron or udev symlinks) cannot be verified via sysfs
+			# and must be trusted as long as they exist.
+			if not await self._hass.async_add_executor_job(os.path.exists, self._serial_port):
+				LOGGER.warning(
+					"Configured serial port %s does not exist, attempting autodetection",
+					self._serial_port,
+				)
+				detected_serial_port = await self._detect_serial_port()
+				if detected_serial_port is not None:
+					LOGGER.warning(
+						"Using autodetected serial port %s instead of configured %s",
+						detected_serial_port,
+						self._config[CONF_SERIAL_PORT],
+					)
+					self._serial_port = detected_serial_port
+
 		self._detect_central_unit()
 		await self._detect_and_create_devices_and_sections_and_pg_outputs()
 		self._create_central_unit_sensors()
@@ -336,25 +358,28 @@ class Jablotron:
 		self._successful_login = True
 
 		def after_modify_callback(_) -> None:
-			self._send_packet(self.create_packet_command(COMMAND_GET_SECTIONS_AND_PG_OUTPUTS_STATES))
+			# Runs on the event loop; offload the blocking serial I/O.
+			self._hass.async_add_executor_job(
+				self._send_packet,
+				self.create_packet_command(COMMAND_GET_SECTIONS_AND_PG_OUTPUTS_STATES),
+			)
 
 		def after_login_callback(_) -> None:
+			# Runs on the event loop; offload the blocking serial I/O.
+			packets_to_send: List[bytes] = []
+
 			if self._successful_login is True:
 				modify_packet = self.int_to_bytes(int_packets[state] + section)
-				self._send_packet(self.create_packet_ui_control(UI_CONTROL_MODIFY_SECTION, modify_packet))
+				packets_to_send.append(self.create_packet_ui_control(UI_CONTROL_MODIFY_SECTION, modify_packet))
 
 			if code != self._config[CONF_PASSWORD]:
-				logout_packets = [self.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END)]
-				logout_packets.extend(self.create_packets_keepalive(self._config[CONF_PASSWORD]))
+				packets_to_send.append(self.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END))
+				packets_to_send.extend(self.create_packets_keepalive(self._config[CONF_PASSWORD]))
 
-				self._send_packets(logout_packets)
+			if packets_to_send:
+				self._hass.async_add_executor_job(self._send_packets, packets_to_send)
 
-			self._hass.loop.call_soon_threadsafe(
-				async_call_later,
-				self._hass,
-				1.0,
-				after_modify_callback,
-			)
+			async_call_later(self._hass, 1.0, after_modify_callback)
 
 		if code != self._config[CONF_PASSWORD]:
 			login_packets = [
@@ -371,7 +396,9 @@ class Jablotron:
 				after_login_callback,
 			)
 		else:
-			after_login_callback(None)
+			# Run the callback on the event loop so it can use async_call_later
+			# and async_add_executor_job safely from any caller thread.
+			self._hass.loop.call_soon_threadsafe(after_login_callback, None)
 
 	def toggle_pg_output(self, pg_output_number: int, state: str) -> None:
 		pg_output_number_packet = self.int_to_bytes(pg_output_number - 1)
@@ -955,8 +982,10 @@ class Jablotron:
 				self._create_packet_device_diagnostics_force_info(device_number),
 			])
 
-			while not self._stream_diagnostics_event.wait(0.5):
-				break
+			# Wait up to 2 seconds for the diagnostics response packet.
+			# The previous "while ... wait(0.5): break" pattern always exited
+			# after a single 0.5s wait regardless of whether the event fired.
+			self._stream_diagnostics_event.wait(2.0)
 
 			self._send_packet(self._create_packet_device_diagnostics_end(device_number))
 
@@ -1336,7 +1365,10 @@ class Jablotron:
 			return
 
 		if device_number > self._config[CONF_NUMBER_OF_DEVICES]:
-			self._log_error_with_packet("State packet of unknown device", packet)
+			if device_number >= SYSTEM_DEVICE_NUMBER_RESERVED_MIN:
+				self._log_debug_with_packet("State packet of system device", packet)
+			else:
+				self._log_error_with_packet("State packet of unknown device", packet)
 			return
 
 		device_type = self._get_device_type(device_number)
@@ -1420,7 +1452,10 @@ class Jablotron:
 		if device_number in (lan_connection_number, gsm_device_number):
 			pass
 		elif device_number > self._config[CONF_NUMBER_OF_DEVICES]:
-			self._log_error_with_packet("Info packet of unknown device", packet)
+			if device_number >= SYSTEM_DEVICE_NUMBER_RESERVED_MIN:
+				self._log_debug_with_packet("Info packet of system device", packet)
+			else:
+				self._log_error_with_packet("Info packet of unknown device", packet)
 			return
 
 		subpackets = self._parse_device_info_subpackets_from_device_info_packet(packet)
@@ -2643,7 +2678,7 @@ class Jablotron:
 
 	@staticmethod
 	def bytes_to_int(packet: bytes) -> int:
-		return int.from_bytes(packet, byteorder=sys.byteorder)
+		return int.from_bytes(packet, byteorder="little")
 
 	@staticmethod
 	def bytes_to_float(packet: bytes) -> float:
@@ -2655,7 +2690,7 @@ class Jablotron:
 
 	@staticmethod
 	def int_to_bytes(number: int) -> bytes:
-		return int.to_bytes(number, 1, byteorder=sys.byteorder)
+		return int.to_bytes(number, 1, byteorder="little")
 
 	@staticmethod
 	def create_packet(packet_type: bytes, data: bytes) -> bytes:
