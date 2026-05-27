@@ -24,6 +24,7 @@ from jablotron_api.domain.models import (
     UserModel,
     UserPatchModel,
 )
+from jablotron_api.services.catalog_io import ensure_id_in_range
 
 
 StatusListener = Callable[[str, dict], Awaitable[None]]
@@ -171,34 +172,13 @@ class DemoPanelRuntime:
         ]
 
     def _ensure_usable_section_id(self, section_id: int) -> None:
-        section_range = self._catalog.initial_setup.sections if self._catalog.initial_setup is not None else None
-        if section_range is None:
-            return
-        if not section_range.first_id <= section_id <= section_range.last_id:
-            raise ValueError(
-                f"Section {section_id} is outside the client-facing usable range "
-                f"{section_range.first_id}-{section_range.last_id}."
-            )
+        ensure_id_in_range(self._catalog.initial_setup, kind="Section", attr="sections", value=section_id)
 
     def _ensure_usable_pg_id(self, pg_id: int) -> None:
-        pg_range = self._catalog.initial_setup.pgs if self._catalog.initial_setup is not None else None
-        if pg_range is None:
-            return
-        if not pg_range.first_id <= pg_id <= pg_range.last_id:
-            raise ValueError(
-                f"PG {pg_id} is outside the client-facing usable range "
-                f"{pg_range.first_id}-{pg_range.last_id}."
-            )
+        ensure_id_in_range(self._catalog.initial_setup, kind="PG", attr="pgs", value=pg_id)
 
     def _ensure_usable_user_id(self, user_id: int) -> None:
-        user_range = self._catalog.initial_setup.users if self._catalog.initial_setup is not None else None
-        if user_range is None:
-            return
-        if not user_range.first_id <= user_id <= user_range.last_id:
-            raise ValueError(
-                f"User {user_id} is outside the client-facing usable range "
-                f"{user_range.first_id}-{user_range.last_id}."
-            )
+        ensure_id_in_range(self._catalog.initial_setup, kind="User", attr="users", value=user_id)
 
     async def start(self) -> None:
         await self._emit("system", dict(self._system_info))

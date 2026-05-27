@@ -409,23 +409,51 @@ class PanelRuntime:
 
     # ---------------------------------------------------------------- control
 
+    _ARM_ACTIONS = {
+        ArmMode.AWAY: "arm_away",
+        ArmMode.HOME: "arm_home",
+        ArmMode.NIGHT: "arm_night",
+    }
+
     async def arm_section(self, section_id: int, mode: ArmMode, code: str | None = None) -> PanelStatusModel:
+        return await self._invoke_section_control(
+            section_id=section_id,
+            action=self._ARM_ACTIONS[mode],
+            code=code,
+            op="arm_section",
+            log_detail=f"mode={mode.value}",
+        )
+
+    async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
+        return await self._invoke_section_control(
+            section_id=section_id,
+            action="disarm",
+            code=code,
+            op="disarm_section",
+            log_detail="",
+        )
+
+    async def _invoke_section_control(
+        self,
+        *,
+        section_id: int,
+        action: str,
+        code: str | None,
+        op: str,
+        log_detail: str,
+    ) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
         effective_code = await self._effective_control_code(code)
         user = await self._find_user_for_code(effective_code)
         await self._ensure_code_can_control_section(effective_code, section_id)
         LOGGER.info(
-            "Panel arm_section requested: section=%s mode=%s code_source=%s resolved_user=%s",
+            "Panel %s requested: section=%s %scode_source=%s resolved_user=%s",
+            op,
             section_id,
-            mode.value,
+            f"{log_detail} " if log_detail else "",
             "explicit" if code and code.strip() else "service_default",
             None if user is None else user.id,
         )
-        action = {
-            ArmMode.AWAY: "arm_away",
-            ArmMode.HOME: "arm_home",
-            ArmMode.NIGHT: "arm_night",
-        }[mode]
         async with self._lock:
             session = self._status_session
             if session is None:
@@ -437,32 +465,7 @@ class PanelRuntime:
                 action=action,
                 code=effective_code,
             )
-        LOGGER.info("Panel arm_section completed: section=%s mode=%s", section_id, mode.value)
-        return await self.refresh_status()
-
-    async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
-        self._ensure_usable_section_id(section_id)
-        effective_code = await self._effective_control_code(code)
-        user = await self._find_user_for_code(effective_code)
-        await self._ensure_code_can_control_section(effective_code, section_id)
-        LOGGER.info(
-            "Panel disarm_section requested: section=%s code_source=%s resolved_user=%s",
-            section_id,
-            "explicit" if code and code.strip() else "service_default",
-            None if user is None else user.id,
-        )
-        async with self._lock:
-            session = self._status_session
-            if session is None:
-                session = self._create_status_session()
-                self._status_session = session
-            await asyncio.to_thread(
-                session.control_section,
-                section_id=section_id,
-                action="disarm",
-                code=effective_code,
-            )
-        LOGGER.info("Panel disarm_section completed: section=%s", section_id)
+        LOGGER.info("Panel %s completed: section=%s %s", op, section_id, log_detail)
         return await self.refresh_status()
 
     async def set_pg(
