@@ -1,5 +1,11 @@
 # Jablotron API Server Refactor Status
 
+## v1 lock
+
+The `/v1` REST + WebSocket schema is now locked for the public alpha. The authoritative description lives in `docs/openapi.v1.json`; regenerate with `venv/bin/python -m jablotron_api.cli.main openapi-export docs/openapi.v1.json`. Stability guarantees and the scope vocabulary are documented in the top-of-README "v1 stability promise" section.
+
+Package version: `1.0.0a1` (`src/jablotron_api/__init__.py` and `pyproject.toml`).
+
 ## Objective
 - Merge the current Home Assistant integration and reverse-engineering work into a maintainable Python API server with a server-backed Home Assistant client integration.
 
@@ -222,7 +228,29 @@
 5. Add a documented migration step for any users who tested the earlier alpha API runtime with the pre-parity control IDs.
 6. Keep future API-backed Home Assistant fixes in the `jablotron100-api-HASS` submodule only; do not mirror them into the root `custom_components/jablotron100` legacy/reference tree.
 
+## Deferred to v1.1
+
+These items from the v1-lock refactor plan were intentionally deferred so the v1 alpha could ship from a known-stable state. They are tracked here so future work picks them up explicitly:
+
+- **A6 — thin root-level CLI wrappers**: `jablotron_user_tool.py`, `jablotron_event_tool.py`, `export_cfg_tool.py`, `import_cfg_tool.py` still own their own argparse surfaces alongside the new `services/user_manager.py`, `services/event_reader.py`, and `services/catalog_io.py`. The service modules are the single source of truth for the mutation logic the API server uses; the root CLIs reuse the same low-level primitives directly. Thinning them further would require lifting their CLI-specific report formatters into the package and was judged not worth the v1-window churn.
+- **B2 — split `api_runtime.py`**: the 861-line Home Assistant `api_runtime.py` was kept as one module in v1.0.0a1. The audit found it well-structured; splitting it carries non-trivial risk to entity unique-ID stability for installed users. Targeted cleanup (dead `jablotron.py` removed, platform setup helper, dropped sync entity methods, enum-derived device-type labels) is in. The deeper coordinator/entity-registry/ws-loop split remains on the v1.1 roadmap.
+
 ## Progress Log
+### 2026-05-27
+- Completed the v1-lock refactor pass on the API server and the HACS integration:
+  - **A1** — Extracted `src/jablotron_api/services/{device_inference,catalog_io,event_reader,user_manager}.py` from `PanelRuntime`. The 1211-line runtime became ~500 lines of orchestration with the service modules owning the actual conversion/CRUD/event logic. `_infer_device_type`, `_catalog_to_model`, `_apply_catalog_names`, `_user_to_model` re-exported from `panel.runtime` for test compatibility.
+  - **A2** — `PanelRuntime.arm_section` and `disarm_section` collapsed to one `_invoke_section_control` helper. `DemoPanelRuntime`'s three identical `_ensure_usable_*_id` helpers now delegate to `services.catalog_io.ensure_id_in_range`, matching the live runtime.
+  - **A3** — `server/app.py` route handlers refactored: introduced `_execute_runtime_call` which collapses the repeated scope-check + log-request + try/except/HTTP-map + audit-write + log-complete block used by arm/disarm/pg_on/pg_off/add_user/edit_user/delete_user. Token-aware serializers moved into `domain/serialization.py`. WebSocket subscribe handshake split into `_handle_ws_subscribe` + `_send_ws_snapshot`.
+  - **A4** — Scope vocabulary redesigned as a strict resource:action hierarchy. Breaking changes: `status:read` removed (split into `sections:read`, `pgs:read`, `devices:read`); `sections:control` split into `sections:arm` and `sections:disarm`; `catalog:read OR config:read` alias on `/v1/export/catalog` removed; `codes:impersonate` now applied uniformly across section and PG control whenever the supplied code differs from the server auth code. `TokenStore` runs `migrate_scope_list` once at startup to rewrite legacy tokens in place, logging one warning per token. Migration test verifies a pre-v1 token comes back with the v1 scopes after store re-open.
+  - **A5** — `/v1/events/recent` is now a deprecated alias for `/v1/events`. New `openapi-export` CLI subcommand generates `docs/openapi.v1.json`; that file is checked in as the canonical v1 surface description. README gains a "v1 stability promise" paragraph.
+  - **B1** — Deleted the dead 2830-line `jablotron.py` from the HACS submodule (pre-API-migration HID/serial protocol code; verified no live module imports it). Trimmed `const.py` to drop ~150 lines of legacy `PACKET_*`/`COMMAND_*`/`UI_CONTROL_*` constants and supporting enums. The `EntityType.POWER_SUPPLY = "power_supple"` string-value typo was deliberately left intact because changing it would break installed entity identity.
+  - **B3** — New `platform_setup.py` with `setup_entity_platform(...)` removes boilerplate `add_entities`+`async_dispatcher_connect` blocks from all five platforms. Dropped dead sync `alarm_arm_*`/`alarm_disarm` and `turn_on`/`turn_off` methods now that the async overrides are authoritative. `event.py:trigger_event` uses `async_write_ha_state` to match the rest.
+  - **B5** — `DEVICE_TYPE_OPTION_LABELS` in the integration's `config_flow.py` is now generated from the `DeviceType` enum via `get_name()` instead of a hardcoded mirror list.
+- Package version bumped to `1.0.0a1` (`pyproject.toml`, `src/jablotron_api/__init__.py`). The HACS submodule manifest version was left at its existing track to preserve update continuity for installed users.
+- Test suite expanded from 75 → 77 passing tests; the additions cover the legacy-scope migration and the new strict catalog-read scope enforcement. Compileall passes on the integration package and the server package.
+- A6 (thin root-level CLI wrappers) and B2 (deep `api_runtime.py` split) were intentionally deferred to v1.1 — see the "Deferred to v1.1" section above for rationale.
+- Live hardware re-validation against the connected JA-107K panel and an end-to-end Home Assistant alpha run against the v1 server are the remaining gates before tagging `v1.0.0` proper.
+
 ### 2026-04-27
 - Fixed the API-backed live user create verification bug by distinguishing omitted optional create fields from fields explicitly requested by the API caller.
 - Added regression coverage for create verification when the panel supplies concrete defaults for omitted raw fields.
