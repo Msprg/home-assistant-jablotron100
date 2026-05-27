@@ -235,6 +235,21 @@ These items from the v1-lock refactor plan were intentionally deferred so the v1
 - **A6 — thin root-level CLI wrappers**: `jablotron_user_tool.py`, `jablotron_event_tool.py`, `export_cfg_tool.py`, `import_cfg_tool.py` still own their own argparse surfaces alongside the new `services/user_manager.py`, `services/event_reader.py`, and `services/catalog_io.py`. The service modules are the single source of truth for the mutation logic the API server uses; the root CLIs reuse the same low-level primitives directly. Thinning them further would require lifting their CLI-specific report formatters into the package and was judged not worth the v1-window churn.
 - **B2 — split `api_runtime.py`**: the 861-line Home Assistant `api_runtime.py` was kept as one module in v1.0.0a1. The audit found it well-structured; splitting it carries non-trivial risk to entity unique-ID stability for installed users. Targeted cleanup (dead `jablotron.py` removed, platform setup helper, dropped sync entity methods, enum-derived device-type labels) is in. The deeper coordinator/entity-registry/ws-loop split remains on the v1.1 roadmap.
 
+## Planned: Home Assistant Add-on packaging
+
+In addition to the standalone Docker/native server, the API server is intended to ship as a Home Assistant Add-on so users with a single HA OS box can plug the panel USB directly into that box, install the add-on, and connect the integration to it locally — no separate Raspberry Pi or mini-PC needed.
+
+Implications to keep in mind from now on so we do not paint the add-on into a corner:
+
+- **mTLS must remain optional, not mandatory.** When the add-on binds to localhost only (or to HA Supervisor's internal network), mTLS is overkill and a friction multiplier for casual users. `ServerSettings.mtls_required` is currently hardcoded `True`; in the add-on path it needs to be controllable via the add-on options schema (mapped to env). Native/docker paths can keep mTLS-on as their default.
+- **Configuration must be env-driven end to end.** HA add-on options are surfaced to the container as `/data/options.json`; the standard pattern is an `run.sh` that reads that file and exports env vars before launching the server. Our current strict-env model (`JABLOTRON_PANEL_AUTH_CODE`, etc.) is the right shape for this; do not add CLI-flag-only knobs that bypass env.
+- **Token bootstrap needs an add-on-friendly path.** Today `bootstrap-token` is a separate CLI invocation against the SQLite store. For the add-on, the natural UX is "the add-on prints a startup token on first run" or a small admin endpoint that the integration's config flow can call. The current CLI path stays; the add-on layer should add a startup-token print on its own.
+- **USB device exposure**: HA add-on config supports `devices:` and `usb:` declarations. Our existing requirement (`/dev/hidraw*`, plus the FLEXI block devices for export/log pulls) maps to that; no code change needed, but the add-on config.yaml will need to declare them and the user will pick the host devices via the add-on UI.
+- **Persistent state at `/data`**: already matches HA add-on conventions (the add-on `/data` directory is the canonical persistent store).
+- **Custom repository distribution**: the add-on can be hosted in a separate small repo (e.g. `Msprg/hassio-addon-jablotron-api`) referencing our `jablotron-api-server` Docker image. The add-on Dockerfile typically extends a base image and runs `pip install jablotron-api-server`; this works as soon as we publish the package to PyPI or push the built image to a registry.
+
+No code changes needed right now to support this; the requirements above are forward-looking guardrails so v1.x decisions don't accidentally rule it out.
+
 ## Progress Log
 ### 2026-05-27
 - Completed the v1-lock refactor pass on the API server and the HACS integration:
