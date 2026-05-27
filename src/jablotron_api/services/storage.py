@@ -12,7 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from jablotron_api.domain.models import DEFAULT_ADMIN_SCOPES, AuthenticatedToken, TokenInfoModel
+from jablotron_api.domain.models import (
+    DEFAULT_ADMIN_SCOPES,
+    AuthenticatedToken,
+    TokenInfoModel,
+    migrate_scope_list,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +37,7 @@ class TokenStore:
         self._path = path
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self._migrate_legacy_scopes()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -78,6 +84,40 @@ class TokenStore:
             if "allowed_user_ids_json" not in token_columns:
                 conn.execute("ALTER TABLE tokens ADD COLUMN allowed_user_ids_json TEXT NOT NULL DEFAULT '[]'")
             conn.commit()
+
+    def _migrate_legacy_scopes(self) -> None:
+        """Rewrite legacy scope names on existing tokens to their v1 equivalents.
+
+        Idempotent; safe to run on every startup. Logs once per rewritten
+        token. Remove after the v1 lock window has comfortably passed.
+        """
+
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id, label, scopes_json FROM tokens").fetchall()
+            rewrites: list[tuple[str, str, str]] = []
+            for row in rows:
+                try:
+                    scopes = json.loads(row["scopes_json"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(scopes, list):
+                    continue
+                new_scopes, changed = migrate_scope_list([str(s) for s in scopes])
+                if changed:
+                    rewrites.append((row["id"], row["label"], json.dumps(new_scopes)))
+            for token_id, label, payload in rewrites:
+                conn.execute(
+                    "UPDATE tokens SET scopes_json = ? WHERE id = ?",
+                    (payload, token_id),
+                )
+                LOGGER.warning(
+                    "Rewrote legacy scopes on token: token=%s (%s) new_scopes=%s",
+                    label,
+                    token_id,
+                    payload,
+                )
+            if rewrites:
+                conn.commit()
 
     def create_token(
         self,

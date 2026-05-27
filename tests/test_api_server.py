@@ -310,10 +310,12 @@ def test_catalog_read_with_users_read_redacts_codes_without_sensitive_scope(tmp_
     assert response.json()["users"][0]["code"] == ""
 
 
-def test_config_read_remains_backward_compatible_for_catalog_endpoint(tmp_path: Path) -> None:
+def test_export_catalog_now_requires_catalog_read_only(tmp_path: Path) -> None:
+    # v1 lock: the historic catalog:read OR config:read alias was removed.
+    # config:read alone must now be rejected for /v1/export/catalog.
     runtime = FakeRuntime()
     store = TokenStore(tmp_path / "tokens.db")
-    token, _ = store.create_token(label="legacy-config-reader", scopes=[Scope.CONFIG_READ.value])
+    token, _ = store.create_token(label="config-only", scopes=[Scope.CONFIG_READ.value])
     app = create_app(
         settings=ServerSettings(db_path=tmp_path / "tokens.db"),
         runtime=runtime,
@@ -322,8 +324,8 @@ def test_config_read_remains_backward_compatible_for_catalog_endpoint(tmp_path: 
     client = TestClient(app)
 
     response = client.get("/v1/export/catalog", headers={"Authorization": f"Bearer {token}"})
-    assert response.status_code == 200
-    assert response.json()["users"] == []
+    assert response.status_code == 403
+    assert response.json()["detail"]["missing"] == [Scope.CATALOG_READ.value]
 
 
 def test_control_endpoints_forward_supplied_code(tmp_path: Path) -> None:
@@ -1274,7 +1276,15 @@ def test_persistent_snapshot_session_system_info_reuses_existing_login(monkeypat
 def test_scope_denial_revocation_and_certificate_binding(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     store = TokenStore(tmp_path / "tokens.db")
-    readonly_token, readonly_info = store.create_token(label="readonly", scopes=[Scope.STATUS_READ.value, Scope.SYSTEM_READ.value])
+    readonly_token, readonly_info = store.create_token(
+        label="readonly",
+        scopes=[
+            Scope.SECTIONS_READ.value,
+            Scope.PGS_READ.value,
+            Scope.DEVICES_READ.value,
+            Scope.SYSTEM_READ.value,
+        ],
+    )
     cert_token, _ = store.create_token(
         label="cert-bound",
         scopes=[Scope.SYSTEM_READ.value],
@@ -1318,7 +1328,11 @@ def test_section_control_ack_failure_returns_conflict(tmp_path: Path) -> None:
     store = TokenStore(tmp_path / "tokens.db")
     token, _ = store.create_token(
         label="controller",
-        scopes=[Scope.SECTIONS_CONTROL.value, Scope.CODES_IMPERSONATE.value],
+        scopes=[
+            Scope.SECTIONS_ARM.value,
+            Scope.SECTIONS_DISARM.value,
+            Scope.CODES_IMPERSONATE.value,
+        ],
     )
     app = create_app(
         settings=ServerSettings(db_path=tmp_path / "tokens.db"),
@@ -1499,3 +1513,57 @@ def test_connection_manager_close_all_closes_connected_websockets() -> None:
     websocket_a.close.assert_awaited_once_with(code=1001, reason="server shutdown")
     websocket_b.close.assert_awaited_once_with(code=1001, reason="server shutdown")
     assert manager._connections == {}
+
+
+def test_legacy_scope_migration_rewrites_old_token_names(tmp_path: Path) -> None:
+    """Tokens minted with pre-v1 scope names (status:read, sections:control)
+    should be transparently rewritten on next TokenStore startup."""
+
+    import json
+    import sqlite3
+    import secrets
+
+    db_path = tmp_path / "tokens.db"
+    # First initialize the schema by constructing a store, then close.
+    TokenStore(db_path)
+
+    # Insert a token with legacy scopes directly, simulating a pre-v1 token.
+    legacy_scopes = ["status:read", "sections:control", "codes:impersonate"]
+    raw_token = secrets.token_urlsafe(16)
+    from jablotron_api.services.storage import token_hash
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO tokens (
+                id, label, token_hash, scopes_json, certificate_fingerprint,
+                allowed_user_ids_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy01",
+                "legacy",
+                token_hash(raw_token),
+                json.dumps(legacy_scopes),
+                None,
+                "[]",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Re-open the store; migration should run during __init__.
+    store = TokenStore(db_path)
+    token = store.authenticate(raw_token)
+    assert token is not None
+    assert set(token.scopes) == {
+        "sections:read",
+        "pgs:read",
+        "devices:read",
+        "sections:arm",
+        "sections:disarm",
+        "codes:impersonate",
+    }

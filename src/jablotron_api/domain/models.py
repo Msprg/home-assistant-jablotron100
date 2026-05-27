@@ -14,17 +14,23 @@ def utc_now() -> datetime:
 
 
 class Scope(StrEnum):
+    # read
     SYSTEM_READ = "system:read"
-    STATUS_READ = "status:read"
+    SECTIONS_READ = "sections:read"
+    PGS_READ = "pgs:read"
+    DEVICES_READ = "devices:read"
+    USERS_READ = "users:read"
+    USERS_CODES_READ = "users:codes:read"
     EVENTS_READ = "events:read"
     CATALOG_READ = "catalog:read"
     CONFIG_READ = "config:read"
-    USERS_READ = "users:read"
-    USERS_CODES_READ = "users:codes:read"
-    USERS_WRITE = "users:write"
-    SECTIONS_CONTROL = "sections:control"
+    # write / control
+    SECTIONS_ARM = "sections:arm"
+    SECTIONS_DISARM = "sections:disarm"
     PGS_CONTROL = "pgs:control"
+    USERS_WRITE = "users:write"
     CODES_IMPERSONATE = "codes:impersonate"
+    # admin
     TOKENS_ADMIN = "tokens:admin"
 
 
@@ -32,19 +38,61 @@ DEFAULT_ADMIN_SCOPES = [
     scope.value
     for scope in (
         Scope.SYSTEM_READ,
-        Scope.STATUS_READ,
+        Scope.SECTIONS_READ,
+        Scope.PGS_READ,
+        Scope.DEVICES_READ,
+        Scope.USERS_READ,
+        Scope.USERS_CODES_READ,
         Scope.EVENTS_READ,
         Scope.CATALOG_READ,
         Scope.CONFIG_READ,
-        Scope.USERS_READ,
-        Scope.USERS_CODES_READ,
-        Scope.USERS_WRITE,
-        Scope.SECTIONS_CONTROL,
+        Scope.SECTIONS_ARM,
+        Scope.SECTIONS_DISARM,
         Scope.PGS_CONTROL,
+        Scope.USERS_WRITE,
         Scope.CODES_IMPERSONATE,
         Scope.TOKENS_ADMIN,
     )
 ]
+
+
+# Legacy → v1 scope migration. Keys are removed scope names; values are
+# the v1 replacements (granted as a set). Applied once at storage startup
+# so existing tokens transparently keep equivalent authority.
+LEGACY_SCOPE_MIGRATION: dict[str, tuple[str, ...]] = {
+    "status:read": (
+        Scope.SECTIONS_READ.value,
+        Scope.PGS_READ.value,
+        Scope.DEVICES_READ.value,
+    ),
+    "sections:control": (
+        Scope.SECTIONS_ARM.value,
+        Scope.SECTIONS_DISARM.value,
+    ),
+}
+
+
+def migrate_scope_list(scopes: list[str]) -> tuple[list[str], bool]:
+    """Apply LEGACY_SCOPE_MIGRATION to a scope list, preserving order.
+
+    Returns (new_scopes, changed)."""
+
+    seen: set[str] = set()
+    out: list[str] = []
+    changed = False
+    for scope in scopes:
+        replacements = LEGACY_SCOPE_MIGRATION.get(scope)
+        if replacements is None:
+            if scope not in seen:
+                out.append(scope)
+                seen.add(scope)
+            continue
+        changed = True
+        for replacement in replacements:
+            if replacement not in seen:
+                out.append(replacement)
+                seen.add(replacement)
+    return out, changed
 
 
 class ArmMode(StrEnum):

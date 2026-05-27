@@ -30,9 +30,6 @@ from jablotron_api.domain.models import (
     UserPatchModel,
 )
 from jablotron_api.domain.serialization import (
-    can_read_catalog,
-    can_read_user_codes,
-    can_read_users,
     serialize_catalog,
     serialize_users,
     serialize_ws_payload,
@@ -41,18 +38,19 @@ from jablotron_api.panel.demo import DemoPanelRuntime
 from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
 from jablotron_api.server.ws import ConnectionManager
-from jablotron_api.services.auth import require_any_scope, require_scopes
+from jablotron_api.services.auth import require_scopes
 from jablotron_api.services.storage import TokenStore
 
 LOGGER = logging.getLogger(__name__)
 
 
-TOPIC_SCOPES: dict[str, str] = {
-    "status": Scope.STATUS_READ.value,
-    "events": Scope.EVENTS_READ.value,
-    "users": Scope.USERS_READ.value,
-    "catalog": Scope.CATALOG_READ.value,
-    "system": Scope.SYSTEM_READ.value,
+TOPIC_SCOPES: dict[str, tuple[str, ...]] = {
+    # status topic carries sections+pgs+devices; consumers need all three read scopes
+    "status": (Scope.SECTIONS_READ.value, Scope.PGS_READ.value, Scope.DEVICES_READ.value),
+    "events": (Scope.EVENTS_READ.value,),
+    "users": (Scope.USERS_READ.value,),
+    "catalog": (Scope.CATALOG_READ.value,),
+    "system": (Scope.SYSTEM_READ.value,),
 }
 
 
@@ -78,10 +76,10 @@ def _token_log_label(token: AuthenticatedToken) -> str:
 
 
 def _authorize_topic(token: AuthenticatedToken, topic: str) -> bool:
-    if topic == "catalog":
-        return can_read_catalog(token)
-    required_scope = TOPIC_SCOPES.get(topic)
-    return required_scope is None or required_scope in token.scopes
+    required_scopes = TOPIC_SCOPES.get(topic)
+    if required_scopes is None:
+        return True
+    return all(scope in token.scopes for scope in required_scopes)
 
 
 _RUNTIME_ERROR_MAP: tuple[tuple[type[Exception], int], ...] = (
@@ -240,10 +238,13 @@ def create_app(
         LOGGER.info("%s completed: token=%s resource=%s %s", op, token_label, resource, summary)
         return result
 
-    def _require_section_control(token: AuthenticatedToken, code: str | None) -> None:
-        require_scopes(token, Scope.SECTIONS_CONTROL.value)
-        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
-            require_scopes(token, Scope.CODES_IMPERSONATE.value)
+    def _require_section_arm(token: AuthenticatedToken, code: str | None) -> None:
+        require_scopes(token, Scope.SECTIONS_ARM.value)
+        _maybe_require_impersonate(token, code)
+
+    def _require_section_disarm(token: AuthenticatedToken, code: str | None) -> None:
+        require_scopes(token, Scope.SECTIONS_DISARM.value)
+        _maybe_require_impersonate(token, code)
 
     def _require_pg_control(token: AuthenticatedToken, code: str | None) -> None:
         require_scopes(token, Scope.PGS_CONTROL.value)
@@ -252,7 +253,11 @@ def create_app(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="PG control requires an explicit panel code.",
             )
-        require_scopes(token, Scope.CODES_IMPERSONATE.value)
+        _maybe_require_impersonate(token, code)
+
+    def _maybe_require_impersonate(token: AuthenticatedToken, code: str | None) -> None:
+        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
+            require_scopes(token, Scope.CODES_IMPERSONATE.value)
 
     async def build_system_payload(token: AuthenticatedToken) -> ServerSystemModel:
         require_scopes(token, Scope.SYSTEM_READ.value)
@@ -279,22 +284,27 @@ def create_app(
 
     @app.get("/v1/status")
     async def status_snapshot(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.STATUS_READ.value)
+        require_scopes(
+            token,
+            Scope.SECTIONS_READ.value,
+            Scope.PGS_READ.value,
+            Scope.DEVICES_READ.value,
+        )
         return await runtime.get_status()
 
     @app.get("/v1/sections")
     async def sections(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.STATUS_READ.value)
+        require_scopes(token, Scope.SECTIONS_READ.value)
         return (await runtime.get_status()).sections
 
     @app.get("/v1/pgs")
     async def pgs(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.STATUS_READ.value)
+        require_scopes(token, Scope.PGS_READ.value)
         return (await runtime.get_status()).pgs
 
     @app.get("/v1/devices")
     async def devices(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.STATUS_READ.value)
+        require_scopes(token, Scope.DEVICES_READ.value)
         return (await runtime.get_status()).devices
 
     @app.post("/v1/sections/{section_id}/arm")
@@ -304,7 +314,7 @@ def create_app(
         code: str | None = Query(default=None),
         token: AuthenticatedToken = Depends(require_token),
     ):
-        _require_section_control(token, code)
+        _require_section_arm(token, code)
         return await _execute_runtime_call(
             token=token,
             op="arm_section",
@@ -323,7 +333,7 @@ def create_app(
         code: str | None = Query(default=None),
         token: AuthenticatedToken = Depends(require_token),
     ):
-        _require_section_control(token, code)
+        _require_section_disarm(token, code)
         return await _execute_runtime_call(
             token=token,
             op="disarm_section",
@@ -447,7 +457,7 @@ def create_app(
 
     @app.get("/v1/export/catalog")
     async def export_catalog(token: AuthenticatedToken = Depends(require_token)):
-        require_any_scope(token, Scope.CATALOG_READ.value, Scope.CONFIG_READ.value)
+        require_scopes(token, Scope.CATALOG_READ.value)
         return serialize_catalog(await runtime.get_catalog(), token)
 
     @app.get("/v1/export/time-limits")

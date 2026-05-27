@@ -22,7 +22,7 @@ def can_read_user_codes(token: AuthenticatedToken) -> bool:
 
 
 def can_read_catalog(token: AuthenticatedToken) -> bool:
-    return _has_scope(token, Scope.CATALOG_READ) or _has_scope(token, Scope.CONFIG_READ)
+    return _has_scope(token, Scope.CATALOG_READ)
 
 
 def serialize_users(users: list, token: AuthenticatedToken) -> list[dict]:

@@ -151,7 +151,13 @@ def test_demo_runtime_pg_control_accepts_server_call_shape(tmp_path: Path) -> No
     store = TokenStore(tmp_path / "tokens.db")
     token, _ = store.create_token(
         label="demo-pg",
-        scopes=[Scope.PGS_CONTROL.value, Scope.CODES_IMPERSONATE.value, Scope.STATUS_READ.value],
+        scopes=[
+            Scope.PGS_CONTROL.value,
+            Scope.CODES_IMPERSONATE.value,
+            Scope.SECTIONS_READ.value,
+            Scope.PGS_READ.value,
+            Scope.DEVICES_READ.value,
+        ],
     )
     app = create_app(
         settings=ServerSettings(db_path=tmp_path / "tokens.db", runtime_mode="demo"),
