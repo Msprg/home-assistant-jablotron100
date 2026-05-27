@@ -251,6 +251,26 @@ Implications to keep in mind from now on so we do not paint the add-on into a co
 No code changes needed right now to support this; the requirements above are forward-looking guardrails so v1.x decisions don't accidentally rule it out.
 
 ## Progress Log
+### 2026-05-27 (afternoon — refactor live validation + promotion + upstream fixes)
+- Live read-only validation against the connected JA-107K panel through the refactored server:
+  - panel system info, sections (6), PGs (20), devices (50), users (82, codes redacted/visible per scope), events, and export-catalog (`main_config` decoded exactly: sections=6, pgs=20, devices=50, users=100, system_name correct)
+  - WebSocket subscribe topic-scope filtering verified (a `sections:read` only token is denied the composite `status` topic, gets the per-resource snapshot it was authorised for)
+  - the new resource:action scope split (sections:read / pgs:read / devices:read; sections:arm vs sections:disarm) confirmed end to end including a freshly-minted narrow-scope token receiving 403 with `{"error":"missing_scopes","missing":[...]}`
+  - legacy-scope token migration ran transparently on the shared `.dev-data/jablotron-api.db` (~27 pre-v1 tokens rewritten to v1 names at startup, one warning logged per rewrite)
+- Live control cycle against the connected JA-107K (mutations restored at end):
+  - Section 5: disarmed → armed_away → disarmed, each transition verified via `/v1/status`
+  - PG 15: on → off → on, each transition verified
+  - User CRUD on reserved slot 90 hit the same intermittent `apply_import_sector` flakiness recorded in the 2026-04-26 entry ("write raised [Errno 5]; continuing because staged bytes verified exactly" followed by post-write export not finding the new user); this is in the underlying import primitive, not introduced by the refactor (the refactor only moves the call site into `services/user_manager.py`). Slot 90 remained absent after the failed add.
+- Docker validation:
+  - built `jablotron-api-server:test`; demo-mode container smoke passed (system/sections/arm/pg-on/WS over mTLS); live-mode startup correctly errors with no `JABLOTRON_PANEL_AUTH_CODE` set, matching the new strict env check
+  - promoted `:test → :latest` and restarted compose; production HA reconnected cleanly on the new image with its existing token (auto-migrated to v1 scopes on store open)
+- Environment scrub (so the package does not ship installation-specific defaults):
+  - removed the hardcoded `1812` panel auth code from `PanelRuntimeConfig` and `PanelSettings`; live runtime now raises a clear startup error if `JABLOTRON_PANEL_AUTH_CODE` is unset
+  - replaced `brainit.tech` example domain with `YOUR_DOMAIN` placeholder in docs and `scripts/generate-dev-certs.sh`
+  - added `.env.example`; gitignored `/data/` (runtime SQLite DB) and `/docker-compose.yml` (local installation-specific copy) — `docker-compose.yml.example` is the published template
+- Five upstream fixes ported from `kukulich/home-assistant-jablotron100` master (commits e685fbc, f5bba03, 27e73a9, 4623e14+976d34d, a8947cd). See the commit body for the per-fix mapping into our refactored stack. All 77 tests pass.
+- HA Add-on packaging deferred but documented as a future deployment target with the one architectural guardrail it imposes (`ServerSettings.mtls_required` must become env-controllable).
+
 ### 2026-05-27
 - Completed the v1-lock refactor pass on the API server and the HACS integration:
   - **A1** — Extracted `src/jablotron_api/services/{device_inference,catalog_io,event_reader,user_manager}.py` from `PanelRuntime`. The 1211-line runtime became ~500 lines of orchestration with the service modules owning the actual conversion/CRUD/event logic. `_infer_device_type`, `_catalog_to_model`, `_apply_catalog_names`, `_user_to_model` re-exported from `panel.runtime` for test compatibility.
