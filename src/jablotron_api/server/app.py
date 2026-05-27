@@ -1,11 +1,22 @@
-"""Application factory."""
+"""FastAPI application factory."""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import logging
+from typing import Any, Awaitable, Callable
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
 from jablotron_api import __version__
 from jablotron_api.domain.models import (
@@ -18,15 +29,73 @@ from jablotron_api.domain.models import (
     UserCreateModel,
     UserPatchModel,
 )
+from jablotron_api.domain.serialization import (
+    can_read_catalog,
+    can_read_user_codes,
+    can_read_users,
+    serialize_catalog,
+    serialize_users,
+    serialize_ws_payload,
+)
 from jablotron_api.panel.demo import DemoPanelRuntime
 from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
 from jablotron_api.server.ws import ConnectionManager
-from jablotron_api.services.auth import require_scopes
-from jablotron_api.services.auth import require_any_scope
+from jablotron_api.services.auth import require_any_scope, require_scopes
 from jablotron_api.services.storage import TokenStore
 
 LOGGER = logging.getLogger(__name__)
+
+
+TOPIC_SCOPES: dict[str, str] = {
+    "status": Scope.STATUS_READ.value,
+    "events": Scope.EVENTS_READ.value,
+    "users": Scope.USERS_READ.value,
+    "catalog": Scope.CATALOG_READ.value,
+    "system": Scope.SYSTEM_READ.value,
+}
+
+
+def _tls_fingerprint_from_scope(scope: dict) -> str | None:
+    extensions = scope.get("extensions")
+    if not isinstance(extensions, dict):
+        return None
+    tls_extension = extensions.get(TLS_EXTENSION_KEY)
+    if not isinstance(tls_extension, dict):
+        return None
+    fingerprint = tls_extension.get("client_cert_fingerprint_sha256")
+    return fingerprint if isinstance(fingerprint, str) and fingerprint else None
+
+
+def _short_fingerprint(fingerprint: str | None) -> str | None:
+    if not fingerprint:
+        return None
+    return f"{fingerprint[:12]}..."
+
+
+def _token_log_label(token: AuthenticatedToken) -> str:
+    return f"{token.label} ({token.id})"
+
+
+def _authorize_topic(token: AuthenticatedToken, topic: str) -> bool:
+    if topic == "catalog":
+        return can_read_catalog(token)
+    required_scope = TOPIC_SCOPES.get(topic)
+    return required_scope is None or required_scope in token.scopes
+
+
+_RUNTIME_ERROR_MAP: tuple[tuple[type[Exception], int], ...] = (
+    (PermissionError, status.HTTP_403_FORBIDDEN),
+    (ValueError, status.HTTP_400_BAD_REQUEST),
+    (RuntimeError, status.HTTP_409_CONFLICT),
+)
+
+
+def _http_status_for(exc: Exception) -> int | None:
+    for exception_type, http_status in _RUNTIME_ERROR_MAP:
+        if isinstance(exc, exception_type):
+            return http_status
+    return None
 
 
 def create_app(
@@ -46,52 +115,6 @@ def create_app(
     token_store = token_store or TokenStore(settings.db_path)
     ws_manager = ConnectionManager()
 
-    def _has_scope(token: AuthenticatedToken, scope: str) -> bool:
-        return scope in token.scopes
-
-    def _can_read_catalog(token: AuthenticatedToken) -> bool:
-        return _has_scope(token, Scope.CATALOG_READ.value) or _has_scope(token, Scope.CONFIG_READ.value)
-
-    def _can_read_users(token: AuthenticatedToken) -> bool:
-        return _has_scope(token, Scope.USERS_READ.value)
-
-    def _can_read_user_codes(token: AuthenticatedToken) -> bool:
-        return _has_scope(token, Scope.USERS_CODES_READ.value)
-
-    def _serialize_users(users: list, token: AuthenticatedToken) -> list[dict]:
-        include_codes = _can_read_user_codes(token)
-        return [
-            user.model_dump(mode="json") if include_codes else user.model_copy(update={"code": ""}).model_dump(mode="json")
-            for user in users
-        ]
-
-    def _serialize_catalog(catalog, token: AuthenticatedToken) -> dict:
-        users_payload = []
-        if _can_read_users(token):
-            users_payload = _serialize_users(catalog.users, token)
-        return catalog.model_dump(mode="json", exclude={"users"}) | {"users": users_payload}
-
-    def _authorize_topic(token: AuthenticatedToken, topic: str) -> bool:
-        if topic == "catalog":
-            return _can_read_catalog(token)
-        required_scope = topic_scopes.get(topic)
-        return required_scope is None or _has_scope(token, required_scope)
-
-    def _serialize_ws_payload(token: AuthenticatedToken, topic: str, payload: dict) -> dict:
-        if topic == "catalog":
-            users_payload = []
-            if _can_read_users(token):
-                users_payload = [
-                    user_payload if _can_read_user_codes(token) else {**user_payload, "code": ""}
-                    for user_payload in payload.get("users", [])
-                ]
-            return {**payload, "users": users_payload}
-        if topic == "users":
-            if _can_read_user_codes(token):
-                return payload
-            return [{**user_payload, "code": ""} for user_payload in payload]
-        return payload
-
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         LOGGER.info(
@@ -109,7 +132,7 @@ def create_app(
                 topic,
                 "update",
                 payload,
-                transform=lambda metadata, broadcast_topic, broadcast_payload: _serialize_ws_payload(
+                transform=lambda metadata, broadcast_topic, broadcast_payload: serialize_ws_payload(
                     metadata["token"],
                     broadcast_topic,
                     broadcast_payload,
@@ -135,32 +158,6 @@ def create_app(
     app.state.token_store = token_store
     app.state.ws_manager = ws_manager
     app.state.settings = settings
-
-    topic_scopes = {
-        "status": Scope.STATUS_READ.value,
-        "events": Scope.EVENTS_READ.value,
-        "users": Scope.USERS_READ.value,
-        "catalog": Scope.CATALOG_READ.value,
-        "system": Scope.SYSTEM_READ.value,
-    }
-
-    def _tls_fingerprint_from_scope(scope: dict) -> str | None:
-        extensions = scope.get("extensions")
-        if not isinstance(extensions, dict):
-            return None
-        tls_extension = extensions.get(TLS_EXTENSION_KEY)
-        if not isinstance(tls_extension, dict):
-            return None
-        fingerprint = tls_extension.get("client_cert_fingerprint_sha256")
-        return fingerprint if isinstance(fingerprint, str) and fingerprint else None
-
-    def _short_fingerprint(fingerprint: str | None) -> str | None:
-        if not fingerprint:
-            return None
-        return f"{fingerprint[:12]}..."
-
-    def _token_log_label(token: AuthenticatedToken) -> str:
-        return f"{token.label} ({token.id})"
 
     def certificate_fingerprint_from_request(
         request: Request,
@@ -190,7 +187,10 @@ def create_app(
                 request.url.path,
                 _short_fingerprint(fingerprint),
             )
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token or certificate binding.")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token or certificate binding.",
+            )
         LOGGER.debug(
             "HTTP authentication ok: method=%s path=%s token=%s scopes=%s fingerprint=%s",
             request.method,
@@ -200,6 +200,59 @@ def create_app(
             _short_fingerprint(fingerprint),
         )
         return token
+
+    async def _execute_runtime_call(
+        *,
+        token: AuthenticatedToken,
+        op: str,
+        resource: str,
+        audit_details: dict[str, Any],
+        runtime_callable: Callable[[], Awaitable[Any]],
+        log_summary: Callable[[Any], str] | None = None,
+    ) -> Any:
+        """Execute a panel-mutating runtime call with uniform logging,
+        runtime-error→HTTP mapping, and audit-trail emission."""
+
+        token_label = _token_log_label(token)
+        LOGGER.info("%s requested: token=%s resource=%s", op, token_label, resource)
+        try:
+            result = await runtime_callable()
+        except Exception as exc:
+            http_status = _http_status_for(exc)
+            if http_status is None:
+                raise
+            level = "denied" if http_status == status.HTTP_403_FORBIDDEN else (
+                "rejected" if http_status == status.HTTP_400_BAD_REQUEST else "failed"
+            )
+            LOGGER.warning(
+                "%s %s: token=%s resource=%s reason=%s",
+                op,
+                level,
+                token_label,
+                resource,
+                exc,
+            )
+            raise HTTPException(status_code=http_status, detail=str(exc)) from exc
+        token_store.write_audit(
+            token_id=token.id, action=op, resource=resource, details=audit_details
+        )
+        summary = log_summary(result) if log_summary is not None else "ok"
+        LOGGER.info("%s completed: token=%s resource=%s %s", op, token_label, resource, summary)
+        return result
+
+    def _require_section_control(token: AuthenticatedToken, code: str | None) -> None:
+        require_scopes(token, Scope.SECTIONS_CONTROL.value)
+        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
+            require_scopes(token, Scope.CODES_IMPERSONATE.value)
+
+    def _require_pg_control(token: AuthenticatedToken, code: str | None) -> None:
+        require_scopes(token, Scope.PGS_CONTROL.value)
+        if code is None or not code.strip():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="PG control requires an explicit panel code.",
+            )
+        require_scopes(token, Scope.CODES_IMPERSONATE.value)
 
     async def build_system_payload(token: AuthenticatedToken) -> ServerSystemModel:
         require_scopes(token, Scope.SYSTEM_READ.value)
@@ -251,171 +304,81 @@ def create_app(
         code: str | None = Query(default=None),
         token: AuthenticatedToken = Depends(require_token),
     ):
-        require_scopes(token, Scope.SECTIONS_CONTROL.value)
-        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
-            require_scopes(token, Scope.CODES_IMPERSONATE.value)
-        LOGGER.info(
-            "Section arm requested: token=%s section=%s mode=%s explicit_code=%s",
-            _token_log_label(token),
-            section_id,
-            mode.value,
-            bool(code and code.strip()),
+        _require_section_control(token, code)
+        return await _execute_runtime_call(
+            token=token,
+            op="arm_section",
+            resource=f"section:{section_id}",
+            audit_details={"mode": mode.value, "code_supplied": bool(code)},
+            runtime_callable=lambda: runtime.arm_section(section_id, mode, code=code),
+            log_summary=lambda updated: (
+                f"mode={mode.value} resulting_state="
+                + str(next((section.state for section in updated.sections if section.id == section_id), None))
+            ),
         )
-        try:
-            updated = await runtime.arm_section(section_id, mode, code=code)
-        except PermissionError as exc:
-            LOGGER.warning(
-                "Section arm denied: token=%s section=%s mode=%s reason=%s",
-                _token_log_label(token),
-                section_id,
-                mode.value,
-                exc,
-            )
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-        except ValueError as exc:
-            LOGGER.warning(
-                "Section arm rejected: token=%s section=%s mode=%s reason=%s",
-                _token_log_label(token),
-                section_id,
-                mode.value,
-                exc,
-            )
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning(
-                "Section arm failed: token=%s section=%s mode=%s reason=%s",
-                _token_log_label(token),
-                section_id,
-                mode.value,
-                exc,
-            )
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="arm_section", resource=f"section:{section_id}", details={"mode": mode.value, "code_supplied": bool(code)})
-        LOGGER.info(
-            "Section arm completed: token=%s section=%s mode=%s resulting_state=%s",
-            _token_log_label(token),
-            section_id,
-            mode.value,
-            next((section.state for section in updated.sections if section.id == section_id), None),
-        )
-        return updated
 
     @app.post("/v1/sections/{section_id}/disarm")
-    async def disarm_section(section_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.SECTIONS_CONTROL.value)
-        if code is not None and code.strip() and code.strip() != settings.panel.auth_code:
-            require_scopes(token, Scope.CODES_IMPERSONATE.value)
-        LOGGER.info(
-            "Section disarm requested: token=%s section=%s explicit_code=%s",
-            _token_log_label(token),
-            section_id,
-            bool(code and code.strip()),
+    async def disarm_section(
+        section_id: int,
+        code: str | None = Query(default=None),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
+        _require_section_control(token, code)
+        return await _execute_runtime_call(
+            token=token,
+            op="disarm_section",
+            resource=f"section:{section_id}",
+            audit_details={"code_supplied": bool(code)},
+            runtime_callable=lambda: runtime.disarm_section(section_id, code=code),
+            log_summary=lambda updated: "resulting_state=" + str(
+                next((section.state for section in updated.sections if section.id == section_id), None)
+            ),
         )
-        try:
-            updated = await runtime.disarm_section(section_id, code=code)
-        except PermissionError as exc:
-            LOGGER.warning(
-                "Section disarm denied: token=%s section=%s reason=%s",
-                _token_log_label(token),
-                section_id,
-                exc,
-            )
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-        except ValueError as exc:
-            LOGGER.warning(
-                "Section disarm rejected: token=%s section=%s reason=%s",
-                _token_log_label(token),
-                section_id,
-                exc,
-            )
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning(
-                "Section disarm failed: token=%s section=%s reason=%s",
-                _token_log_label(token),
-                section_id,
-                exc,
-            )
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="disarm_section", resource=f"section:{section_id}", details={"code_supplied": bool(code)})
-        LOGGER.info(
-            "Section disarm completed: token=%s section=%s resulting_state=%s",
-            _token_log_label(token),
-            section_id,
-            next((section.state for section in updated.sections if section.id == section_id), None),
-        )
-        return updated
 
     @app.post("/v1/pgs/{pg_id}/on")
-    async def pg_on(pg_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.PGS_CONTROL.value)
-        if code is None or not code.strip():
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PG control requires an explicit panel code.")
-        require_scopes(token, Scope.CODES_IMPERSONATE.value)
-        LOGGER.info(
-            "PG on requested: token=%s pg=%s explicit_code=%s allowed_user_ids=%s",
-            _token_log_label(token),
-            pg_id,
-            True,
-            token.allowed_user_ids,
+    async def pg_on(
+        pg_id: int,
+        code: str | None = Query(default=None),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
+        _require_pg_control(token, code)
+        return await _execute_runtime_call(
+            token=token,
+            op="pg_on",
+            resource=f"pg:{pg_id}",
+            audit_details={"code_supplied": bool(code)},
+            runtime_callable=lambda: runtime.set_pg(
+                pg_id, True, code=code, allowed_user_ids=token.allowed_user_ids
+            ),
+            log_summary=lambda updated: "resulting_state=" + str(
+                next((pg.state for pg in updated.pgs if pg.id == pg_id), None)
+            ),
         )
-        try:
-            updated = await runtime.set_pg(pg_id, True, code=code, allowed_user_ids=token.allowed_user_ids)
-        except PermissionError as exc:
-            LOGGER.warning("PG on denied: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-        except ValueError as exc:
-            LOGGER.warning("PG on rejected: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning("PG on failed: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="pg_on", resource=f"pg:{pg_id}", details={"code_supplied": bool(code)})
-        LOGGER.info(
-            "PG on completed: token=%s pg=%s resulting_state=%s",
-            _token_log_label(token),
-            pg_id,
-            next((pg.state for pg in updated.pgs if pg.id == pg_id), None),
-        )
-        return updated
 
     @app.post("/v1/pgs/{pg_id}/off")
-    async def pg_off(pg_id: int, code: str | None = Query(default=None), token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(token, Scope.PGS_CONTROL.value)
-        if code is None or not code.strip():
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="PG control requires an explicit panel code.")
-        require_scopes(token, Scope.CODES_IMPERSONATE.value)
-        LOGGER.info(
-            "PG off requested: token=%s pg=%s explicit_code=%s allowed_user_ids=%s",
-            _token_log_label(token),
-            pg_id,
-            True,
-            token.allowed_user_ids,
+    async def pg_off(
+        pg_id: int,
+        code: str | None = Query(default=None),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
+        _require_pg_control(token, code)
+        return await _execute_runtime_call(
+            token=token,
+            op="pg_off",
+            resource=f"pg:{pg_id}",
+            audit_details={"code_supplied": bool(code)},
+            runtime_callable=lambda: runtime.set_pg(
+                pg_id, False, code=code, allowed_user_ids=token.allowed_user_ids
+            ),
+            log_summary=lambda updated: "resulting_state=" + str(
+                next((pg.state for pg in updated.pgs if pg.id == pg_id), None)
+            ),
         )
-        try:
-            updated = await runtime.set_pg(pg_id, False, code=code, allowed_user_ids=token.allowed_user_ids)
-        except PermissionError as exc:
-            LOGGER.warning("PG off denied: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-        except ValueError as exc:
-            LOGGER.warning("PG off rejected: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning("PG off failed: token=%s pg=%s reason=%s", _token_log_label(token), pg_id, exc)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="pg_off", resource=f"pg:{pg_id}", details={"code_supplied": bool(code)})
-        LOGGER.info(
-            "PG off completed: token=%s pg=%s resulting_state=%s",
-            _token_log_label(token),
-            pg_id,
-            next((pg.state for pg in updated.pgs if pg.id == pg_id), None),
-        )
-        return updated
 
     @app.get("/v1/users")
     async def users(token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.USERS_READ.value)
-        return _serialize_users(await runtime.get_users(), token)
+        return serialize_users(await runtime.get_users(), token)
 
     @app.get("/v1/users/{user_id}")
     async def user(user_id: int, token: AuthenticatedToken = Depends(require_token)):
@@ -423,54 +386,44 @@ def create_app(
         result = await runtime.get_user(user_id)
         if result is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
-        return _serialize_users([result], token)[0]
+        return serialize_users([result], token)[0]
 
     @app.post("/v1/users")
     async def add_user(payload: UserCreateModel, token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.USERS_WRITE.value)
-        LOGGER.info("User add requested: token=%s user=%s", _token_log_label(token), payload.id)
-        try:
-            result = await runtime.add_user(payload)
-        except ValueError as exc:
-            LOGGER.warning("User add rejected: token=%s user=%s reason=%s", _token_log_label(token), payload.id, exc)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning("User add failed: token=%s user=%s reason=%s", _token_log_label(token), payload.id, exc)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="add_user", resource=f"user:{payload.id}", details=payload.model_dump(mode="json"))
-        LOGGER.info("User add completed: token=%s user=%s", _token_log_label(token), payload.id)
-        return result
+        return await _execute_runtime_call(
+            token=token,
+            op="add_user",
+            resource=f"user:{payload.id}",
+            audit_details=payload.model_dump(mode="json"),
+            runtime_callable=lambda: runtime.add_user(payload),
+        )
 
     @app.patch("/v1/users/{user_id}")
-    async def edit_user(user_id: int, payload: UserPatchModel, token: AuthenticatedToken = Depends(require_token)):
+    async def edit_user(
+        user_id: int,
+        payload: UserPatchModel,
+        token: AuthenticatedToken = Depends(require_token),
+    ):
         require_scopes(token, Scope.USERS_WRITE.value)
-        LOGGER.info("User edit requested: token=%s user=%s", _token_log_label(token), user_id)
-        try:
-            result = await runtime.edit_user(user_id, payload)
-        except ValueError as exc:
-            LOGGER.warning("User edit rejected: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning("User edit failed: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="edit_user", resource=f"user:{user_id}", details=payload.model_dump(exclude_unset=True, mode="json"))
-        LOGGER.info("User edit completed: token=%s user=%s", _token_log_label(token), user_id)
-        return result
+        return await _execute_runtime_call(
+            token=token,
+            op="edit_user",
+            resource=f"user:{user_id}",
+            audit_details=payload.model_dump(exclude_unset=True, mode="json"),
+            runtime_callable=lambda: runtime.edit_user(user_id, payload),
+        )
 
     @app.delete("/v1/users/{user_id}")
     async def delete_user(user_id: int, token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.USERS_WRITE.value)
-        LOGGER.info("User delete requested: token=%s user=%s", _token_log_label(token), user_id)
-        try:
-            await runtime.delete_user(user_id)
-        except ValueError as exc:
-            LOGGER.warning("User delete rejected: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            LOGGER.warning("User delete failed: token=%s user=%s reason=%s", _token_log_label(token), user_id, exc)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-        token_store.write_audit(token_id=token.id, action="delete_user", resource=f"user:{user_id}", details={})
-        LOGGER.info("User delete completed: token=%s user=%s", _token_log_label(token), user_id)
+        await _execute_runtime_call(
+            token=token,
+            op="delete_user",
+            resource=f"user:{user_id}",
+            audit_details={},
+            runtime_callable=lambda: runtime.delete_user(user_id),
+        )
         return {"status": "deleted", "user_id": user_id}
 
     @app.get("/v1/events")
@@ -483,17 +436,19 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.EVENTS_READ.value)
-        return await runtime.get_events_recent(limit=limit, include_raw=include_raw, kinds=kinds, exclude_kinds=exclude_kinds)
+        return await runtime.get_events_recent(
+            limit=limit, include_raw=include_raw, kinds=kinds, exclude_kinds=exclude_kinds
+        )
 
     @app.get("/v1/export/users")
     async def export_users(token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.USERS_READ.value)
-        return _serialize_users(await runtime.get_export_users(), token)
+        return serialize_users(await runtime.get_export_users(), token)
 
     @app.get("/v1/export/catalog")
     async def export_catalog(token: AuthenticatedToken = Depends(require_token)):
         require_any_scope(token, Scope.CATALOG_READ.value, Scope.CONFIG_READ.value)
-        return _serialize_catalog(await runtime.get_catalog(), token)
+        return serialize_catalog(await runtime.get_catalog(), token)
 
     @app.get("/v1/export/time-limits")
     async def export_time_limits(token: AuthenticatedToken = Depends(require_token)):
@@ -506,7 +461,9 @@ def create_app(
         return await runtime.get_export_communications()
 
     @app.post("/v1/tokens")
-    async def create_token(payload: TokenCreateRequest, token: AuthenticatedToken = Depends(require_token)) -> TokenCreateResponse:
+    async def create_token(
+        payload: TokenCreateRequest, token: AuthenticatedToken = Depends(require_token)
+    ) -> TokenCreateResponse:
         require_scopes(token, Scope.TOKENS_ADMIN.value)
         token_value, token_info = token_store.create_token(
             label=payload.label,
@@ -514,7 +471,12 @@ def create_app(
             certificate_fingerprint=payload.certificate_fingerprint,
             allowed_user_ids=payload.allowed_user_ids,
         )
-        token_store.write_audit(token_id=token.id, action="create_token", resource=f"token:{token_info.id}", details=payload.model_dump(mode="json"))
+        token_store.write_audit(
+            token_id=token.id,
+            action="create_token",
+            resource=f"token:{token_info.id}",
+            details=payload.model_dump(mode="json"),
+        )
         LOGGER.info(
             "Token created via API: actor=%s token=%s scopes=%s allowed_user_ids=%s fingerprint_bound=%s",
             _token_log_label(token),
@@ -534,17 +496,20 @@ def create_app(
     async def delete_token(token_id: str, token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.TOKENS_ADMIN.value)
         token_store.revoke_token(token_id)
-        token_store.write_audit(token_id=token.id, action="revoke_token", resource=f"token:{token_id}", details={})
+        token_store.write_audit(
+            token_id=token.id, action="revoke_token", resource=f"token:{token_id}", details={}
+        )
         LOGGER.info("Token revoked via API: actor=%s token_id=%s", _token_log_label(token), token_id)
         return {"status": "revoked", "token_id": token_id}
 
     @app.websocket("/v1/ws")
-    async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), fingerprint: str | None = Query(default=None)):
+    async def websocket_endpoint(
+        websocket: WebSocket,
+        token: str = Query(...),
+        fingerprint: str | None = Query(default=None),
+    ):
         fingerprint = _tls_fingerprint_from_scope(websocket.scope) or fingerprint
-        authenticated = token_store.authenticate(
-            token,
-            certificate_fingerprint=fingerprint,
-        )
+        authenticated = token_store.authenticate(token, certificate_fingerprint=fingerprint)
         if authenticated is None:
             LOGGER.warning(
                 "WebSocket authentication failed: path=%s fingerprint=%s",
@@ -560,51 +525,68 @@ def create_app(
             _short_fingerprint(fingerprint),
         )
         try:
-            await websocket.send_json({"event": "hello", "topics": list(topic_scopes)})
+            await websocket.send_json({"event": "hello", "topics": list(TOPIC_SCOPES)})
             while True:
                 message = await websocket.receive_json()
                 action = message.get("action")
                 if action == "subscribe":
-                    topics = [str(topic) for topic in message.get("topics", [])]
-                    allowed_topics: list[str] = []
-                    denied_topics: list[str] = []
-                    for topic in topics:
-                        if _authorize_topic(authenticated, topic):
-                            allowed_topics.append(topic)
-                        else:
-                            denied_topics.append(topic)
-                    if denied_topics:
-                        LOGGER.warning(
-                            "WebSocket subscribe denied topics: token=%s denied=%s",
-                            _token_log_label(authenticated),
-                            denied_topics,
-                        )
-                        await websocket.send_json({"event": "error", "error": "missing_scopes", "topics": denied_topics})
-                    if not allowed_topics:
-                        continue
-                    topics = allowed_topics
-                    await ws_manager.subscribe(websocket, topics)
-                    LOGGER.info(
-                        "WebSocket subscribed: token=%s topics=%s",
-                        _token_log_label(authenticated),
-                        topics,
-                    )
-                    for topic in topics:
-                        if topic == "status":
-                            await websocket.send_json({"event": "snapshot", "topic": "status", "payload": (await runtime.get_status()).model_dump(mode="json")})
-                        elif topic == "catalog":
-                            await websocket.send_json({"event": "snapshot", "topic": "catalog", "payload": _serialize_catalog(await runtime.get_catalog(), authenticated)})
-                        elif topic == "system":
-                            await websocket.send_json({"event": "snapshot", "topic": "system", "payload": (await build_system_payload(authenticated)).model_dump(mode="json")})
-                        elif topic == "users":
-                            await websocket.send_json({"event": "snapshot", "topic": "users", "payload": _serialize_users(await runtime.get_users(), authenticated)})
-                        elif topic == "events":
-                            await websocket.send_json({"event": "snapshot", "topic": "events", "payload": [event.model_dump(mode="json") for event in await runtime.get_events_recent(limit=20)]})
+                    await _handle_ws_subscribe(websocket, authenticated, message)
                 elif action == "ping":
                     await websocket.send_json({"event": "pong"})
         except WebSocketDisconnect:
             LOGGER.info("WebSocket disconnected: token=%s", _token_log_label(authenticated))
         finally:
             await ws_manager.disconnect(websocket)
+
+    async def _handle_ws_subscribe(
+        websocket: WebSocket, authenticated: AuthenticatedToken, message: dict
+    ) -> None:
+        topics = [str(topic) for topic in message.get("topics", [])]
+        allowed_topics: list[str] = []
+        denied_topics: list[str] = []
+        for topic in topics:
+            if _authorize_topic(authenticated, topic):
+                allowed_topics.append(topic)
+            else:
+                denied_topics.append(topic)
+        if denied_topics:
+            LOGGER.warning(
+                "WebSocket subscribe denied topics: token=%s denied=%s",
+                _token_log_label(authenticated),
+                denied_topics,
+            )
+            await websocket.send_json(
+                {"event": "error", "error": "missing_scopes", "topics": denied_topics}
+            )
+        if not allowed_topics:
+            return
+        await ws_manager.subscribe(websocket, allowed_topics)
+        LOGGER.info(
+            "WebSocket subscribed: token=%s topics=%s",
+            _token_log_label(authenticated),
+            allowed_topics,
+        )
+        for topic in allowed_topics:
+            await _send_ws_snapshot(websocket, authenticated, topic)
+
+    async def _send_ws_snapshot(
+        websocket: WebSocket, authenticated: AuthenticatedToken, topic: str
+    ) -> None:
+        if topic == "status":
+            payload = (await runtime.get_status()).model_dump(mode="json")
+        elif topic == "catalog":
+            payload = serialize_catalog(await runtime.get_catalog(), authenticated)
+        elif topic == "system":
+            payload = (await build_system_payload(authenticated)).model_dump(mode="json")
+        elif topic == "users":
+            payload = serialize_users(await runtime.get_users(), authenticated)
+        elif topic == "events":
+            payload = [
+                event.model_dump(mode="json")
+                for event in await runtime.get_events_recent(limit=20)
+            ]
+        else:
+            return
+        await websocket.send_json({"event": "snapshot", "topic": topic, "payload": payload})
 
     return app
