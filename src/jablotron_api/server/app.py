@@ -437,8 +437,7 @@ def create_app(
         return {"status": "deleted", "user_id": user_id}
 
     @app.get("/v1/events")
-    @app.get("/v1/events/recent")
-    async def events_recent(
+    async def events(
         limit: int = Query(default=20, ge=1, le=200),
         include_raw: bool = Query(default=False),
         kinds: str | None = Query(default=None),
@@ -449,6 +448,20 @@ def create_app(
         return await runtime.get_events_recent(
             limit=limit, include_raw=include_raw, kinds=kinds, exclude_kinds=exclude_kinds
         )
+
+    # Deprecated alias retained for v1 backward compatibility with the
+    # earlier /v1/events/recent path. Clients should migrate to /v1/events
+    # with the same query parameters; this alias will be removed after the
+    # v1 alpha window.
+    @app.get("/v1/events/recent", deprecated=True)
+    async def events_recent_deprecated(
+        limit: int = Query(default=20, ge=1, le=200),
+        include_raw: bool = Query(default=False),
+        kinds: str | None = Query(default=None),
+        exclude_kinds: str | None = Query(default=None),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
+        return await events(limit, include_raw, kinds, exclude_kinds, token)
 
     @app.get("/v1/export/users")
     async def export_users(token: AuthenticatedToken = Depends(require_token)):

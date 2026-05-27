@@ -62,6 +62,26 @@ def cmd_client(args: argparse.Namespace) -> None:
     client_cli.main(args.client_args)
 
 
+def cmd_openapi_export(args: argparse.Namespace) -> None:
+    """Write the FastAPI-generated OpenAPI document to disk for the v1 lock."""
+
+    import json
+    import tempfile
+
+    from jablotron_api.panel.demo import DemoPanelRuntime
+    from jablotron_api.server.app import create_app
+    from jablotron_api.server.config import ServerSettings
+
+    output = Path(args.output)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "tokens.db"
+        settings = ServerSettings(db_path=db, runtime_mode="demo")
+        app = create_app(settings=settings, runtime=DemoPanelRuntime(), token_store=TokenStore(db))
+        spec = app.openapi()
+    output.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+    print(f"wrote {output}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -80,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     client = subparsers.add_parser("client", help="Run the packaged reference client CLI.")
     client.add_argument("client_args", nargs=argparse.REMAINDER)
     client.set_defaults(func=cmd_client)
+
+    openapi = subparsers.add_parser(
+        "openapi-export",
+        help="Generate the FastAPI OpenAPI document for the v1 schema lock.",
+    )
+    openapi.add_argument("output", help="Output JSON path (e.g. docs/openapi.v1.json)")
+    openapi.set_defaults(func=cmd_openapi_export)
 
     return parser
 

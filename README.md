@@ -10,6 +10,24 @@ Tested with JA-100K, JA-101K, JA-101K-LAN, JA-103K, JA-103KRY, JA-106K-3G, JA-10
 
 This repository now also contains a Python `jablotron-api-server` that owns the USB/FLEXI panel connection and exposes a scoped `HTTPS` + `WebSocket` API for clients such as the Home Assistant integration.
 
+### v1 stability promise
+
+The `/v1` REST and WebSocket surface is being locked for the public alpha. Within the v1 series:
+
+- REST paths under `/v1/...` will not be renamed or removed, only deprecated (with a `Deprecation` flag in the OpenAPI document) before any eventual removal in a future major version.
+- Response shapes (the Pydantic models in `src/jablotron_api/domain/models.py`) will only be extended in backward-compatible ways: new optional fields, never removed or retyped existing ones.
+- The token scope vocabulary (the `Scope` enum) is fixed. Scope names will not be renamed; new scopes can be added. The legacy `status:read` and `sections:control` names are auto-migrated to the v1 names on TokenStore startup for the duration of the v1 alpha window.
+- WebSocket topic names (`status`, `events`, `users`, `catalog`, `system`) and the envelope shape (`{sequence, topic, event, timestamp, payload}`) are fixed.
+- Error responses use a consistent shape: HTTP status code plus a JSON body with `detail` containing either a string or `{error, missing|missing_any_of}` for scope denials.
+
+The authoritative description is `docs/openapi.v1.json`, generated from the running FastAPI app. To regenerate it after changes:
+
+```bash
+venv/bin/python -m jablotron_api.cli.main openapi-export docs/openapi.v1.json
+```
+
+The `/v1/events/recent` path is a deprecated alias for `/v1/events?limit=...&kinds=...` and will be removed after the v1 alpha window.
+
 ### Quick start
 
 1. Build the image:

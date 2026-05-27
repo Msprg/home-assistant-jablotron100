@@ -9,3 +9,4 @@ DEVELOPMENT_SETUP.md
 /.dev-data/
 /.env
 .gitmodules
+/data/
