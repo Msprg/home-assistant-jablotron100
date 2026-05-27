@@ -2180,7 +2180,10 @@ class Jablotron:
 		if device_number in (DeviceNumber.MOBILE_APPLICATION.value, DeviceNumber.USB.value):
 			offset = offset - 1
 
-		user_no = int((self.bytes_to_int(packet[3:4]) - offset) / 4)
+		# Each user occupies 4 consecutive values in the packet byte after the
+		# fixed offset, so // 4 converts the offset-relative position into the
+		# user number.
+		user_no = (self.bytes_to_int(packet[3:4]) - offset) // 4
 		self._last_authorized_user_or_device = "User {}".format(user_no)
 		LOGGER.debug("Authorized user: {}".format(user_no))
 
@@ -2379,7 +2382,7 @@ class Jablotron:
 				if not info_type.is_unknown():
 					info_packets.append(ParsedDeviceInfoPacket(info_type, info_subpacket[start:end]))
 
-			except Exception:
+			except ValueError:
 				Jablotron._log_error_with_packet(
 					"Unknown device info type {}".format(info_type_int),
 					packet,
@@ -2862,4 +2865,7 @@ class JablotronEntity(Entity):
 		self.refresh_state()
 
 	def _get_state(self) -> StateType | AlarmControlPanelState:
-		return self._jablotron.entities_states[self._control.id]
+		# .get() lets the `available` property report unavailable when the
+		# entity is queried before its initial value is written, instead
+		# of raising KeyError.
+		return self._jablotron.entities_states.get(self._control.id)

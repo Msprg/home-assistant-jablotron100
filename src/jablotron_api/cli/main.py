@@ -43,19 +43,26 @@ def cmd_server(_args: argparse.Namespace) -> None:
     log_config["formatters"]["access"]["fmt"] = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
     log_config["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    uvicorn.run(
-        app,
+    uvicorn_kwargs: dict = dict(
         host=settings.host,
         port=settings.port,
         http=TLSAwareH11Protocol,
         ws=TLSAwareWebSocketProtocol,
-        ssl_certfile=settings.tls_certfile,
-        ssl_keyfile=settings.tls_keyfile,
-        ssl_ca_certs=settings.tls_ca_certs,
-        ssl_cert_reqs=ssl.CERT_REQUIRED,
         timeout_graceful_shutdown=15,
         log_config=log_config,
     )
+    # Always serve over TLS; the difference is whether we demand and
+    # validate the client certificate. mTLS off path is for HA Add-on
+    # localhost / Supervisor deployments where mTLS is friction without
+    # security benefit.
+    if settings.tls_certfile and settings.tls_keyfile:
+        uvicorn_kwargs["ssl_certfile"] = settings.tls_certfile
+        uvicorn_kwargs["ssl_keyfile"] = settings.tls_keyfile
+    if settings.mtls_required:
+        if settings.tls_ca_certs:
+            uvicorn_kwargs["ssl_ca_certs"] = settings.tls_ca_certs
+        uvicorn_kwargs["ssl_cert_reqs"] = ssl.CERT_REQUIRED
+    uvicorn.run(app, **uvicorn_kwargs)
 
 
 def cmd_client(args: argparse.Namespace) -> None:

@@ -35,7 +35,11 @@ class ServerSettings:
     tls_keyfile: str | None = os.getenv("JABLOTRON_API_TLS_KEYFILE")
     tls_ca_certs: str | None = os.getenv("JABLOTRON_API_TLS_CA_CERTS")
     runtime_mode: str = os.getenv("JABLOTRON_API_RUNTIME_MODE", "live")
-    mtls_required: bool = True
+    # mTLS defaults on. The HA Add-on packaging needs to disable mTLS when
+    # the server is bound to localhost or HA Supervisor's internal network
+    # (mTLS would be friction without security benefit there). Override
+    # with JABLOTRON_API_MTLS_REQUIRED=false in that environment.
+    mtls_required: bool = os.getenv("JABLOTRON_API_MTLS_REQUIRED", "true").lower() not in {"0", "false", "no"}
     panel: PanelSettings = field(
         default_factory=lambda: PanelSettings(
             port=os.getenv("JABLOTRON_PANEL_PORT", "auto"),
