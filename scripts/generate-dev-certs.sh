@@ -16,7 +16,7 @@ Usage:
 
 Examples:
   scripts/generate-dev-certs.sh
-  scripts/generate-dev-certs.sh .dev-certs --ip 192.168.1.50 --dns jablotron-api-server.brainit.tech
+  scripts/generate-dev-certs.sh .dev-certs --ip 192.168.1.50 --dns jablotron-api-server.YOUR_DOMAIN
 
 Notes:
   - A local development CA is generated.

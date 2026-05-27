@@ -42,7 +42,7 @@ docker build -t jablotron-api-server:latest .
 chmod +x scripts/generate-dev-certs.sh
 scripts/generate-dev-certs.sh .dev-certs \
   --ip 127.0.0.1 \
-  --dns jablotron-api-server.brainit.tech
+  --dns jablotron-api-server.YOUR_DOMAIN
 mkdir -p .dev-data
 ```
 
@@ -123,7 +123,7 @@ python3 -m jablotron_api.cli.main server \
   --tls-keyfile /path/to/server.key \
   --tls-ca-certs /path/to/ca.crt \
   --panel-port auto \
-  --panel-auth-code 1812
+  --panel-auth-code "$JABLOTRON_PANEL_AUTH_CODE"
 ```
 
 2. Generate development certs if you have not already:
@@ -131,10 +131,10 @@ python3 -m jablotron_api.cli.main server \
 ```bash
 scripts/generate-dev-certs.sh .dev-certs \
   --ip YOUR_SERVER_LAN_IP \
-  --dns jablotron-api-server.brainit.tech
+  --dns jablotron-api-server.YOUR_DOMAIN
 ```
 
-3. Create a client certificate and token for Home Assistant. Use scopes at least `system:read`, `status:read`, `config:read`, `events:read`, `sections:control`, and `pgs:control`.
+3. Create a client certificate and token for Home Assistant. Use scopes at least `system:read`, `sections:read`, `pgs:read`, `devices:read`, `catalog:read`, `events:read`, `sections:arm`, `sections:disarm`, and `pgs:control`. Add `codes:impersonate` if Home Assistant will forward a user-supplied code that differs from the server's service code.
 
 4. Install the API-backed custom component from the submodule into the Home Assistant config directory as a symlink or copy. During active development, a symlink is the fastest option:
 
@@ -187,7 +187,7 @@ python3 -m debugpy --listen 127.0.0.1:5679 -m jablotron_api.cli.main server \
   --tls-keyfile /path/to/server.key \
   --tls-ca-certs /path/to/ca.crt \
   --panel-port auto \
-  --panel-auth-code 1812
+  --panel-auth-code "$JABLOTRON_PANEL_AUTH_CODE"
 ```
 
 

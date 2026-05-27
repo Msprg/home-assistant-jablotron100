@@ -11,7 +11,9 @@ services:
       JABLOTRON_API_TLS_KEYFILE: /data/certs/server.key
       JABLOTRON_API_TLS_CA_CERTS: /data/certs/ca.crt
       JABLOTRON_API_RUNTIME_MODE: "${JABLOTRON_API_RUNTIME_MODE:-live}"
-      JABLOTRON_PANEL_AUTH_CODE: "${JABLOTRON_PANEL_AUTH_CODE:-1812}"
+      # Required in live mode (any non-empty value works for demo). Set
+      # in a sibling .env file (gitignored); see .env.example.
+      JABLOTRON_PANEL_AUTH_CODE: "${JABLOTRON_PANEL_AUTH_CODE:?must be set in .env}"
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-/dev/hidraw0}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-/dev/sdb1}"
       JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-/dev/sdc1}"

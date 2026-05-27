@@ -9,7 +9,9 @@ from pathlib import Path
 @dataclass
 class PanelSettings:
     port: str = "auto"
-    auth_code: str = "1812"
+    # No default: panel service code is installation-specific. The server
+    # raises a clear error at startup in live mode if this is empty.
+    auth_code: str = ""
     flexi_cfg_device: str = "auto"
     flexi_log_device: str = "auto"
     import_path: Path = Path("/mnt/flexi_cfg/IMPORT.CFG")
@@ -37,7 +39,7 @@ class ServerSettings:
     panel: PanelSettings = field(
         default_factory=lambda: PanelSettings(
             port=os.getenv("JABLOTRON_PANEL_PORT", "auto"),
-            auth_code=os.getenv("JABLOTRON_PANEL_AUTH_CODE", "1812"),
+            auth_code=os.getenv("JABLOTRON_PANEL_AUTH_CODE", ""),
             flexi_cfg_device=os.getenv("JABLOTRON_PANEL_FLEXI_CFG_DEVICE", "auto"),
             flexi_log_device=os.getenv("JABLOTRON_PANEL_FLEXI_LOG_DEVICE", "auto"),
             import_path=Path(os.getenv("JABLOTRON_PANEL_IMPORT_PATH", "/mnt/flexi_cfg/IMPORT.CFG")),

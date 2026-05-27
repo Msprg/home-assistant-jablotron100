@@ -107,6 +107,12 @@ def create_app(
         if settings.runtime_mode == "demo":
             runtime = DemoPanelRuntime()
         else:
+            if not settings.panel.auth_code:
+                raise RuntimeError(
+                    "JABLOTRON_PANEL_AUTH_CODE is required in live runtime mode. "
+                    "Set the env var to the installation's panel service code, "
+                    "or run with JABLOTRON_API_RUNTIME_MODE=demo for a smoke test."
+                )
             from jablotron_api.panel.runtime import PanelRuntime
 
             runtime = PanelRuntime(settings.panel)

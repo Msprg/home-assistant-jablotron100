@@ -84,7 +84,10 @@ __all__ = [
 @dataclass
 class PanelRuntimeConfig:
     port: str = "auto"
-    auth_code: str = "1812"
+    # No default: the panel service code is installation-specific and must
+    # be provided explicitly. ServerSettings reads it from
+    # JABLOTRON_PANEL_AUTH_CODE; tests pass it directly.
+    auth_code: str = ""
     flexi_cfg_device: str = "auto"
     flexi_log_device: str = "auto"
     import_path: Path = DEFAULT_IMPORT_PATH

@@ -27,7 +27,7 @@ From the repo root:
 chmod +x scripts/generate-dev-certs.sh
 scripts/generate-dev-certs.sh .dev-certs \
   --ip 192.168.1.50 \
-  --dns jablotron-api-server.brainit.tech
+  --dns jablotron-api-server.YOUR_DOMAIN
 ```
 
 If you do not pass `--ip` or `--dns`, the script still includes `127.0.0.1`, `localhost`, the current hostname, and the machine's currently detected LAN IPv4 addresses.
@@ -94,7 +94,7 @@ docker compose -f docker-compose.dev.yml up --build
 
 In the `jablotron100-api-HASS` config flow, use:
 
-- `server_url`: `https://192.168.1.50:8443` or `https://jablotron-api-server.brainit.tech:8443`
+- `server_url`: `https://192.168.1.50:8443` or `https://jablotron-api-server.YOUR_DOMAIN:8443`
 - `api_token`: the token you bootstrapped
 - `tls_ca_cert`: path to `ca.crt` on the Home Assistant machine
 - `tls_client_cert`: path to `client.crt` on the Home Assistant machine

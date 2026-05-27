@@ -1,3 +1,6 @@
+# Production-style compose. Set installation-specific values in a sibling
+# .env file (see .env.example) rather than editing this file. The required
+# variables are listed there with explanations.
 services:
   jablotron-api:
     build: .
@@ -9,19 +12,19 @@ services:
       JABLOTRON_API_TLS_CERTFILE: /data/certs/server.crt
       JABLOTRON_API_TLS_KEYFILE: /data/certs/server.key
       JABLOTRON_API_TLS_CA_CERTS: /data/certs/ca.crt
-      JABLOTRON_PANEL_AUTH_CODE: "1812"
-      JABLOTRON_PANEL_PORT: "auto"
-      JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "auto"
-      JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "auto"
+      # Required in live mode. Set in .env (gitignored).
+      JABLOTRON_PANEL_AUTH_CODE: "${JABLOTRON_PANEL_AUTH_CODE:?must be set in .env for live mode}"
+      JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-auto}"
+      JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-auto}"
+      JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-auto}"
     volumes:
       - ./data:/data
     device_cgroup_rules:
       - "c 13:* rmw"
       - "b *:* rmw"
     devices:
-      - /dev/hidraw0:/dev/hidraw0
-      - /dev/sdb1:/dev/sdb1
-      - /dev/sdc1:/dev/sdc1
+      - "${JABLOTRON_PANEL_PORT_HOST:-/dev/hidraw0}:${JABLOTRON_PANEL_PORT_HOST:-/dev/hidraw0}"
+      - "${JABLOTRON_PANEL_FLEXI_CFG_HOST:-/dev/sdb1}:${JABLOTRON_PANEL_FLEXI_CFG_HOST:-/dev/sdb1}"
+      - "${JABLOTRON_PANEL_FLEXI_LOG_HOST:-/dev/sdc1}:${JABLOTRON_PANEL_FLEXI_LOG_HOST:-/dev/sdc1}"
     ports:
       - "8443:8443"
-
