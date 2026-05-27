@@ -251,6 +251,12 @@ Implications to keep in mind from now on so we do not paint the add-on into a co
 No code changes needed right now to support this; the requirements above are forward-looking guardrails so v1.x decisions don't accidentally rule it out.
 
 ## Progress Log
+### 2026-05-27 (evening — post-promotion cleanup)
+- Three more upstream fixes ported (e9f9f28 KeyError-on-early-state-query; 0c315d8 floor-division for authorized-user packet parse; 972ca1a narrow except in info-subpacket parser). Bundled with one HA Add-on prep change: `ServerSettings.mtls_required` is now driven by `JABLOTRON_API_MTLS_REQUIRED` (default `true`), and `cli/main.cmd_server` builds the uvicorn kwargs conditionally so an add-on bound to localhost / HA Supervisor can run TLS-only without client-cert demand. This was the one architectural code change called out in the HA Add-on packaging notes above.
+- `docs/openapi.v1.json` regenerated; only delta is the `info.version` bump to `1.0.0a1`.
+- `.vscode/launch.json` (debugpy target pointing at the developer's HA box LAN IP) untracked and `/.vscode/` added to `.gitignore`.
+- Production container rebuilt and restarted on the post-fix image; HA reconnected cleanly on its existing token (still ha-user99-main, auto-migrated to v1 scopes on store open).
+
 ### 2026-05-27 (afternoon — refactor live validation + promotion + upstream fixes)
 - Live read-only validation against the connected JA-107K panel through the refactored server:
   - panel system info, sections (6), PGs (20), devices (50), users (82, codes redacted/visible per scope), events, and export-catalog (`main_config` decoded exactly: sections=6, pgs=20, devices=50, users=100, system_name correct)
