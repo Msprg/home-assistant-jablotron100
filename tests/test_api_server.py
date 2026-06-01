@@ -12,6 +12,7 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from jablotron_api.domain.models import (
+    ArmMode,
     CentralStatusModel,
     DEFAULT_ADMIN_SCOPES,
     DeviceStatusModel,
@@ -136,8 +137,7 @@ class FakeRuntime:
     async def get_export_communications(self):
         return {"communications": {"service_enabled": True, "sms_enabled": False}}
 
-    async def arm_section(self, section_id, mode, code=None, *, allowed_user_ids=None):
-        del allowed_user_ids
+    async def arm_section(self, section_id, mode, code=None):
         if section_id != 1:
             raise ValueError("Section 2 is outside the client-facing usable range 1-1.")
         self.last_arm_code = code
@@ -146,15 +146,14 @@ class FakeRuntime:
             await listener("status", self.status.model_dump(mode="json"))
         return self.status
 
-    async def disarm_section(self, section_id, code=None, *, allowed_user_ids=None):
-        del allowed_user_ids
+    async def disarm_section(self, section_id, code=None):
         if section_id != 1:
             raise ValueError("Section 2 is outside the client-facing usable range 1-1.")
         self.last_disarm_code = code
         self.status.sections[0].state = "disarmed"
         return self.status
 
-    async def set_pg(self, pg_id, enabled, code=None, *, allowed_user_ids=None):
+    async def set_pg(self, pg_id, enabled, code=None):
         if pg_id != 1:
             raise ValueError("PG 2 is outside the client-facing usable range 1-1.")
         self.last_pg_code = code
@@ -370,6 +369,30 @@ def test_control_endpoints_require_impersonation_scope_for_alternate_code(tmp_pa
     assert forbidden.json()["detail"]["missing"] == [Scope.CODES_IMPERSONATE.value]
 
 
+def test_pg_control_denied_without_action_scope_even_with_impersonate(tmp_path: Path) -> None:
+    # The action scope is checked first and independently: a token that holds
+    # codes:impersonate (and supplies a valid code) is still denied if it lacks
+    # pgs:control. Impersonation is purely additive; it never substitutes for
+    # the action scope.
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    token, _ = store.create_token(
+        label="impersonate-only",
+        scopes=[Scope.CODES_IMPERSONATE.value],
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+
+    forbidden = client.post("/v1/pgs/1/on?code=2468", headers={"Authorization": f"Bearer {token}"})
+    assert forbidden.status_code == 403
+    assert forbidden.json()["detail"]["missing"] == [Scope.PGS_CONTROL.value]
+    assert runtime.last_pg_code is None  # action never reached the runtime
+
+
 def test_pg_control_endpoints_require_explicit_code(tmp_path: Path) -> None:
     runtime = FakeRuntime()
     store = TokenStore(tmp_path / "tokens.db")
@@ -427,10 +450,47 @@ def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -
     assert calls[1]["timeout"] == 0.6
 
 
-def test_panel_runtime_rejects_pg_control_for_known_user_without_pg_rights() -> None:
+class _RecordingControlSession:
+    """Minimal stand-in for PersistentSnapshotSession that records the code
+    forwarded by control_section/control_pg without touching a real panel."""
+
+    def __init__(self) -> None:
+        self.pg_calls: list[tuple[int, bool, str | None]] = []
+        self.section_calls: list[tuple[int, str, str | None]] = []
+
+    def control_pg(self, *, pg_id: int, enabled: bool, code: str | None = None) -> None:
+        self.pg_calls.append((pg_id, enabled, code))
+
+    def control_section(self, *, section_id: int, action: str, code: str | None = None) -> None:
+        self.section_calls.append((section_id, action, code))
+
+
+def _runtime_with_recording_session(catalog: ExportCatalogModel):
+    runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="4458"))
+    runtime._catalog = catalog
+    session = _RecordingControlSession()
+    runtime._status_session = session  # type: ignore[assignment]
+
+    async def _fake_refresh() -> PanelStatusModel:
+        return PanelStatusModel(
+            refreshed_at=datetime.now(timezone.utc),
+            sections=[],
+            pgs=[],
+            devices=[],
+            service_mode=False,
+        )
+
+    runtime.refresh_status = _fake_refresh  # type: ignore[method-assign]
+    return runtime, session
+
+
+def test_panel_runtime_forwards_pg_code_without_local_authorization() -> None:
+    # The API server is a thin gate: it forwards the supplied code to the panel
+    # and lets the panel decide validity and what the code may control. Even
+    # when the exported catalog says the user lacks rights to this PG, the
+    # runtime must NOT short-circuit with its own PermissionError.
     async def run() -> None:
-        runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="4458"))
-        runtime._catalog = ExportCatalogModel(
+        catalog = ExportCatalogModel(
             sections=[],
             pgs=[ExportPGModel(id=15, display_id=15, name="PG output 15")],
             devices=[],
@@ -440,7 +500,7 @@ def test_panel_runtime_rejects_pg_control_for_known_user_without_pg_rights() -> 
                     name="HomeAssistant",
                     code="4458",
                     section_ids=[1],
-                    pg_ids=[18],
+                    pg_ids=[18],  # deliberately NOT 15
                     rights="coUserNoSelfedit",
                 )
             ],
@@ -450,47 +510,40 @@ def test_panel_runtime_rejects_pg_control_for_known_user_without_pg_rights() -> 
                 pgs=InitialSetupRangeModel(first_id=1, last_id=20, count=20),
             ),
         )
-        try:
-            await runtime.set_pg(15, True, code="4458")
-        except PermissionError as exc:
-            assert str(exc) == "The supplied code is not allowed to control PG 15."
-            assert "100" not in str(exc)  # user id MUST NOT leak to clients
-        else:
-            raise AssertionError("Expected PermissionError for unauthorized PG control.")
+        runtime, session = _runtime_with_recording_session(catalog)
+        await runtime.set_pg(15, True, code="4458")
+        assert session.pg_calls == [(15, True, "4458")]
 
     asyncio.run(run())
 
 
-def test_panel_runtime_rejects_pg_control_for_token_bound_to_other_user() -> None:
+def test_panel_runtime_forwards_section_code_without_local_authorization() -> None:
+    # Same contract for section arming: a code that the exported catalog would
+    # not associate with this section is still forwarded verbatim to the panel.
     async def run() -> None:
-        runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="4458"))
-        runtime._catalog = ExportCatalogModel(
-            sections=[],
-            pgs=[ExportPGModel(id=15, display_id=15, name="PG output 15")],
+        catalog = ExportCatalogModel(
+            sections=[ExportSectionModel(id=4, display_id=4, name="Garage")],
+            pgs=[],
             devices=[],
             users=[
                 UserModel(
                     id=100,
                     name="HomeAssistant",
-                    code="4458",
-                    section_ids=[1],
-                    pg_ids=[15],
+                    code="1812",
+                    section_ids=[1],  # deliberately NOT 4
+                    pg_ids=[],
                     rights="coUserNoSelfedit",
                 )
             ],
             initial_setup=InitialSetupModel(
                 source="test",
                 exact=True,
-                pgs=InitialSetupRangeModel(first_id=1, last_id=20, count=20),
+                sections=InitialSetupRangeModel(first_id=1, last_id=10, count=10),
             ),
         )
-        try:
-            await runtime.set_pg(15, True, code="4458", allowed_user_ids=[101])
-        except PermissionError as exc:
-            assert str(exc) == "The supplied code is not allowed by this token."
-            assert "100" not in str(exc)
-        else:
-            raise AssertionError("Expected PermissionError for token/user mismatch.")
+        runtime, session = _runtime_with_recording_session(catalog)
+        await runtime.arm_section(4, ArmMode.AWAY, code="1812")
+        assert session.section_calls == [(4, "arm_away", "1812")]
 
     asyncio.run(run())
 
@@ -1350,8 +1403,7 @@ def test_scope_denial_revocation_and_certificate_binding(tmp_path: Path) -> None
 def test_section_control_ack_failure_returns_conflict(tmp_path: Path) -> None:
     runtime = FakeRuntime()
 
-    async def fail_arm(section_id, mode, code=None, *, allowed_user_ids=None):
-        del allowed_user_ids
+    async def fail_arm(section_id, mode, code=None):
         raise RuntimeError("Section control was not acknowledged by the panel.")
 
     runtime.arm_section = fail_arm
@@ -1568,8 +1620,8 @@ def test_legacy_scope_migration_rewrites_old_token_names(tmp_path: Path) -> None
             """
             INSERT INTO tokens (
                 id, label, token_hash, scopes_json, certificate_fingerprint,
-                allowed_user_ids_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 "legacy01",
@@ -1577,7 +1629,6 @@ def test_legacy_scope_migration_rewrites_old_token_names(tmp_path: Path) -> None
                 token_hash(raw_token),
                 json.dumps(legacy_scopes),
                 None,
-                "[]",
                 "2026-01-01T00:00:00+00:00",
             ),
         )

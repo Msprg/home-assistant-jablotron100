@@ -58,7 +58,6 @@ class TokenStore:
                     token_hash TEXT NOT NULL UNIQUE,
                     scopes_json TEXT NOT NULL,
                     certificate_fingerprint TEXT,
-                    allowed_user_ids_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     last_used_at TEXT,
                     revoked_at TEXT
@@ -80,9 +79,20 @@ class TokenStore:
                 );
                 """
             )
+            # The per-token user-id binding (allowed_user_ids) was removed: the
+            # panel is the sole authority on whether a supplied code is valid
+            # and what it may control, so the API server no longer second-guesses
+            # it. Drop the now-dead column on existing databases. Best-effort:
+            # if the SQLite build predates DROP COLUMN support the column simply
+            # lingers unused (it is never read or written).
             token_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tokens)").fetchall()}
-            if "allowed_user_ids_json" not in token_columns:
-                conn.execute("ALTER TABLE tokens ADD COLUMN allowed_user_ids_json TEXT NOT NULL DEFAULT '[]'")
+            if "allowed_user_ids_json" in token_columns:
+                try:
+                    conn.execute("ALTER TABLE tokens DROP COLUMN allowed_user_ids_json")
+                except sqlite3.OperationalError:
+                    LOGGER.warning(
+                        "Could not drop legacy allowed_user_ids_json column; leaving it unused."
+                    )
             conn.commit()
 
     def _migrate_legacy_scopes(self) -> None:
@@ -125,7 +135,6 @@ class TokenStore:
         label: str,
         scopes: list[str] | None = None,
         certificate_fingerprint: str | None = None,
-        allowed_user_ids: list[int] | None = None,
     ) -> tuple[str, TokenInfoModel]:
         # Reject control characters in the label so a CR/LF/tab cannot be
         # used to forge audit-log entries or split structured log lines.
@@ -139,13 +148,12 @@ class TokenStore:
         token_id = secrets.token_hex(8)
         created_at = utc_now_iso()
         effective_scopes = scopes or list(DEFAULT_ADMIN_SCOPES)
-        effective_allowed_user_ids = allowed_user_ids or []
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO tokens (
-                    id, label, token_hash, scopes_json, certificate_fingerprint, allowed_user_ids_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, label, token_hash, scopes_json, certificate_fingerprint, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token_id,
@@ -153,17 +161,15 @@ class TokenStore:
                     token_hash(token_value),
                     json.dumps(effective_scopes),
                     certificate_fingerprint,
-                    json.dumps(effective_allowed_user_ids),
                     created_at,
                 ),
             )
             conn.commit()
         LOGGER.info(
-            "Token created: token=%s (%s) scopes=%s allowed_user_ids=%s fingerprint_bound=%s",
+            "Token created: token=%s (%s) scopes=%s fingerprint_bound=%s",
             label,
             token_id,
             ",".join(effective_scopes),
-            effective_allowed_user_ids,
             bool(certificate_fingerprint),
         )
         return token_value, TokenInfoModel(
@@ -171,7 +177,6 @@ class TokenStore:
             label=label,
             scopes=effective_scopes,
             certificate_fingerprint=certificate_fingerprint,
-            allowed_user_ids=effective_allowed_user_ids,
             created_at=datetime.fromisoformat(created_at),
         )
 
@@ -221,7 +226,6 @@ class TokenStore:
             label=row["label"],
             scopes=json.loads(row["scopes_json"]),
             certificate_fingerprint=row["certificate_fingerprint"],
-            allowed_user_ids=json.loads(row["allowed_user_ids_json"] or "[]"),
         )
 
     def write_audit(
@@ -274,7 +278,6 @@ class TokenStore:
             label=row["label"],
             scopes=json.loads(row["scopes_json"]),
             certificate_fingerprint=row["certificate_fingerprint"],
-            allowed_user_ids=json.loads(row["allowed_user_ids_json"] or "[]"),
             created_at=created_at,
             revoked_at=revoked_at,
             last_used_at=last_used_at,

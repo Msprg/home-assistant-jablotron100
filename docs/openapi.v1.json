@@ -99,13 +99,6 @@
       },
       "TokenCreateRequest": {
         "properties": {
-          "allowed_user_ids": {
-            "items": {
-              "type": "integer"
-            },
-            "title": "Allowed User Ids",
-            "type": "array"
-          },
           "certificate_fingerprint": {
             "anyOf": [
               {
@@ -154,13 +147,6 @@
       },
       "TokenInfoModel": {
         "properties": {
-          "allowed_user_ids": {
-            "items": {
-              "type": "integer"
-            },
-            "title": "Allowed User Ids",
-            "type": "array"
-          },
           "certificate_fingerprint": {
             "anyOf": [
               {

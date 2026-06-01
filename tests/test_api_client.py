@@ -134,15 +134,12 @@ def test_client_cli_token_payload() -> None:
             "users:read",
             "--scope",
             "events:read",
-            "--allowed-user-id",
-            "90",
         ]
     )
 
     assert _token_payload(args) == {
         "label": "ops",
         "scopes": ["users:read", "events:read"],
-        "allowed_user_ids": [90],
     }
 
 

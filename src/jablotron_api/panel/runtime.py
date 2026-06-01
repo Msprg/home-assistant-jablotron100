@@ -432,14 +432,11 @@ class PanelRuntime:
         section_id: int,
         mode: ArmMode,
         code: str | None = None,
-        *,
-        allowed_user_ids: list[int] | None = None,
     ) -> PanelStatusModel:
         return await self._invoke_section_control(
             section_id=section_id,
             action=self._ARM_ACTIONS[mode],
             code=code,
-            allowed_user_ids=allowed_user_ids,
             op="arm_section",
             log_detail=f"mode={mode.value}",
         )
@@ -448,14 +445,11 @@ class PanelRuntime:
         self,
         section_id: int,
         code: str | None = None,
-        *,
-        allowed_user_ids: list[int] | None = None,
     ) -> PanelStatusModel:
         return await self._invoke_section_control(
             section_id=section_id,
             action="disarm",
             code=code,
-            allowed_user_ids=allowed_user_ids,
             op="disarm_section",
             log_detail="",
         )
@@ -466,25 +460,21 @@ class PanelRuntime:
         section_id: int,
         action: str,
         code: str | None,
-        allowed_user_ids: list[int] | None,
         op: str,
         log_detail: str,
     ) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
         effective_code = await self._effective_control_code(code)
-        user = await self._find_user_for_code(effective_code)
-        # Token binding: when the caller's token is restricted to a user-id
-        # allow-list, refuse a code that resolves to a user outside that
-        # list. Matches the behavior already enforced for PG control.
-        await self._ensure_code_allowed_for_token(effective_code, allowed_user_ids)
-        await self._ensure_code_can_control_section(effective_code, section_id)
+        # The supplied code is forwarded to the panel as-is; the panel is the
+        # sole authority on whether the code is valid and what it may control.
+        # The API server only gates on token scope (sections:arm/disarm plus
+        # codes:impersonate when a code is supplied) at the route layer.
         LOGGER.info(
-            "Panel %s requested: section=%s %scode_source=%s resolved_user=%s",
+            "Panel %s requested: section=%s %scode_source=%s",
             op,
             section_id,
             f"{log_detail} " if log_detail else "",
             "explicit" if code and code.strip() else "service_default",
-            None if user is None else user.id,
         )
         async with self._lock:
             session = self._status_session
@@ -505,22 +495,18 @@ class PanelRuntime:
         pg_id: int,
         enabled: bool,
         code: str | None = None,
-        *,
-        allowed_user_ids: list[int] | None = None,
     ) -> PanelStatusModel:
         self._ensure_usable_pg_id(pg_id)
         effective_code = (code or "").strip()
         if not effective_code:
             raise PermissionError("PG control requires an explicit panel code.")
-        user = await self._find_user_for_code(effective_code)
-        await self._ensure_code_allowed_for_token(effective_code, allowed_user_ids)
-        await self._ensure_code_can_control_pg(effective_code, pg_id)
+        # As with section control, the code is forwarded verbatim and the panel
+        # decides validity and authorization; the route layer has already
+        # required pgs:control plus codes:impersonate.
         LOGGER.info(
-            "Panel set_pg requested: pg=%s enabled=%s resolved_user=%s allowed_user_ids=%s",
+            "Panel set_pg requested: pg=%s enabled=%s code_source=explicit",
             pg_id,
             enabled,
-            None if user is None else user.id,
-            allowed_user_ids,
         )
         async with self._lock:
             session = self._status_session
@@ -539,58 +525,6 @@ class PanelRuntime:
     async def _effective_control_code(self, code: str | None) -> str:
         normalized = (code or "").strip()
         return normalized or self._config.auth_code
-
-    async def _ensure_code_can_control_section(self, code: str, section_id: int) -> None:
-        user = await self._find_user_for_code(code)
-        if user is None:
-            return
-        if section_id not in user.section_ids:
-            LOGGER.warning("Section control denied by user rights: user=%s section=%s", user.id, section_id)
-            raise PermissionError(
-                f"The supplied code is not allowed to control section {section_id}."
-            )
-
-    async def _ensure_code_can_control_pg(self, code: str, pg_id: int) -> None:
-        user = await self._find_user_for_code(code)
-        if user is None:
-            return
-        if pg_id not in user.pg_ids:
-            LOGGER.warning("PG control denied by user rights: user=%s pg=%s", user.id, pg_id)
-            raise PermissionError(
-                f"The supplied code is not allowed to control PG {pg_id}."
-            )
-
-    async def _ensure_code_allowed_for_token(self, code: str, allowed_user_ids: list[int] | None) -> None:
-        if not allowed_user_ids:
-            return
-        user = await self._find_user_for_code(code)
-        if user is None:
-            LOGGER.warning(
-                "Control impersonation denied: supplied code did not resolve to an exported user allowed by token binding"
-            )
-            raise PermissionError(
-                "Supplied code does not match a Jablotron user allowed by this token."
-            )
-        if user.id not in allowed_user_ids:
-            LOGGER.warning(
-                "Control impersonation denied: user=%s not in allowed_user_ids=%s",
-                user.id,
-                allowed_user_ids,
-            )
-            raise PermissionError("The supplied code is not allowed by this token.")
-
-    async def _find_user_for_code(self, code: str) -> UserModel | None:
-        catalog = await self.get_catalog()
-        for user in catalog.users:
-            if user.code == code:
-                return user
-        return None
-
-    async def get_user_for_code(self, code: str) -> UserModel | None:
-        normalized = (code or "").strip()
-        if not normalized:
-            return None
-        return await self._find_user_for_code(normalized)
 
     # ---------------------------------------------------------------- user CRUD
 

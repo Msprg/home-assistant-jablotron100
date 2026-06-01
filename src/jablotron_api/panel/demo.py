@@ -290,10 +290,8 @@ class DemoPanelRuntime:
         section_id: int,
         mode: ArmMode,
         code: str | None = None,
-        *,
-        allowed_user_ids: list[int] | None = None,
     ) -> PanelStatusModel:
-        del code, allowed_user_ids
+        del code
         self._ensure_usable_section_id(section_id)
         for section in self._status.sections:
             if section.id == section_id:
@@ -310,10 +308,8 @@ class DemoPanelRuntime:
         self,
         section_id: int,
         code: str | None = None,
-        *,
-        allowed_user_ids: list[int] | None = None,
     ) -> PanelStatusModel:
-        del code, allowed_user_ids
+        del code
         self._ensure_usable_section_id(section_id)
         for section in self._status.sections:
             if section.id == section_id:
@@ -327,10 +323,8 @@ class DemoPanelRuntime:
         pg_id: int,
         enabled: bool,
         code: str | None = None,
-        *,
-        allowed_user_ids: list[int] | None = None,
     ) -> PanelStatusModel:
-        del code, allowed_user_ids
+        del code
         self._ensure_usable_pg_id(pg_id)
         for pg in self._status.pgs:
             if pg.id == pg_id:

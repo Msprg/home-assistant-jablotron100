@@ -296,7 +296,6 @@ class TokenCreateRequest(BaseModel):
     label: str
     scopes: list[str] = Field(default_factory=list)
     certificate_fingerprint: str | None = None
-    allowed_user_ids: list[int] = Field(default_factory=list)
 
     @field_validator("label")
     @classmethod
@@ -315,7 +314,6 @@ class TokenInfoModel(BaseModel):
     label: str
     scopes: list[str]
     certificate_fingerprint: str | None = None
-    allowed_user_ids: list[int] = Field(default_factory=list)
     created_at: datetime
     revoked_at: datetime | None = None
     last_used_at: datetime | None = None
@@ -331,7 +329,6 @@ class AuthenticatedToken(BaseModel):
     label: str
     scopes: list[str]
     certificate_fingerprint: str | None = None
-    allowed_user_ids: list[int] = Field(default_factory=list)
 
 
 class WebSocketEnvelope(BaseModel):

@@ -468,9 +468,7 @@ def create_app(
             op="arm_section",
             resource=f"section:{section_id}",
             audit_details={"mode": mode.value, "code_supplied": bool(code)},
-            runtime_callable=lambda: runtime.arm_section(
-                section_id, mode, code=code, allowed_user_ids=token.allowed_user_ids
-            ),
+            runtime_callable=lambda: runtime.arm_section(section_id, mode, code=code),
             log_summary=lambda updated: (
                 f"mode={mode.value} resulting_state="
                 + str(next((section.state for section in updated.sections if section.id == section_id), None))
@@ -489,9 +487,7 @@ def create_app(
             op="disarm_section",
             resource=f"section:{section_id}",
             audit_details={"code_supplied": bool(code)},
-            runtime_callable=lambda: runtime.disarm_section(
-                section_id, code=code, allowed_user_ids=token.allowed_user_ids
-            ),
+            runtime_callable=lambda: runtime.disarm_section(section_id, code=code),
             log_summary=lambda updated: "resulting_state=" + str(
                 next((section.state for section in updated.sections if section.id == section_id), None)
             ),
@@ -509,9 +505,7 @@ def create_app(
             op="pg_on",
             resource=f"pg:{pg_id}",
             audit_details={"code_supplied": bool(code)},
-            runtime_callable=lambda: runtime.set_pg(
-                pg_id, True, code=code, allowed_user_ids=token.allowed_user_ids
-            ),
+            runtime_callable=lambda: runtime.set_pg(pg_id, True, code=code),
             log_summary=lambda updated: "resulting_state=" + str(
                 next((pg.state for pg in updated.pgs if pg.id == pg_id), None)
             ),
@@ -529,9 +523,7 @@ def create_app(
             op="pg_off",
             resource=f"pg:{pg_id}",
             audit_details={"code_supplied": bool(code)},
-            runtime_callable=lambda: runtime.set_pg(
-                pg_id, False, code=code, allowed_user_ids=token.allowed_user_ids
-            ),
+            runtime_callable=lambda: runtime.set_pg(pg_id, False, code=code),
             log_summary=lambda updated: "resulting_state=" + str(
                 next((pg.state for pg in updated.pgs if pg.id == pg_id), None)
             ),
@@ -645,7 +637,6 @@ def create_app(
                 label=payload.label,
                 scopes=payload.scopes,
                 certificate_fingerprint=payload.certificate_fingerprint,
-                allowed_user_ids=payload.allowed_user_ids,
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -656,11 +647,10 @@ def create_app(
             details=payload.model_dump(mode="json"),
         )
         LOGGER.info(
-            "Token created via API: actor=%s token=%s scopes=%s allowed_user_ids=%s fingerprint_bound=%s",
+            "Token created via API: actor=%s token=%s scopes=%s fingerprint_bound=%s",
             _token_log_label(token),
             f"{sanitize_for_log(token_info.label)} ({token_info.id})",
             ",".join(token_info.scopes),
-            token_info.allowed_user_ids,
             bool(token_info.certificate_fingerprint),
         )
         return TokenCreateResponse(token=token_value, token_info=token_info)

@@ -23,13 +23,10 @@ def cmd_bootstrap_token(args: argparse.Namespace) -> None:
         label=args.label,
         scopes=args.scopes or list(DEFAULT_ADMIN_SCOPES),
         certificate_fingerprint=args.certificate_fingerprint,
-        allowed_user_ids=args.allowed_user_ids,
     )
     print(f"token {token_value}")
     print(f"id {token_info.id}")
     print(f"scopes {','.join(token_info.scopes)}")
-    if token_info.allowed_user_ids:
-        print(f"allowed_user_ids {','.join(str(item) for item in token_info.allowed_user_ids)}")
 
 
 def cmd_server(_args: argparse.Namespace) -> None:
@@ -109,7 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--label", default="bootstrap-admin")
     bootstrap.add_argument("--scope", dest="scopes", action="append", default=[])
     bootstrap.add_argument("--certificate-fingerprint")
-    bootstrap.add_argument("--allowed-user-id", dest="allowed_user_ids", type=int, action="append", default=[])
     bootstrap.set_defaults(func=cmd_bootstrap_token)
 
     client = subparsers.add_parser("client", help="Run the packaged reference client CLI.")

@@ -97,8 +97,6 @@ def _token_payload(args: argparse.Namespace) -> dict[str, Any]:
     if args.scope:
         payload["scopes"] = args.scope
     _merge_if_set(payload, "certificate_fingerprint", args.certificate_fingerprint)
-    if args.allowed_user_id:
-        payload["allowed_user_ids"] = args.allowed_user_id
     if not payload.get("label"):
         raise SystemExit("Token creation requires --label or a label field in --json.")
     return payload
@@ -298,7 +296,6 @@ def build_parser() -> argparse.ArgumentParser:
     tokens_create.add_argument("--label")
     tokens_create.add_argument("--scope", action="append", default=[])
     tokens_create.add_argument("--certificate-fingerprint")
-    tokens_create.add_argument("--allowed-user-id", type=int, action="append", default=[])
     _set_handler(tokens_create, _run_tokens_create)
     tokens_revoke = tokens_subparsers.add_parser("revoke", parents=[connection])
     tokens_revoke.add_argument("token_id")
