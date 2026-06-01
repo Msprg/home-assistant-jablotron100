@@ -563,6 +563,12 @@ class PersistentSnapshotSession:
     def _ensure_authorized_code_locked(self, client: JablotronUSBClient, code: str) -> None:
         if self._authorized_code == code:
             return
+        # AUTHORISATION_END clears the panel's authorization immediately.
+        # Invalidate our cache before awaiting the result so a wrong-code
+        # rejection cannot leave us thinking the previous code is still
+        # authorized on the panel (it isn't).
+        self._authorized_code = None
+        self._last_control_authorized_at = 0.0
         client.send_packets(
             [
                 Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END),

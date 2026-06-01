@@ -99,6 +99,10 @@ class FakeRuntime:
     async def close(self) -> None:
         return None
 
+    def code_format(self):
+        from jablotron_api.domain.codes import CodeFormat
+        return CodeFormat(code_length=4, code_prefix=False, source="panel")
+
     def add_listener(self, listener) -> None:
         self._listeners.append(listener)
 

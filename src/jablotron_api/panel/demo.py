@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from jablotron_api.domain.codes import CodeFormat, resolve_code_format
 from jablotron_api.domain.models import (
     ArmMode,
     BusStatusModel,
@@ -170,6 +171,14 @@ class DemoPanelRuntime:
             EventRecordModel(timestamp=_utc_now(), kind="EVENT", text="Demo runtime started", source="demo"),
             EventRecordModel(timestamp=_utc_now(), kind="EVENT", text="Warehouse armed in night mode", source="demo", section="2"),
         ]
+
+    def code_format(self) -> CodeFormat:
+        initial = self._catalog.initial_setup
+        return resolve_code_format(
+            catalog_code_length=initial.code_length if initial is not None else None,
+            catalog_code_prefix=initial.code_prefix if initial is not None else None,
+            server_auth_code=None,
+        )
 
     def _ensure_usable_section_id(self, section_id: int) -> None:
         ensure_id_in_range(self._catalog.initial_setup, kind="Section", attr="sections", value=section_id)

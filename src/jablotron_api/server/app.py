@@ -244,21 +244,32 @@ def create_app(
         LOGGER.info("%s completed: token=%s resource=%s %s", op, token_label, resource, summary)
         return result
 
+    def _validate_user_code(code: str | None) -> None:
+        from jablotron_api.domain.codes import validate_user_code
+
+        try:
+            validate_user_code(code, runtime.code_format())
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     def _require_section_arm(token: AuthenticatedToken, code: str | None) -> None:
         require_scopes(token, Scope.SECTIONS_ARM.value)
+        _validate_user_code(code)
         _maybe_require_impersonate(token, code)
 
     def _require_section_disarm(token: AuthenticatedToken, code: str | None) -> None:
         require_scopes(token, Scope.SECTIONS_DISARM.value)
+        _validate_user_code(code)
         _maybe_require_impersonate(token, code)
 
     def _require_pg_control(token: AuthenticatedToken, code: str | None) -> None:
         require_scopes(token, Scope.PGS_CONTROL.value)
-        if code is None or not code.strip():
+        if code is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="PG control requires an explicit panel code.",
             )
+        _validate_user_code(code)
         _maybe_require_impersonate(token, code)
 
     def _maybe_require_impersonate(token: AuthenticatedToken, code: str | None) -> None:
@@ -290,13 +301,36 @@ def create_app(
 
     @app.get("/v1/status")
     async def status_snapshot(token: AuthenticatedToken = Depends(require_token)):
-        require_scopes(
-            token,
-            Scope.SECTIONS_READ.value,
-            Scope.PGS_READ.value,
-            Scope.DEVICES_READ.value,
+        # Status is a composite view; require at least one of the three
+        # per-resource read scopes and return only the slices the token can
+        # actually see. central/refreshed_at/service_mode/source are always
+        # included (they are not gated by any per-resource read scope).
+        granted = {
+            Scope.SECTIONS_READ.value: Scope.SECTIONS_READ.value in token.scopes,
+            Scope.PGS_READ.value: Scope.PGS_READ.value in token.scopes,
+            Scope.DEVICES_READ.value: Scope.DEVICES_READ.value in token.scopes,
+        }
+        if not any(granted.values()):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "missing_scopes",
+                    "missing": [
+                        Scope.SECTIONS_READ.value,
+                        Scope.PGS_READ.value,
+                        Scope.DEVICES_READ.value,
+                    ],
+                    "note": "Need at least one of these read scopes.",
+                },
+            )
+        snapshot = await runtime.get_status()
+        return snapshot.model_copy(
+            update={
+                "sections": snapshot.sections if granted[Scope.SECTIONS_READ.value] else [],
+                "pgs": snapshot.pgs if granted[Scope.PGS_READ.value] else [],
+                "devices": snapshot.devices if granted[Scope.DEVICES_READ.value] else [],
+            }
         )
-        return await runtime.get_status()
 
     @app.get("/v1/sections")
     async def sections(token: AuthenticatedToken = Depends(require_token)):

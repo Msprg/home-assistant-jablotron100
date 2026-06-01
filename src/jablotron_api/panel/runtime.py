@@ -28,6 +28,7 @@ from jablotron_re_tools import (
     cleanup_read_session,
 )
 
+from jablotron_api.domain.codes import CodeFormat, resolve_code_format
 from jablotron_api.domain.models import (
     ArmMode,
     EventRecordModel,
@@ -160,6 +161,14 @@ class PanelRuntime:
 
     def _initial_setup(self) -> InitialSetupModel | None:
         return None if self._catalog is None else self._catalog.initial_setup
+
+    def code_format(self) -> CodeFormat:
+        initial = self._initial_setup()
+        return resolve_code_format(
+            catalog_code_length=initial.code_length if initial is not None else None,
+            catalog_code_prefix=initial.code_prefix if initial is not None else None,
+            server_auth_code=self._config.auth_code or None,
+        )
 
     def _ensure_usable_section_id(self, section_id: int) -> None:
         ensure_id_in_range(self._initial_setup(), kind="Section", attr="sections", value=section_id)
