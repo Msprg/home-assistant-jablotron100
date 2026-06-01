@@ -185,9 +185,20 @@ def ensure_id_in_range(
     attr: str,
     value: int,
 ) -> None:
+    # Cheap sanity floor: every Jablotron resource is 1-indexed and any
+    # legitimate ID fits in a small unsigned int. Reject obviously bogus
+    # values before any catalog data is consulted.
+    if value < 1 or value > 999:
+        raise ValueError(f"{kind} {value} is outside the supported range 1-999.")
     selection = None if initial_setup is None else getattr(initial_setup, attr)
     if selection is None:
-        return
+        # Catalog has not been loaded yet (or its initial_setup is missing).
+        # Fail closed rather than open — we'd rather make the operator wait
+        # for the first catalog pull than risk a panel write with an
+        # unbounded ID.
+        raise ValueError(
+            f"{kind} range is unknown; the catalog has not been loaded yet."
+        )
     if not selection.first_id <= value <= selection.last_id:
         raise ValueError(
             f"{kind} {value} is outside the client-facing usable range "

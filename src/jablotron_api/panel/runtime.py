@@ -427,20 +427,35 @@ class PanelRuntime:
         ArmMode.NIGHT: "arm_night",
     }
 
-    async def arm_section(self, section_id: int, mode: ArmMode, code: str | None = None) -> PanelStatusModel:
+    async def arm_section(
+        self,
+        section_id: int,
+        mode: ArmMode,
+        code: str | None = None,
+        *,
+        allowed_user_ids: list[int] | None = None,
+    ) -> PanelStatusModel:
         return await self._invoke_section_control(
             section_id=section_id,
             action=self._ARM_ACTIONS[mode],
             code=code,
+            allowed_user_ids=allowed_user_ids,
             op="arm_section",
             log_detail=f"mode={mode.value}",
         )
 
-    async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
+    async def disarm_section(
+        self,
+        section_id: int,
+        code: str | None = None,
+        *,
+        allowed_user_ids: list[int] | None = None,
+    ) -> PanelStatusModel:
         return await self._invoke_section_control(
             section_id=section_id,
             action="disarm",
             code=code,
+            allowed_user_ids=allowed_user_ids,
             op="disarm_section",
             log_detail="",
         )
@@ -451,12 +466,17 @@ class PanelRuntime:
         section_id: int,
         action: str,
         code: str | None,
+        allowed_user_ids: list[int] | None,
         op: str,
         log_detail: str,
     ) -> PanelStatusModel:
         self._ensure_usable_section_id(section_id)
         effective_code = await self._effective_control_code(code)
         user = await self._find_user_for_code(effective_code)
+        # Token binding: when the caller's token is restricted to a user-id
+        # allow-list, refuse a code that resolves to a user outside that
+        # list. Matches the behavior already enforced for PG control.
+        await self._ensure_code_allowed_for_token(effective_code, allowed_user_ids)
         await self._ensure_code_can_control_section(effective_code, section_id)
         LOGGER.info(
             "Panel %s requested: section=%s %scode_source=%s resolved_user=%s",
@@ -527,7 +547,7 @@ class PanelRuntime:
         if section_id not in user.section_ids:
             LOGGER.warning("Section control denied by user rights: user=%s section=%s", user.id, section_id)
             raise PermissionError(
-                f"Code is known as user {user.id} and is not allowed to control section {section_id}."
+                f"The supplied code is not allowed to control section {section_id}."
             )
 
     async def _ensure_code_can_control_pg(self, code: str, pg_id: int) -> None:
@@ -537,7 +557,7 @@ class PanelRuntime:
         if pg_id not in user.pg_ids:
             LOGGER.warning("PG control denied by user rights: user=%s pg=%s", user.id, pg_id)
             raise PermissionError(
-                f"Code is known as user {user.id} and is not allowed to control PG {pg_id}."
+                f"The supplied code is not allowed to control PG {pg_id}."
             )
 
     async def _ensure_code_allowed_for_token(self, code: str, allowed_user_ids: list[int] | None) -> None:
@@ -546,16 +566,18 @@ class PanelRuntime:
         user = await self._find_user_for_code(code)
         if user is None:
             LOGGER.warning(
-                "PG/control impersonation denied: supplied code did not resolve to an exported user allowed by token binding"
+                "Control impersonation denied: supplied code did not resolve to an exported user allowed by token binding"
             )
-            raise PermissionError("Supplied code does not match an exported Jablotron user allowed by this token.")
+            raise PermissionError(
+                "Supplied code does not match a Jablotron user allowed by this token."
+            )
         if user.id not in allowed_user_ids:
             LOGGER.warning(
-                "PG/control impersonation denied: user=%s not in allowed_user_ids=%s",
+                "Control impersonation denied: user=%s not in allowed_user_ids=%s",
                 user.id,
                 allowed_user_ids,
             )
-            raise PermissionError(f"Code is known as user {user.id} and is not allowed by this token.")
+            raise PermissionError("The supplied code is not allowed by this token.")
 
     async def _find_user_for_code(self, code: str) -> UserModel | None:
         catalog = await self.get_catalog()

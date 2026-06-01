@@ -127,6 +127,14 @@ class TokenStore:
         certificate_fingerprint: str | None = None,
         allowed_user_ids: list[int] | None = None,
     ) -> tuple[str, TokenInfoModel]:
+        # Reject control characters in the label so a CR/LF/tab cannot be
+        # used to forge audit-log entries or split structured log lines.
+        if not label or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in label):
+            raise ValueError(
+                "Token label must be non-empty and free of control characters."
+            )
+        if len(label) > 200:
+            raise ValueError("Token label must be 200 characters or fewer.")
         token_value = secrets.token_urlsafe(32)
         token_id = secrets.token_hex(8)
         created_at = utc_now_iso()

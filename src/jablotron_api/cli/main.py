@@ -43,6 +43,14 @@ def cmd_server(_args: argparse.Namespace) -> None:
     log_config["formatters"]["access"]["fmt"] = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
     log_config["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    # Redact sensitive query parameters (token=, fingerprint=) from
+    # uvicorn's access log before they hit any file or stdout sink.
+    log_config.setdefault("filters", {})["redact_sensitive_query"] = {
+        "()": "jablotron_api.server.app.SensitiveQueryAccessLogFilter",
+    }
+    log_config["loggers"]["uvicorn.access"].setdefault("filters", []).append(
+        "redact_sensitive_query"
+    )
     uvicorn_kwargs: dict = dict(
         host=settings.host,
         port=settings.port,

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import json
 import logging
-from typing import Any, Awaitable, Callable
+import re
+from typing import Any, Awaitable, Callable, Mapping
 
 from fastapi import (
     Depends,
@@ -44,6 +46,22 @@ from jablotron_api.services.storage import TokenStore
 LOGGER = logging.getLogger(__name__)
 
 
+# WebSocket message size cap. 64 KiB is more than enough for any
+# legitimate subscribe / ping payload; anything larger is treated as a
+# DoS attempt and the connection is closed with code 1009.
+_WS_MAX_MESSAGE_BYTES: int = 64 * 1024
+
+# HTTP request body size cap. Token CRUD / user CRUD payloads are small;
+# anything larger is rejected with 413 before any handler runs.
+_MAX_HTTP_BODY_BYTES: int = 1 * 1024 * 1024
+
+
+def _json_response(status_code: int, body: dict[str, Any]):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=status_code, content=body)
+
+
 TOPIC_SCOPES: dict[str, tuple[str, ...]] = {
     # status topic carries sections+pgs+devices; consumers need all three read scopes
     "status": (Scope.SECTIONS_READ.value, Scope.PGS_READ.value, Scope.DEVICES_READ.value),
@@ -52,6 +70,66 @@ TOPIC_SCOPES: dict[str, tuple[str, ...]] = {
     "catalog": (Scope.CATALOG_READ.value,),
     "system": (Scope.SYSTEM_READ.value,),
 }
+
+
+class SensitiveQueryAccessLogFilter(logging.Filter):
+    """Redact ?token=... and ?fingerprint=... from uvicorn access log lines.
+
+    uvicorn formats access lines as ``"{request_line} {status_code}"`` where
+    ``request_line`` is e.g. ``GET /v1/ws?token=abc HTTP/1.1``. The token
+    would otherwise land in any access-log sink (stdout, container logs,
+    log shippers, ELK). This filter rewrites the request_line argument
+    before formatting.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not args:
+            return True
+        if isinstance(args, dict):
+            redacted = {key: _redact_url(value) if isinstance(value, str) else value for key, value in args.items()}
+            record.args = redacted
+            return True
+        if isinstance(args, tuple):
+            record.args = tuple(_redact_url(item) if isinstance(item, str) else item for item in args)
+        return True
+
+
+_SENSITIVE_QUERY_PARAMS: tuple[str, ...] = ("token", "fingerprint")
+_QUERY_REDACTION_PATTERN: re.Pattern[str] = re.compile(
+    r"([?&](?:" + "|".join(_SENSITIVE_QUERY_PARAMS) + r")=)[^& \"]+",
+    re.IGNORECASE,
+)
+_LOG_INJECTION_PATTERN: re.Pattern[str] = re.compile(r"[\r\n\t\x00-\x1f\x7f]")
+
+
+def _redact_url(url: str) -> str:
+    return _QUERY_REDACTION_PATTERN.sub(r"\1<redacted>", url)
+
+
+def sanitize_for_log(value: str | None) -> str:
+    """Strip control characters that would let an attacker forge log lines."""
+
+    if value is None:
+        return ""
+    return _LOG_INJECTION_PATTERN.sub("?", value)
+
+
+def _bearer_token_from_headers(headers: Mapping[str, str]) -> str | None:
+    auth = headers.get("authorization") if hasattr(headers, "get") else None
+    if not auth or not auth.lower().startswith("bearer "):
+        return None
+    return auth.split(" ", 1)[1].strip() or None
+
+
+def certificate_fingerprint_from_request(request: Request) -> str | None:
+    """Module-level dependency so tests can override it via FastAPI's
+    ``app.dependency_overrides`` mapping. We never accept a fingerprint
+    from a client-supplied header or query parameter — only from the
+    mTLS-aware uvicorn protocol's TLS scope extension.
+    """
+
+    return _tls_fingerprint_from_scope(request.scope)
 
 
 def _tls_fingerprint_from_scope(scope: dict) -> str | None:
@@ -72,7 +150,9 @@ def _short_fingerprint(fingerprint: str | None) -> str | None:
 
 
 def _token_log_label(token: AuthenticatedToken) -> str:
-    return f"{token.label} ({token.id})"
+    # Sanitize the user-controlled label so a token created with a newline
+    # in its label cannot forge or split log entries.
+    return f"{sanitize_for_log(token.label)} ({token.id})"
 
 
 def _authorize_topic(token: AuthenticatedToken, topic: str) -> bool:
@@ -163,11 +243,39 @@ def create_app(
     app.state.ws_manager = ws_manager
     app.state.settings = settings
 
-    def certificate_fingerprint_from_request(
-        request: Request,
-        x_client_cert_fingerprint: str | None = Header(default=None),
-    ) -> str | None:
-        return _tls_fingerprint_from_scope(request.scope) or x_client_cert_fingerprint
+    @app.middleware("http")
+    async def _limit_request_body(request: Request, call_next):
+        # Refuse requests that advertise a body larger than the cap so a
+        # malicious or malfunctioning client cannot exhaust memory before
+        # any handler runs. None of our endpoints accept payloads larger
+        # than a few KiB; 1 MiB is generous.
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > _MAX_HTTP_BODY_BYTES:
+                    return _json_response(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        {"detail": "Request body too large."},
+                    )
+            except ValueError:
+                return _json_response(
+                    status.HTTP_400_BAD_REQUEST,
+                    {"detail": "Malformed Content-Length header."},
+                )
+        try:
+            return await call_next(request)
+        except RecursionError:
+            # Deeply-nested JSON exceeds Python's recursion limit during
+            # parsing — return a clean 400 instead of crashing the worker.
+            LOGGER.warning(
+                "RecursionError while handling request method=%s path=%s",
+                request.method,
+                request.url.path,
+            )
+            return _json_response(
+                status.HTTP_400_BAD_REQUEST,
+                {"detail": "Request payload nesting too deep."},
+            )
 
     def require_token(
         request: Request,
@@ -360,7 +468,9 @@ def create_app(
             op="arm_section",
             resource=f"section:{section_id}",
             audit_details={"mode": mode.value, "code_supplied": bool(code)},
-            runtime_callable=lambda: runtime.arm_section(section_id, mode, code=code),
+            runtime_callable=lambda: runtime.arm_section(
+                section_id, mode, code=code, allowed_user_ids=token.allowed_user_ids
+            ),
             log_summary=lambda updated: (
                 f"mode={mode.value} resulting_state="
                 + str(next((section.state for section in updated.sections if section.id == section_id), None))
@@ -379,7 +489,9 @@ def create_app(
             op="disarm_section",
             resource=f"section:{section_id}",
             audit_details={"code_supplied": bool(code)},
-            runtime_callable=lambda: runtime.disarm_section(section_id, code=code),
+            runtime_callable=lambda: runtime.disarm_section(
+                section_id, code=code, allowed_user_ids=token.allowed_user_ids
+            ),
             log_summary=lambda updated: "resulting_state=" + str(
                 next((section.state for section in updated.sections if section.id == section_id), None)
             ),
@@ -528,12 +640,15 @@ def create_app(
         payload: TokenCreateRequest, token: AuthenticatedToken = Depends(require_token)
     ) -> TokenCreateResponse:
         require_scopes(token, Scope.TOKENS_ADMIN.value)
-        token_value, token_info = token_store.create_token(
-            label=payload.label,
-            scopes=payload.scopes,
-            certificate_fingerprint=payload.certificate_fingerprint,
-            allowed_user_ids=payload.allowed_user_ids,
-        )
+        try:
+            token_value, token_info = token_store.create_token(
+                label=payload.label,
+                scopes=payload.scopes,
+                certificate_fingerprint=payload.certificate_fingerprint,
+                allowed_user_ids=payload.allowed_user_ids,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         token_store.write_audit(
             token_id=token.id,
             action="create_token",
@@ -543,7 +658,7 @@ def create_app(
         LOGGER.info(
             "Token created via API: actor=%s token=%s scopes=%s allowed_user_ids=%s fingerprint_bound=%s",
             _token_log_label(token),
-            f"{token_info.label} ({token_info.id})",
+            f"{sanitize_for_log(token_info.label)} ({token_info.id})",
             ",".join(token_info.scopes),
             token_info.allowed_user_ids,
             bool(token_info.certificate_fingerprint),
@@ -568,11 +683,31 @@ def create_app(
     @app.websocket("/v1/ws")
     async def websocket_endpoint(
         websocket: WebSocket,
-        token: str = Query(...),
-        fingerprint: str | None = Query(default=None),
+        token: str | None = Query(default=None),
     ):
-        fingerprint = _tls_fingerprint_from_scope(websocket.scope) or fingerprint
-        authenticated = token_store.authenticate(token, certificate_fingerprint=fingerprint)
+        # Auth precedence:
+        #   1. Authorization: Bearer <token> header on the WS upgrade request.
+        #   2. ?token=<token> query parameter (kept for HA-integration
+        #      compatibility — deprecated for v1.1; tokens in URLs land in
+        #      access logs and proxy logs).
+        # The TLS fingerprint is read only from the verified TLS scope;
+        # never from a client-supplied query parameter or header.
+        header_token = _bearer_token_from_headers(websocket.headers)
+        token_value = header_token or token
+        if not token_value:
+            LOGGER.warning(
+                "WebSocket authentication failed: missing bearer token path=%s",
+                websocket.url.path,
+            )
+            await websocket.close(code=4401)
+            return
+        if header_token is None and token is not None:
+            LOGGER.warning(
+                "WebSocket authentication used deprecated ?token= query parameter; "
+                "move to the Authorization header to keep the token out of access logs.",
+            )
+        fingerprint = _tls_fingerprint_from_scope(websocket.scope)
+        authenticated = token_store.authenticate(token_value, certificate_fingerprint=fingerprint)
         if authenticated is None:
             LOGGER.warning(
                 "WebSocket authentication failed: path=%s fingerprint=%s",
@@ -590,12 +725,34 @@ def create_app(
         try:
             await websocket.send_json({"event": "hello", "topics": list(TOPIC_SCOPES)})
             while True:
-                message = await websocket.receive_json()
+                # receive_text + json.loads instead of receive_json so we can
+                # cap message size and route JSONDecodeError to a 1003 close
+                # instead of crashing the receive loop with an uncaught
+                # exception.
+                raw = await websocket.receive_text()
+                if len(raw) > _WS_MAX_MESSAGE_BYTES:
+                    LOGGER.warning(
+                        "WebSocket message exceeded size cap: token=%s size=%d",
+                        _token_log_label(authenticated),
+                        len(raw),
+                    )
+                    await websocket.close(code=1009, reason="message too large")
+                    return
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    await websocket.send_json({"event": "error", "error": "invalid_json"})
+                    continue
+                if not isinstance(message, dict):
+                    await websocket.send_json({"event": "error", "error": "invalid_message"})
+                    continue
                 action = message.get("action")
                 if action == "subscribe":
                     await _handle_ws_subscribe(websocket, authenticated, message)
                 elif action == "ping":
                     await websocket.send_json({"event": "pong"})
+                else:
+                    await websocket.send_json({"event": "error", "error": "unknown_action"})
         except WebSocketDisconnect:
             LOGGER.info("WebSocket disconnected: token=%s", _token_log_label(authenticated))
         finally:

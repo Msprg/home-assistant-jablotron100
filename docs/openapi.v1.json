@@ -500,22 +500,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -613,22 +597,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -729,22 +697,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -788,22 +740,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -849,22 +785,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -909,22 +829,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -968,22 +872,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -1050,22 +938,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -1136,22 +1008,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1221,22 +1077,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1280,22 +1120,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -1375,22 +1199,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1460,22 +1268,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1520,22 +1312,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1579,22 +1355,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -1642,22 +1402,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1699,22 +1443,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -1781,22 +1509,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1841,22 +1553,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -1898,22 +1594,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],
@@ -1978,22 +1658,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -2045,22 +1709,6 @@
               ],
               "title": "Authorization"
             }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
-            }
           }
         ],
         "responses": {
@@ -2111,22 +1759,6 @@
                 }
               ],
               "title": "Authorization"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-client-cert-fingerprint",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Client-Cert-Fingerprint"
             }
           }
         ],

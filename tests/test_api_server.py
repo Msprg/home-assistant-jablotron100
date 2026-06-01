@@ -136,7 +136,8 @@ class FakeRuntime:
     async def get_export_communications(self):
         return {"communications": {"service_enabled": True, "sms_enabled": False}}
 
-    async def arm_section(self, section_id, mode, code=None):
+    async def arm_section(self, section_id, mode, code=None, *, allowed_user_ids=None):
+        del allowed_user_ids
         if section_id != 1:
             raise ValueError("Section 2 is outside the client-facing usable range 1-1.")
         self.last_arm_code = code
@@ -145,7 +146,8 @@ class FakeRuntime:
             await listener("status", self.status.model_dump(mode="json"))
         return self.status
 
-    async def disarm_section(self, section_id, code=None):
+    async def disarm_section(self, section_id, code=None, *, allowed_user_ids=None):
+        del allowed_user_ids
         if section_id != 1:
             raise ValueError("Section 2 is outside the client-facing usable range 1-1.")
         self.last_disarm_code = code
@@ -451,7 +453,8 @@ def test_panel_runtime_rejects_pg_control_for_known_user_without_pg_rights() -> 
         try:
             await runtime.set_pg(15, True, code="4458")
         except PermissionError as exc:
-            assert str(exc) == "Code is known as user 100 and is not allowed to control PG 15."
+            assert str(exc) == "The supplied code is not allowed to control PG 15."
+            assert "100" not in str(exc)  # user id MUST NOT leak to clients
         else:
             raise AssertionError("Expected PermissionError for unauthorized PG control.")
 
@@ -484,7 +487,8 @@ def test_panel_runtime_rejects_pg_control_for_token_bound_to_other_user() -> Non
         try:
             await runtime.set_pg(15, True, code="4458", allowed_user_ids=[101])
         except PermissionError as exc:
-            assert str(exc) == "Code is known as user 100 and is not allowed by this token."
+            assert str(exc) == "The supplied code is not allowed by this token."
+            assert "100" not in str(exc)
         else:
             raise AssertionError("Expected PermissionError for token/user mismatch.")
 
@@ -1312,20 +1316,42 @@ def test_scope_denial_revocation_and_certificate_binding(tmp_path: Path) -> None
     missing_fingerprint = client.get("/v1/system", headers={"Authorization": f"Bearer {cert_token}"})
     assert missing_fingerprint.status_code == 401
 
-    matching_fingerprint = client.get(
-        "/v1/system",
-        headers={
-            "Authorization": f"Bearer {cert_token}",
-            "X-Client-Cert-Fingerprint": "demo-fingerprint",
-        },
-    )
-    assert matching_fingerprint.status_code == 200
+    from jablotron_api.server.app import certificate_fingerprint_from_request
+
+    # Override the TLS-scope-derived dependency to simulate a verified
+    # client cert in the test transport, which doesn't actually run mTLS.
+    # The server never reads cert fingerprints from request headers or
+    # query parameters; this override is the only sanctioned way to inject
+    # one from a test.
+    app.dependency_overrides[certificate_fingerprint_from_request] = lambda: "demo-fingerprint"
+    try:
+        matching_fingerprint = client.get(
+            "/v1/system",
+            headers={"Authorization": f"Bearer {cert_token}"},
+        )
+        assert matching_fingerprint.status_code == 200
+
+        # Header injection MUST NOT bypass cert binding: even with a
+        # matching fingerprint in the X-Client-Cert-Fingerprint header,
+        # the server should ignore it when the dependency returns None.
+        app.dependency_overrides[certificate_fingerprint_from_request] = lambda: None
+        forged_header = client.get(
+            "/v1/system",
+            headers={
+                "Authorization": f"Bearer {cert_token}",
+                "X-Client-Cert-Fingerprint": "demo-fingerprint",
+            },
+        )
+        assert forged_header.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_section_control_ack_failure_returns_conflict(tmp_path: Path) -> None:
     runtime = FakeRuntime()
 
-    async def fail_arm(section_id, mode, code=None):
+    async def fail_arm(section_id, mode, code=None, *, allowed_user_ids=None):
+        del allowed_user_ids
         raise RuntimeError("Section control was not acknowledged by the panel.")
 
     runtime.arm_section = fail_arm

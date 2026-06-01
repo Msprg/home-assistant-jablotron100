@@ -285,8 +285,15 @@ class DemoPanelRuntime:
             }
         }
 
-    async def arm_section(self, section_id: int, mode: ArmMode, code: str | None = None) -> PanelStatusModel:
-        del code
+    async def arm_section(
+        self,
+        section_id: int,
+        mode: ArmMode,
+        code: str | None = None,
+        *,
+        allowed_user_ids: list[int] | None = None,
+    ) -> PanelStatusModel:
+        del code, allowed_user_ids
         self._ensure_usable_section_id(section_id)
         for section in self._status.sections:
             if section.id == section_id:
@@ -299,8 +306,14 @@ class DemoPanelRuntime:
         self._events.insert(0, EventRecordModel(timestamp=_utc_now(), kind="EVENT", text=f"Section {section_id} armed {mode.value}", source="demo", section=str(section_id)))
         return await self.refresh_status()
 
-    async def disarm_section(self, section_id: int, code: str | None = None) -> PanelStatusModel:
-        del code
+    async def disarm_section(
+        self,
+        section_id: int,
+        code: str | None = None,
+        *,
+        allowed_user_ids: list[int] | None = None,
+    ) -> PanelStatusModel:
+        del code, allowed_user_ids
         self._ensure_usable_section_id(section_id)
         for section in self._status.sections:
             if section.id == section_id:

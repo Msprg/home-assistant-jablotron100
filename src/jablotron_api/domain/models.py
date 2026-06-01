@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def utc_now() -> datetime:
@@ -297,6 +297,17 @@ class TokenCreateRequest(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     certificate_fingerprint: str | None = None
     allowed_user_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("label")
+    @classmethod
+    def _label_must_not_contain_control_chars(cls, value: str) -> str:
+        # Reject CR, LF, tab, and other C0 / DEL control characters so a
+        # crafted label cannot forge a log line or split structured logs.
+        if not value or len(value) > 200 or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+            raise ValueError(
+                "Token label must be 1-200 characters and free of control characters."
+            )
+        return value
 
 
 class TokenInfoModel(BaseModel):
