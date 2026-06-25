@@ -2776,10 +2776,20 @@ class Jablotron:
 
 	@staticmethod
 	def detect_serial_port() -> str | None:
-		return Jablotron._check_possible_paths_for_serial_port(os.listdir(HIDRAW_PATH))
+		try:
+			possible_paths = os.listdir(HIDRAW_PATH)
+		except OSError as ex:
+			LOGGER.debug("Failed to list %s: %s", HIDRAW_PATH, ex)
+			return None
+
+		return Jablotron._check_possible_paths_for_serial_port(possible_paths)
 
 	async def _detect_serial_port(self) -> str | None:
-		possible_paths = await self._hass.async_add_executor_job(os.listdir, HIDRAW_PATH)
+		try:
+			possible_paths = await self._hass.async_add_executor_job(os.listdir, HIDRAW_PATH)
+		except OSError as ex:
+			LOGGER.debug("Failed to list %s: %s", HIDRAW_PATH, ex)
+			return None
 
 		return Jablotron._check_possible_paths_for_serial_port(possible_paths)
 
