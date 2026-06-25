@@ -13,6 +13,7 @@ from jablotron_usb_debug import (
     DeviceInfoType,
     Jablotron,
     JablotronUSBClient,
+    JablotronUSBStreamError,
     SystemInfo,
     UI_CONTROL_AUTHORISATION_END,
     UI_CONTROL_MODIFY_SECTION,
@@ -114,6 +115,12 @@ FAST_CONTROL_CONFIRMATION_TIMEOUT_SECONDS = 0.25
 AUTHORIZATION_REFRESH_SETTLE_SECONDS = 0.12
 PG_CONTROL_QUERY_SETTLE_SECONDS = 0.05
 CONTROL_AUTHORIZATION_IDLE_SECONDS = 60.0
+# Reopen backoff after a USB stream failure: refuse to retry the (re)open+login
+# until a deadline that grows linearly with the failure streak, capped, so a
+# truly-absent device does not get hammered. Mirrors upstream STREAM_REOPEN_DELAY
+# / STREAM_REOPEN_MAX_DELAY (cd2432d).
+STREAM_REOPEN_DELAY_SECONDS = 1.0
+STREAM_REOPEN_MAX_DELAY_SECONDS = 30.0
 
 
 def _diagnostics_timeout_for_device(device: DeviceStatusModel) -> float:
@@ -380,6 +387,9 @@ class PersistentSnapshotSession:
     """Long-lived authenticated HID session for steady-state status polling."""
 
     def __init__(self, *, port: str, code: str, reset: bool = True) -> None:
+        # Keep the raw configured value ("auto" or a fixed path) so the port can
+        # be re-resolved after a USB re-enumeration, not just once at startup.
+        self._configured_port = port
         self._serial_port = ensure_serial_port(port)
         self._code = code
         self._reset = reset
@@ -390,6 +400,9 @@ class PersistentSnapshotSession:
         self._last_enable_device_states_at = 0.0
         self._authorized_code: str | None = None
         self._last_control_authorized_at = 0.0
+        # Reopen-backoff state, mutated only under self._io_lock.
+        self._reopen_failures = 0
+        self._next_reopen_allowed_at = 0.0
 
     def close(self) -> None:
         self._stop_event.set()
@@ -517,7 +530,30 @@ class PersistentSnapshotSession:
         if self._client is not None:
             return self._client
 
-        client = JablotronUSBClient(self._serial_port)
+        # Reopen backoff: after a (re)open failure, refuse to retry until the
+        # deadline so a truly-absent device is not hammered on every poll/request.
+        # Only consult the clock while actually in a failure streak, so the
+        # steady-state open path issues no extra time.monotonic() call.
+        if self._reopen_failures > 0:
+            now = time.monotonic()
+            if now < self._next_reopen_allowed_at:
+                raise JablotronUSBStreamError(
+                    f"USB device unavailable on {self._serial_port}; backing off "
+                    f"{self._next_reopen_allowed_at - now:.1f}s before the next reopen attempt"
+                )
+            # A /dev/hidrawN renumbering is picked up before we try to reopen.
+            self._redetect_serial_port_locked()
+
+        try:
+            client = JablotronUSBClient(self._serial_port)
+        except OSError as exc:
+            # Device path missing/dead: feed backoff and surface a catchable error
+            # without ever reaching the expensive login sequence.
+            self._note_reopen_failure_locked()
+            raise JablotronUSBStreamError(
+                f"Failed to open USB device {self._serial_port}: {exc}"
+            ) from exc
+
         try:
             active_code = auth_code or self._code
             perform_login(client, active_code, reset=self._reset)
@@ -528,13 +564,52 @@ class PersistentSnapshotSession:
             self._drain_packets_locked(client, timeout=0.5)
         except Exception:
             client.close()
+            self._note_reopen_failure_locked()
             raise
 
         self._client = client
         self._authorized_code = active_code
         self._last_control_authorized_at = time.monotonic()
+        # Successful (re)open clears the backoff streak.
+        self._reopen_failures = 0
+        self._next_reopen_allowed_at = 0.0
         self._ensure_keepalive_thread_locked()
         return client
+
+    def _note_reopen_failure_locked(self) -> None:
+        """Record a failed (re)open and arm the backoff deadline."""
+        self._reopen_failures += 1
+        delay = min(
+            STREAM_REOPEN_DELAY_SECONDS * self._reopen_failures,
+            STREAM_REOPEN_MAX_DELAY_SECONDS,
+        )
+        self._next_reopen_allowed_at = time.monotonic() + delay
+        LOGGER.debug(
+            "USB (re)open attempt %d failed on %s; backing off %.1fs",
+            self._reopen_failures,
+            self._serial_port,
+            delay,
+        )
+
+    def _redetect_serial_port_locked(self) -> None:
+        """Re-resolve the serial port so a /dev/hidrawN re-enumeration is followed.
+
+        Never raises: ``ensure_serial_port`` raises ``SystemExit`` when no device
+        is found, and ``Jablotron.detect_serial_port`` may raise ``OSError`` on a
+        host without the hidraw sysfs tree. In either case we keep the previously
+        resolved port and let the subsequent open fail into the normal backoff
+        path. Must never raise, because it is also called from the keepalive
+        thread's ``except Exception`` handler where an escaping ``SystemExit``
+        would silently kill the daemon thread.
+        """
+        try:
+            new_port = ensure_serial_port(self._configured_port)
+        except (SystemExit, OSError) as exc:
+            LOGGER.debug("Serial-port redetection found no usable device: %s", exc)
+            return
+        if new_port != self._serial_port:
+            LOGGER.info("Serial port changed from %s to %s", self._serial_port, new_port)
+            self._serial_port = new_port
 
     def _ensure_keepalive_thread_locked(self) -> None:
         if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
@@ -612,6 +687,11 @@ class PersistentSnapshotSession:
                     client.send_packet(RAW_SESSION_KEEPALIVE)
                 except Exception:
                     self._close_client_locked()
+                    # Follow a re-enumerated port so the next reopen targets it.
+                    # _redetect_serial_port_locked never raises (it swallows the
+                    # SystemExit ensure_serial_port raises when no device is
+                    # found), so it cannot kill this daemon thread.
+                    self._redetect_serial_port_locked()
 
     def _maybe_refresh_device_state_stream_locked(self, client: JablotronUSBClient) -> None:
         now = time.monotonic()
