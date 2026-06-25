@@ -22,6 +22,7 @@ from flexi_pcap_tool import IMPORT_START_LBA
 from jablotron_usb_debug import (
     Jablotron,
     JablotronUSBClient,
+    JablotronUSBStreamError,
     build_flink_info_log_reports,
     describe_packet,
     ensure_serial_port,

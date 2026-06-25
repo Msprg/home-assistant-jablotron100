@@ -14,6 +14,7 @@ from export_cfg_tool import extract_users, read_export_direct
 from jablotron_re_tools import add_flexi_cfg_device_argument, resolve_flexi_cfg_device
 from jablotron_usb_debug import (
     JablotronUSBClient,
+    JablotronUSBStreamError,
     Jablotron,
     SystemInfo,
     describe_packet,
@@ -188,7 +189,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except JablotronUSBStreamError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":

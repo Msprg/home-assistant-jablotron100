@@ -260,6 +260,18 @@ def ensure_serial_port(port: str | None) -> str:
     return port
 
 
+class JablotronUSBStreamError(OSError):
+    """Raised when a read/write on the HID stream fails (device yank/re-enumeration).
+
+    Subclasses :class:`OSError` (and therefore :class:`Exception`) on purpose:
+    the long-running server session catches it in its ``except Exception``
+    recovery blocks and reconnects on the next call, whereas the old
+    ``raise SystemExit`` here was a ``BaseException`` that slipped past those
+    handlers and killed the process. One-shot CLI tools convert it back to a
+    clean ``SystemExit`` at their entrypoints.
+    """
+
+
 class JablotronUSBClient:
     """Thin wrapper that mirrors the integration's read/write helpers."""
 
@@ -287,7 +299,10 @@ class JablotronUSBClient:
             self._write(buffer)
 
     def _write(self, payload: bytes) -> None:
-        os.write(self._fd, payload)
+        try:
+            os.write(self._fd, payload)
+        except OSError as exc:
+            raise JablotronUSBStreamError(f"USB write failed on {self._serial_port}: {exc}") from exc
         time.sleep(self._write_delay)
 
     def _log_outgoing(self, packet: bytes) -> None:
@@ -322,7 +337,7 @@ class JablotronUSBClient:
                 for packet in Jablotron.get_packets_from_packet(raw):
                     yield packet
         except OSError as exc:
-            raise SystemExit(f"USB read failed on {self._serial_port}: {exc}") from exc
+            raise JablotronUSBStreamError(f"USB read failed on {self._serial_port}: {exc}") from exc
 
     def close(self) -> None:
         os.close(self._fd)
@@ -733,6 +748,10 @@ def main() -> None:
             monitor_packets(client, timeout=args.timeout, count=args.count, decode=args.decode)
         else:
             parser.error(f"Unhandled command: {args.command}")
+    except JablotronUSBStreamError as exc:
+        # Preserve the clean one-line exit this tool had when read_packets/_write
+        # raised SystemExit directly, now that they raise a catchable error.
+        raise SystemExit(str(exc)) from exc
     finally:
         client.close()
 

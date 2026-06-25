@@ -37,7 +37,7 @@ from jablotron_re_tools import (
     resolve_flexi_log_device,
     unmount_device,
 )
-from jablotron_usb_debug import ensure_serial_port, perform_login
+from jablotron_usb_debug import JablotronUSBStreamError, ensure_serial_port, perform_login
 
 DEFAULT_FLEXI_LOG_MOUNTPOINT = Path("/mnt/flexi_log")
 DEFAULT_WINDOW_BYTES = 102400
@@ -2410,7 +2410,11 @@ def cmd_recent(args: argparse.Namespace) -> None:
     if not getattr(args, "source_export_cfg", None):
         try:
             export_catalog, export_catalog_path = pull_runtime_export_catalog(args, prefix="event_catalog")
-        except SystemExit:
+        except (SystemExit, JablotronUSBStreamError):
+            # A USB read/write failure during the optional catalog pull must not
+            # abort event decoding: continue catalog-less, as before. read_packets
+            # now raises JablotronUSBStreamError instead of SystemExit, so both
+            # are caught here.
             export_catalog = None
         catalog = merge_decoder_catalogs(catalog, export_catalog)
     decoded_records = build_decoded_records(records, archive, catalog=catalog)
@@ -3008,7 +3012,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except JablotronUSBStreamError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 if __name__ == "__main__":
