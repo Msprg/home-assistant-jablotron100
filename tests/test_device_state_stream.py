@@ -300,3 +300,58 @@ def test_stream_loop_iteration_emits_on_device_edge(monkeypatch) -> None:
         session.close()
 
     assert captured and captured[-1].get(4) == "on"
+
+
+# ---------------------------------------- cooperative diagnostics sweep (fix)
+
+
+class _FakeClient:
+    """Minimal client: no-op writes, no packets to read."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def send_packet(self, packet: bytes) -> None:
+        self.sent.append(packet)
+
+    def send_packets(self, packets) -> None:
+        self.sent.extend(packets)
+
+    def read_packets(self, *, timeout=None):
+        return iter(())
+
+    def close(self) -> None:
+        return None
+
+
+def test_diagnostics_sweep_releases_io_lock_between_devices(monkeypatch) -> None:
+    # The core fix: the sweep must NOT hold _io_lock continuously. Between
+    # devices the lock is released (and the worker sleeps off-lock) so the
+    # continuous stream reader can interleave instead of being starved.
+    session = _make_session(monkeypatch)
+    client = _FakeClient()
+    monkeypatch.setattr(session, "_ensure_client_locked", lambda auth_code=None: client)
+    monkeypatch.setattr(session, "_read_into_parser_locked", lambda *a, **k: None)
+    session._client = client
+    devices = [
+        DeviceStatusModel(id=3, name="Therm A", inferred_device_type="thermometer", state="off"),
+        DeviceStatusModel(id=4, name="Therm B", inferred_device_type="thermometer", state="off"),
+    ]
+
+    owned_during_yield: list[bool] = []
+
+    def fake_sleep(_seconds: float) -> None:
+        # The inter-device yield happens off the lock: the worker thread must
+        # not own _io_lock here, or the stream reader could not run.
+        owned_during_yield.append(session._io_lock._is_owned())
+
+    monkeypatch.setattr(legacy.time, "sleep", fake_sleep)
+
+    snapshot = session.query_snapshot(
+        panel_model="JA-107K", pg_count=0, devices=devices, central=None,
+        query_device_status=True, include_diagnostics=True, timeout=0.0,
+    )
+
+    assert owned_during_yield, "expected at least one inter-device yield"
+    assert not any(owned_during_yield), "_io_lock must be released between devices"
+    assert {d.id for d in snapshot.devices} >= {3, 4}

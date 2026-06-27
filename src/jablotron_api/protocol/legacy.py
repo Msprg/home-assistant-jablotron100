@@ -52,6 +52,21 @@ class LegacyPanelSnapshot:
     service_mode: bool
 
 
+@dataclass
+class _SnapshotJob:
+    """In-progress snapshot state carried across the cooperative diagnostics
+    sweep. The sweep releases _io_lock between devices so the continuous stream
+    reader interleaves; the parser/seed/device maps must persist across those
+    releases, so they live here rather than as locals under one lock hold."""
+
+    parser: _SnapshotParser
+    devices_by_id: dict[int, DeviceStatusModel]
+    special_devices: dict[str, int | None]
+    seed_states: dict[int, str | None]
+    pg_count: int
+    diagnostic_numbers: list[int]
+
+
 def _panel_special_devices(model: str | None) -> dict[str, int | None]:
     if model in {"JA-101K", "JA-101K-LAN", "JA-106K-3G", "JA-14K"}:
         return {"power_supply": 124, "lan": 125, "gsm": 127}
@@ -491,11 +506,14 @@ class PersistentSnapshotSession:
         include_diagnostics: bool = False,
         timeout: float = 2.0,
     ) -> LegacyPanelSnapshot:
+        # Base snapshot (sections/PGs/device status) under one short hold. The
+        # diagnostics sweep is the only long part, and it runs cooperatively
+        # below so it never freezes the real-time reader for its full duration.
         with self._io_lock:
             try:
                 client = self._ensure_client_locked()
                 self._maybe_refresh_device_state_stream_locked(client)
-                return self._query_snapshot_locked(
+                job = self._query_snapshot_base_locked(
                     client,
                     panel_model=panel_model,
                     pg_count=pg_count,
@@ -505,6 +523,37 @@ class PersistentSnapshotSession:
                     include_diagnostics=include_diagnostics,
                     timeout=timeout,
                 )
+                if job.parser.login_failed:
+                    self._close_client_locked()
+                    raise WrongCodeError("Wrong code.")
+                if not job.diagnostic_numbers:
+                    # Fast path (no diagnostics): finalize under the same hold so
+                    # a plain poll is a single, brief lock acquisition.
+                    return self._finalize_snapshot_locked(job)
+            except Exception:
+                self._close_client_locked()
+                raise
+
+        # Cooperative diagnostics: one device per lock acquisition, yielding the
+        # bus (sleep off-lock) between devices so the stream reader can run —
+        # read pushed motion, age out dwell-offs, and re-solicit the OFF bitmap.
+        # This caps real-time latency during a sweep at one device's diagnostics
+        # window (~2-3s) instead of the whole ~38s sweep.
+        for device_id in job.diagnostic_numbers:
+            time.sleep(STREAM_LOOP_TICK_SECONDS)
+            with self._io_lock:
+                try:
+                    client = self._client
+                    if client is None:
+                        break  # session bounced mid-sweep; abandon the rest
+                    self._run_one_device_diagnostics_locked(client, job, device_id)
+                except Exception:
+                    self._close_client_locked()
+                    raise
+
+        with self._io_lock:
+            try:
+                return self._finalize_snapshot_locked(job)
             except Exception:
                 self._close_client_locked()
                 raise
@@ -1012,7 +1061,7 @@ class PersistentSnapshotSession:
                 if on_packet is not None:
                     on_packet()
 
-    def _query_snapshot_locked(
+    def _query_snapshot_base_locked(
         self,
         client: JablotronUSBClient,
         *,
@@ -1023,7 +1072,10 @@ class PersistentSnapshotSession:
         query_device_status: bool,
         include_diagnostics: bool,
         timeout: float,
-    ) -> LegacyPanelSnapshot:
+    ) -> _SnapshotJob:
+        """Run the base snapshot (sections/PGs/device status) and compute the
+        diagnostics work-list. Returns a _SnapshotJob the caller drives through
+        the cooperative diagnostics sweep and then finalizes."""
         devices_by_id = {device.id: device.model_copy(deep=True) for device in (devices or [])}
         special_devices = _panel_special_devices(panel_model)
         parser = _SnapshotParser(
@@ -1056,6 +1108,7 @@ class PersistentSnapshotSession:
 
         self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=timeout, on_packet=on_packet)
 
+        diagnostic_numbers: list[int] = []
         if include_diagnostics:
             diagnostic_numbers = [
                 device.id
@@ -1070,42 +1123,55 @@ class PersistentSnapshotSession:
                 if key in {"lan", "gsm"} and isinstance(device_id, int)
             )
             diagnostic_numbers.append(0)
-            for device_id in diagnostic_numbers:
-                device = devices_by_id.get(device_id)
-                packets = [
-                    Jablotron._create_packet_device_diagnostics_start(device_id),
-                    Jablotron._create_packet_device_diagnostics_force_info(device_id),
-                ]
-                if device is not None:
-                    packets.insert(0, Jablotron.create_packet_device_info(device_id))
-                client.send_packets(packets)
-                self._read_into_parser_locked(
-                    client,
-                    parser,
-                    pg_count=pg_count,
-                    timeout=DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS if device is None else _diagnostics_timeout_for_device(device),
-                    stop_on_first_gap=False,
-                    on_packet=on_packet,
-                )
-                client.send_packet(Jablotron._create_packet_device_diagnostics_end(device_id))
-                self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=0.1, on_packet=on_packet)
 
-        if parser.login_failed:
-            self._close_client_locked()
-            raise WrongCodeError("Wrong code.")
+        return _SnapshotJob(
+            parser=parser,
+            devices_by_id=devices_by_id,
+            special_devices=special_devices,
+            seed_states=seed_states,
+            pg_count=pg_count,
+            diagnostic_numbers=diagnostic_numbers,
+        )
 
+    def _run_one_device_diagnostics_locked(self, client: JablotronUSBClient, job: _SnapshotJob, device_id: int) -> None:
+        """Diagnose a single device into the job's parser. Called under a fresh
+        lock acquisition per device so the stream reader interleaves between
+        devices (see query_snapshot's cooperative sweep)."""
+        parser = job.parser
+        pg_count = job.pg_count
+        on_packet = lambda: self._emit_snapshot_device_edges_locked(parser, job.seed_states)
+        device = job.devices_by_id.get(device_id)
+        packets = [
+            Jablotron._create_packet_device_diagnostics_start(device_id),
+            Jablotron._create_packet_device_diagnostics_force_info(device_id),
+        ]
+        if device is not None:
+            packets.insert(0, Jablotron.create_packet_device_info(device_id))
+        client.send_packets(packets)
+        self._read_into_parser_locked(
+            client,
+            parser,
+            pg_count=pg_count,
+            timeout=DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS if device is None else _diagnostics_timeout_for_device(device),
+            stop_on_first_gap=False,
+            on_packet=on_packet,
+        )
+        client.send_packet(Jablotron._create_packet_device_diagnostics_end(device_id))
+        self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=0.1, on_packet=on_packet)
+
+    def _finalize_snapshot_locked(self, job: _SnapshotJob) -> LegacyPanelSnapshot:
         # The latch (fed by the continuous stream reader) is the authority for
         # device on/off. Fold in any genuine edge this snapshot itself observed,
         # then overlay the latched value so the emitted snapshot agrees with the
         # stream and a dwell-held motion is not stomped back to "off".
-        self._reconcile_snapshot_devices_locked(devices_by_id, seed_states)
+        self._reconcile_snapshot_devices_locked(job.devices_by_id, job.seed_states)
 
         return LegacyPanelSnapshot(
-            sections=parser.sections,
-            pgs=parser.pgs,
-            devices=list(parser.devices_by_id.values()),
-            central=parser.central,
-            service_mode=parser.service_mode,
+            sections=job.parser.sections,
+            pgs=job.parser.pgs,
+            devices=list(job.parser.devices_by_id.values()),
+            central=job.parser.central,
+            service_mode=job.parser.service_mode,
         )
 
     def _emit_snapshot_device_edges_locked(
