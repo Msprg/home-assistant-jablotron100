@@ -17,7 +17,12 @@ import asyncio
 from jablotron_api.domain.models import DeviceStatusModel, PanelStatusModel
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
 from jablotron_api.protocol import legacy
-from jablotron_api.protocol.legacy import MOTION_ON_MIN_DWELL_SECONDS, PersistentSnapshotSession
+from jablotron_api.protocol.legacy import (
+    MOTION_ON_MIN_DWELL_SECONDS,
+    PersistentSnapshotSession,
+    _panel_special_devices,
+    _SnapshotParser,
+)
 
 
 def _make_session(monkeypatch) -> PersistentSnapshotSession:
@@ -192,6 +197,54 @@ def test_runtime_stream_callback_is_a_noop_without_a_loop() -> None:
     # Before start()/after close() the loop is None; the worker-thread callback
     # must never raise.
     runtime._on_device_states_changed({1: "on"})
+
+
+# -------------------------------- real-time edges during a long (diagnostics) read
+
+
+def test_snapshot_read_hook_emits_device_edge_in_realtime(monkeypatch) -> None:
+    # The per-packet hook is what keeps motion real-time while a multi-second
+    # diagnostics read holds the bus (the stream loop is blocked on the lock).
+    session = _make_session(monkeypatch)
+    captured: list[dict[int, str]] = []
+    session.set_on_device_state_change(captured.append)
+
+    parser = _SnapshotParser(
+        devices_by_id={7: DeviceStatusModel(id=7, name="PIR Rack", inferred_entity_type="device_state_motion", state="off")},
+        special_devices=_panel_special_devices("JA-107K"),
+    )
+    seed = {7: "off"}
+
+    # A device-state packet parsed mid-read flips device 7 on.
+    parser.devices_by_id[7].state = "on"
+    assert session._emit_snapshot_device_edges_locked(parser, seed) is True
+    assert captured and captured[-1].get(7) == "on"
+    assert seed[7] == "on"  # advanced so the edge is fed exactly once
+
+    # No further parsed change -> no spurious re-emit.
+    captured.clear()
+    assert session._emit_snapshot_device_edges_locked(parser, seed) is False
+    assert captured == []
+
+
+def test_read_into_parser_invokes_on_packet_per_packet(monkeypatch) -> None:
+    session = _make_session(monkeypatch)
+    parser = _SnapshotParser(devices_by_id={}, special_devices={})
+    monkeypatch.setattr(parser, "parse_packet", lambda packet, *, pg_count: None)
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read_packets(self, *, timeout=None):
+            self.reads += 1
+            return iter([b"\x55\x00", b"\xd8\x00"]) if self.reads == 1 else iter(())
+
+    calls = {"n": 0}
+    session._read_into_parser_locked(
+        FakeClient(), parser, pg_count=0, timeout=0.1, on_packet=lambda: calls.__setitem__("n", calls["n"] + 1)
+    )
+    assert calls["n"] == 2  # once per parsed packet
 
 
 # ---------------------------------------------------- one real loop iteration

@@ -991,6 +991,7 @@ class PersistentSnapshotSession:
         pg_count: int,
         timeout: float,
         stop_on_first_gap: bool = True,
+        on_packet: Callable[[], None] | None = None,
     ) -> None:
         deadline = time.monotonic() + timeout
         saw_packets = False
@@ -1004,6 +1005,12 @@ class PersistentSnapshotSession:
             saw_packets = True
             for packet in batch:
                 parser.parse_packet(packet, pg_count=pg_count)
+                # Surface device-state edges as they are parsed, even mid-read.
+                # A long diagnostics read holds the bus for many seconds; without
+                # this hook a motion edge captured during it would not be emitted
+                # until the whole snapshot finished, reintroducing the latency.
+                if on_packet is not None:
+                    on_packet()
 
     def _query_snapshot_locked(
         self,
@@ -1025,6 +1032,10 @@ class PersistentSnapshotSession:
             central=central.model_copy(deep=True) if central is not None else CentralStatusModel(),
         )
         seed_states = {device_id: device.state for device_id, device in devices_by_id.items()}
+        # Real-time edge emit during this read: whoever holds the bus (fast poll
+        # or a long diagnostics sweep) publishes motion edges per-packet, so
+        # device-state latency is decoupled from how long the read holds the lock.
+        on_packet = lambda: self._emit_snapshot_device_edges_locked(parser, seed_states)
 
         # Parse (don't discard) any device-state packets pushed since the last
         # read so a motion edge buffered just before this poll isn't thrown away;
@@ -1032,6 +1043,7 @@ class PersistentSnapshotSession:
         # fresh perform_sections_query below.
         for packet in self._drain_packets_locked(client, timeout=0.05) or ():
             parser.parse_packet(packet, pg_count=pg_count)
+        on_packet()
         perform_sections_query(client)
 
         if query_device_status:
@@ -1042,7 +1054,7 @@ class PersistentSnapshotSession:
             if status_device_numbers:
                 client.send_packets([Jablotron.create_packet_device_info(device_id) for device_id in status_device_numbers])
 
-        self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=timeout)
+        self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=timeout, on_packet=on_packet)
 
         if include_diagnostics:
             diagnostic_numbers = [
@@ -1073,9 +1085,10 @@ class PersistentSnapshotSession:
                     pg_count=pg_count,
                     timeout=DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS if device is None else _diagnostics_timeout_for_device(device),
                     stop_on_first_gap=False,
+                    on_packet=on_packet,
                 )
                 client.send_packet(Jablotron._create_packet_device_diagnostics_end(device_id))
-                self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=0.1)
+                self._read_into_parser_locked(client, parser, pg_count=pg_count, timeout=0.1, on_packet=on_packet)
 
         if parser.login_failed:
             self._close_client_locked()
@@ -1094,6 +1107,34 @@ class PersistentSnapshotSession:
             central=parser.central,
             service_mode=parser.service_mode,
         )
+
+    def _emit_snapshot_device_edges_locked(
+        self, parser: _SnapshotParser, seed_states: dict[int, str | None]
+    ) -> bool:
+        """Per-packet hook for snapshot/diagnostics reads: fold any device whose
+        parsed state changed since last seen into the latch and notify the
+        runtime immediately, and age out dwell-deferred offs. This is what keeps
+        motion real-time while a multi-second diagnostics read holds the bus
+        (the stream loop is blocked on the lock during that read, so it cannot
+        do this itself). ``seed_states`` is advanced as edges are applied so each
+        change is fed exactly once and a stale baseline never regresses the latch."""
+        now = time.monotonic()
+        changed = False
+        for device_id, device in parser.devices_by_id.items():
+            observed = device.state
+            if observed in ("on", "off") and observed != seed_states.get(device_id):
+                seed_states[device_id] = observed
+                if self._apply_latched_state_locked(device_id, observed, now):
+                    changed = True
+        if self._expire_pending_offs_locked(now):
+            changed = True
+        if changed and self._on_device_state_change is not None:
+            snapshot = dict(self._latched_states)
+            try:
+                self._on_device_state_change(snapshot)
+            except Exception:
+                LOGGER.debug("Device-state change callback failed", exc_info=True)
+        return changed
 
     def _reconcile_snapshot_devices_locked(
         self, devices_by_id: dict[int, DeviceStatusModel], seed_states: dict[int, str | None]
