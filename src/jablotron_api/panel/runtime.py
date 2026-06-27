@@ -123,6 +123,10 @@ class PanelRuntime:
         self._closed = False
         self._next_diagnostics_refresh_monotonic = 0.0
         self._next_full_refresh_monotonic = 0.0
+        # When the previous diagnostics run left a wireless temperature
+        # unresolved, the next (fast-retry) run re-polls only those devices
+        # instead of the whole bus. None => a full diagnostics sweep.
+        self._diagnostics_targeted_device_ids: list[int] | None = None
         self._status_session: PersistentSnapshotSession | None = None
         # Event loop captured at start() so the session's stream-reader thread
         # can hand device-state edges back via call_soon_threadsafe.
@@ -333,6 +337,7 @@ class PanelRuntime:
                 central=None if self._status is None else self._status.central,
                 query_device_status=include_full_refresh or include_diagnostics,
                 include_diagnostics=include_diagnostics,
+                diagnostics_device_ids=self._diagnostics_targeted_device_ids if include_diagnostics else None,
                 timeout=timeout,
             )
             sections, pgs = _apply_catalog_names(
@@ -357,15 +362,24 @@ class PanelRuntime:
                 include_diagnostics,
             )
             if include_diagnostics:
-                unresolved_wireless_temperatures = any(
-                    device.wireless
+                unresolved_temp_device_ids = [
+                    device.id
+                    for device in status.devices
+                    if device.wireless
                     and (device.inferred_device_type or "") in {"thermometer", "thermostat"}
                     and device.temperature is None
-                    for device in status.devices
-                )
-                self._next_diagnostics_refresh_monotonic = time.monotonic() + (
-                    60.0 if unresolved_wireless_temperatures else 3600.0
-                )
+                ]
+                if unresolved_temp_device_ids:
+                    # Chase the missing temperature(s) on a 5-minute cadence, and
+                    # target only those devices next time so the retry is a short
+                    # sweep rather than the whole bus (which froze the real-time
+                    # reader). A permanently-None sensor stays harmless: the
+                    # cooperative sweep never blocks motion.
+                    self._next_diagnostics_refresh_monotonic = time.monotonic() + 300.0
+                    self._diagnostics_targeted_device_ids = unresolved_temp_device_ids
+                else:
+                    self._next_diagnostics_refresh_monotonic = time.monotonic() + 3600.0
+                    self._diagnostics_targeted_device_ids = None
             if include_full_refresh or include_diagnostics:
                 self._next_full_refresh_monotonic = time.monotonic() + self._config.full_refresh_interval_seconds
         await self._emit("status", status.model_dump(mode="json"))

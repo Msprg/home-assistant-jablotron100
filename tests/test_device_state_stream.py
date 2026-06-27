@@ -324,6 +324,31 @@ class _FakeClient:
         return None
 
 
+def test_diagnostics_base_scopes_to_targeted_devices(monkeypatch) -> None:
+    # The fast-retry chasing an unresolved wireless temperature must re-poll
+    # ONLY the named device(s), not the whole bus (which froze the reader).
+    session = _make_session(monkeypatch)
+    client = _FakeClient()
+    devices = [
+        DeviceStatusModel(id=3, name="Therm A", inferred_device_type="thermometer", state="off"),
+        DeviceStatusModel(id=4, name="Therm B", inferred_device_type="thermometer", state="off"),
+    ]
+
+    full = session._query_snapshot_base_locked(
+        client, panel_model="JA-107K", pg_count=0, devices=devices, central=None,
+        query_device_status=True, include_diagnostics=True, diagnostics_device_ids=None, timeout=0.0,
+    )
+    # Full sweep: both diagnosable devices plus the panel (0).
+    assert set(full.diagnostic_numbers) >= {3, 4, 0}
+
+    targeted = session._query_snapshot_base_locked(
+        client, panel_model="JA-107K", pg_count=0, devices=devices, central=None,
+        query_device_status=True, include_diagnostics=True, diagnostics_device_ids=[4], timeout=0.0,
+    )
+    # Targeted retry: only device 4 — no whole-bus, no panel/lan/gsm.
+    assert targeted.diagnostic_numbers == [4]
+
+
 def test_diagnostics_sweep_releases_io_lock_between_devices(monkeypatch) -> None:
     # The core fix: the sweep must NOT hold _io_lock continuously. Between
     # devices the lock is released (and the worker sleeps off-lock) so the

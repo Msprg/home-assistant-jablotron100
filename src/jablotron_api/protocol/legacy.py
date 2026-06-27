@@ -504,6 +504,7 @@ class PersistentSnapshotSession:
         central: CentralStatusModel | None = None,
         query_device_status: bool = True,
         include_diagnostics: bool = False,
+        diagnostics_device_ids: list[int] | None = None,
         timeout: float = 2.0,
     ) -> LegacyPanelSnapshot:
         # Base snapshot (sections/PGs/device status) under one short hold. The
@@ -521,6 +522,7 @@ class PersistentSnapshotSession:
                     central=central,
                     query_device_status=query_device_status,
                     include_diagnostics=include_diagnostics,
+                    diagnostics_device_ids=diagnostics_device_ids,
                     timeout=timeout,
                 )
                 if job.parser.login_failed:
@@ -1071,6 +1073,7 @@ class PersistentSnapshotSession:
         central: CentralStatusModel | None,
         query_device_status: bool,
         include_diagnostics: bool,
+        diagnostics_device_ids: list[int] | None,
         timeout: float,
     ) -> _SnapshotJob:
         """Run the base snapshot (sections/PGs/device status) and compute the
@@ -1110,19 +1113,36 @@ class PersistentSnapshotSession:
 
         diagnostic_numbers: list[int] = []
         if include_diagnostics:
-            diagnostic_numbers = [
-                device.id
-                for device in sorted(
-                    (device for device in devices_by_id.values() if _device_supports_diagnostics(device)),
-                    key=_diagnostics_priority,
+            if diagnostics_device_ids is not None:
+                # Targeted retry (e.g. chasing an unresolved wireless
+                # temperature): re-poll only the named devices, not the whole
+                # bus, so the sweep stays short.
+                wanted = set(diagnostics_device_ids)
+                diagnostic_numbers = [
+                    device.id
+                    for device in sorted(
+                        (
+                            device
+                            for device in devices_by_id.values()
+                            if device.id in wanted and _device_supports_diagnostics(device)
+                        ),
+                        key=_diagnostics_priority,
+                    )
+                ]
+            else:
+                diagnostic_numbers = [
+                    device.id
+                    for device in sorted(
+                        (device for device in devices_by_id.values() if _device_supports_diagnostics(device)),
+                        key=_diagnostics_priority,
+                    )
+                ]
+                diagnostic_numbers.extend(
+                    device_id
+                    for key, device_id in special_devices.items()
+                    if key in {"lan", "gsm"} and isinstance(device_id, int)
                 )
-            ]
-            diagnostic_numbers.extend(
-                device_id
-                for key, device_id in special_devices.items()
-                if key in {"lan", "gsm"} and isinstance(device_id, int)
-            )
-            diagnostic_numbers.append(0)
+                diagnostic_numbers.append(0)
 
         return _SnapshotJob(
             parser=parser,
