@@ -173,8 +173,8 @@ def test_redetect_never_raises_when_no_device(monkeypatch, redetect_error) -> No
         session.close()
 
 
-def test_keepalive_iteration_survives_send_failure_and_redetect_no_device(monkeypatch) -> None:
-    # The keepalive daemon thread must not die if a write fails AND port
+def test_stream_loop_iteration_survives_send_failure_and_redetect_no_device(monkeypatch) -> None:
+    # The keepalive/stream daemon thread must not die if a write fails AND port
     # redetection finds no device (ensure_serial_port raises SystemExit).
     state = {"n": 0}
 
@@ -203,7 +203,7 @@ def test_keepalive_iteration_survives_send_failure_and_redetect_no_device(monkey
 
         monkeypatch.setattr(session._stop_event, "wait", fake_wait)
         # Should return normally; no exception escapes the loop body.
-        session._keepalive_loop()
+        session._stream_loop()
         assert session._client is None  # failed client was dropped
     finally:
         session.close()

@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from jablotron_usb_debug import (
     DeviceConnection,
@@ -121,6 +122,31 @@ CONTROL_AUTHORIZATION_IDLE_SECONDS = 60.0
 # / STREAM_REOPEN_MAX_DELAY (cd2432d).
 STREAM_REOPEN_DELAY_SECONDS = 1.0
 STREAM_REOPEN_MAX_DELAY_SECONDS = 30.0
+
+# Continuous device-state reader (the keepalive thread doubles as a live stream
+# reader). After perform_enable_device_states the panel asynchronously *pushes*
+# device-state packets (motion/contact on/off) whenever they change. The thread
+# drains them every tick so a brief PIR pulse is observed in real time instead of
+# being aliased away by the periodic snapshot poll. All reads stay under
+# _io_lock; the budget/tick are kept short so a control op never waits more than
+# one read burst for the lock.
+STREAM_LOOP_TICK_SECONDS = 0.05
+# Kept short so the lock is held only briefly per tick: an idle read blocks at
+# most this long under _io_lock, bounding how long a concurrent control op waits
+# for the bus. A streamed packet returns sooner (select wakes immediately), so a
+# small budget costs nothing for real-time edge capture.
+STREAM_READ_BUDGET_SECONDS = 0.05
+STREAM_KEEPALIVE_INTERVAL_SECONDS = 1.0
+# A rising motion edge is held "on" for at least this long before a following
+# "off" is honoured, so a fire-and-clear pulse whose on/off packets land in the
+# same read burst is still published as an "on" before it clears. The dwell only
+# *defers* the off (never drops it): _expire_pending_offs_locked applies it once
+# the dwell elapses. Clearing relies on the panel's own "off" edge — exactly as
+# the original integration did, with no host-side auto-timeout. Should an "off"
+# edge ever be lost on the wire, the periodic device-states bitmap the panel
+# re-pushes on the DEVICE_STATE_RENEWAL_SECONDS re-enable corrects it (bounded
+# staleness), so a device cannot stay stuck "on" indefinitely.
+MOTION_ON_MIN_DWELL_SECONDS = 1.0
 
 
 def _diagnostics_timeout_for_device(device: DeviceStatusModel) -> float:
@@ -403,6 +429,42 @@ class PersistentSnapshotSession:
         # Reopen-backoff state, mutated only under self._io_lock.
         self._reopen_failures = 0
         self._next_reopen_allowed_at = 0.0
+        # Live device-state stream state, all mutated only under self._io_lock.
+        # _live_parser is a persistent _SnapshotParser seeded with the catalog
+        # devices so streamed packets are interpreted exactly like a snapshot
+        # read (heartbeat/fault handling included). _latched_states is the
+        # authoritative on/off map the runtime overlays onto every emit.
+        self._live_parser: _SnapshotParser | None = None
+        self._live_pg_count = 0
+        self._latched_states: dict[int, str] = {}
+        self._state_on_since: dict[int, float] = {}
+        self._pending_off: set[int] = set()
+        self._on_device_state_change: Callable[[dict[int, str]], None] | None = None
+
+    def set_on_device_state_change(self, callback: Callable[[dict[int, str]], None] | None) -> None:
+        """Register a callback fired (off the I/O lock) whenever a latched device
+        on/off state changes. The argument is a fresh copy of the latched map.
+
+        The callback runs on the stream-reader thread; it must be cheap and
+        thread-safe (the runtime hands the work straight to the event loop via
+        ``loop.call_soon_threadsafe`` and returns)."""
+        self._on_device_state_change = callback
+
+    def configure_live_devices(self, devices, *, pg_count: int, panel_model: str | None) -> None:
+        """Seed the persistent live-stream parser with the catalog devices so the
+        continuous reader can interpret pushed device-state packets. Latched
+        states are preserved across reconfigure so an in-flight motion is not
+        cleared by a catalog refresh."""
+        with self._io_lock:
+            self._live_pg_count = pg_count
+            self._live_parser = _SnapshotParser(
+                devices_by_id={device.id: device.model_copy(deep=True) for device in devices},
+                special_devices=_panel_special_devices(panel_model),
+            )
+
+    def snapshot_device_states(self) -> dict[int, str]:
+        with self._io_lock:
+            return dict(self._latched_states)
 
     def close(self) -> None:
         self._stop_event.set()
@@ -616,8 +678,8 @@ class PersistentSnapshotSession:
             return
         self._stop_event.clear()
         self._keepalive_thread = threading.Thread(
-            target=self._keepalive_loop,
-            name="jablotron-session-keepalive",
+            target=self._stream_loop,
+            name="jablotron-session-stream",
             daemon=True,
         )
         self._keepalive_thread.start()
@@ -677,21 +739,107 @@ class PersistentSnapshotSession:
         client.send_packet(Jablotron.create_packet_command(b"\x02"))
         self._drain_packets_locked(client, timeout=0.8)
 
-    def _keepalive_loop(self) -> None:
-        while not self._stop_event.wait(1.0):
+    def _stream_loop(self) -> None:
+        """Continuous keepalive + device-state reader.
+
+        Each tick (off the lock, so control is never starved more than one burst)
+        it takes _io_lock and: sends the ~1s keepalive when due, renews the
+        device-state stream, drains pushed device-state packets into the live
+        parser/latch, and ages out any dwell-deferred "off". After releasing the
+        lock it notifies the runtime if a latched state changed. The client is
+        only consumed here, never opened — (re)open + backoff stay owned by
+        _ensure_client_locked, driven by the snapshot poll."""
+        last_keepalive = 0.0
+        while not self._stop_event.wait(STREAM_LOOP_TICK_SECONDS):
+            emit_states: dict[int, str] | None = None
             with self._io_lock:
                 client = self._client
-                if client is None:
-                    continue
+                if client is not None:
+                    try:
+                        now = time.monotonic()
+                        if now - last_keepalive >= STREAM_KEEPALIVE_INTERVAL_SECONDS:
+                            client.send_packet(RAW_SESSION_KEEPALIVE)
+                            last_keepalive = now
+                        self._maybe_refresh_device_state_stream_locked(client)
+                        changed = False
+                        if self._live_parser is not None:
+                            for packet in client.read_packets(timeout=STREAM_READ_BUDGET_SECONDS):
+                                self._live_parser.parse_packet(packet, pg_count=self._live_pg_count)
+                                # Sync after *every* packet so the rising edge of a
+                                # same-burst on->off pulse is latched before the
+                                # "off" is parsed.
+                                if self._sync_latch_from_live_parser_locked(time.monotonic()):
+                                    changed = True
+                        if self._expire_pending_offs_locked(time.monotonic()):
+                            changed = True
+                        if changed:
+                            emit_states = dict(self._latched_states)
+                    except Exception:
+                        self._close_client_locked()
+                        # Follow a re-enumerated port so the next reopen targets it.
+                        # _redetect_serial_port_locked never raises (it swallows the
+                        # SystemExit ensure_serial_port raises when no device is
+                        # found), so it cannot kill this daemon thread.
+                        self._redetect_serial_port_locked()
+                        emit_states = None
+            if emit_states is not None and self._on_device_state_change is not None:
                 try:
-                    client.send_packet(RAW_SESSION_KEEPALIVE)
+                    self._on_device_state_change(emit_states)
                 except Exception:
-                    self._close_client_locked()
-                    # Follow a re-enumerated port so the next reopen targets it.
-                    # _redetect_serial_port_locked never raises (it swallows the
-                    # SystemExit ensure_serial_port raises when no device is
-                    # found), so it cannot kill this daemon thread.
-                    self._redetect_serial_port_locked()
+                    LOGGER.debug("Device-state change callback failed", exc_info=True)
+
+    # ----------------------------------------------------- device-state latch
+
+    def _sync_latch_from_live_parser_locked(self, now: float) -> bool:
+        if self._live_parser is None:
+            return False
+        changed = False
+        for device_id, device in self._live_parser.devices_by_id.items():
+            if self._apply_latched_state_locked(device_id, device.state, now):
+                changed = True
+        return changed
+
+    def _apply_latched_state_locked(self, device_id: int, state: str | None, now: float) -> bool:
+        """Fold a freshly observed on/off into the latch with rising-edge dwell.
+
+        Returns True when the published (latched) state changed. A trailing "off"
+        seen within MOTION_ON_MIN_DWELL_SECONDS of the rising edge is deferred
+        (recorded in _pending_off) so a brief pulse stays observable; it is
+        applied later by _expire_pending_offs_locked or by a subsequent "off"
+        once the dwell has elapsed."""
+        if state not in ("on", "off"):
+            return False
+        current = self._latched_states.get(device_id)
+        if state == "on":
+            self._pending_off.discard(device_id)
+            if current != "on":
+                self._latched_states[device_id] = "on"
+                self._state_on_since[device_id] = now
+                return True
+            return False
+        # state == "off"
+        if current == "on":
+            if now - self._state_on_since.get(device_id, 0.0) >= MOTION_ON_MIN_DWELL_SECONDS:
+                self._latched_states[device_id] = "off"
+                self._pending_off.discard(device_id)
+                return True
+            self._pending_off.add(device_id)
+            return False
+        if current != "off":
+            self._latched_states[device_id] = "off"
+            return True
+        return False
+
+    def _expire_pending_offs_locked(self, now: float) -> bool:
+        if not self._pending_off:
+            return False
+        changed = False
+        for device_id in list(self._pending_off):
+            if now - self._state_on_since.get(device_id, 0.0) >= MOTION_ON_MIN_DWELL_SECONDS:
+                self._latched_states[device_id] = "off"
+                self._pending_off.discard(device_id)
+                changed = True
+        return changed
 
     def _maybe_refresh_device_state_stream_locked(self, client: JablotronUSBClient) -> None:
         now = time.monotonic()
@@ -876,8 +1024,14 @@ class PersistentSnapshotSession:
             special_devices=special_devices,
             central=central.model_copy(deep=True) if central is not None else CentralStatusModel(),
         )
+        seed_states = {device_id: device.state for device_id, device in devices_by_id.items()}
 
-        self._drain_packets_locked(client, timeout=0.05)
+        # Parse (don't discard) any device-state packets pushed since the last
+        # read so a motion edge buffered just before this poll isn't thrown away;
+        # the stale sections reply mixed in is harmlessly overwritten by the
+        # fresh perform_sections_query below.
+        for packet in self._drain_packets_locked(client, timeout=0.05) or ():
+            parser.parse_packet(packet, pg_count=pg_count)
         perform_sections_query(client)
 
         if query_device_status:
@@ -927,6 +1081,12 @@ class PersistentSnapshotSession:
             self._close_client_locked()
             raise WrongCodeError("Wrong code.")
 
+        # The latch (fed by the continuous stream reader) is the authority for
+        # device on/off. Fold in any genuine edge this snapshot itself observed,
+        # then overlay the latched value so the emitted snapshot agrees with the
+        # stream and a dwell-held motion is not stomped back to "off".
+        self._reconcile_snapshot_devices_locked(devices_by_id, seed_states)
+
         return LegacyPanelSnapshot(
             sections=parser.sections,
             pgs=parser.pgs,
@@ -934,6 +1094,22 @@ class PersistentSnapshotSession:
             central=parser.central,
             service_mode=parser.service_mode,
         )
+
+    def _reconcile_snapshot_devices_locked(
+        self, devices_by_id: dict[int, DeviceStatusModel], seed_states: dict[int, str | None]
+    ) -> None:
+        now = time.monotonic()
+        for device_id, device in devices_by_id.items():
+            observed = device.state
+            # Only feed the latch when a real packet changed the state during
+            # this read (observed != the seed it started from), never the stale
+            # baseline — that would let an old snapshot value regress a newer
+            # streamed edge.
+            if observed in ("on", "off") and observed != seed_states.get(device_id):
+                self._apply_latched_state_locked(device_id, observed, now)
+            latched = self._latched_states.get(device_id)
+            if latched is not None:
+                device.state = latched
 
     def _query_system_info_locked(self, client: JablotronUSBClient, *, timeout: float) -> LegacySystemInfo:
         model = None

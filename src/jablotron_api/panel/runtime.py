@@ -38,6 +38,7 @@ from jablotron_api.domain.models import (
     UserCreateModel,
     UserModel,
     UserPatchModel,
+    utc_now,
 )
 from jablotron_api.protocol.legacy import PersistentSnapshotSession
 from jablotron_api.services.catalog_io import (
@@ -123,6 +124,12 @@ class PanelRuntime:
         self._next_diagnostics_refresh_monotonic = 0.0
         self._next_full_refresh_monotonic = 0.0
         self._status_session: PersistentSnapshotSession | None = None
+        # Event loop captured at start() so the session's stream-reader thread
+        # can hand device-state edges back via call_soon_threadsafe.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending_stream_states: dict[int, str] | None = None
+        self._stream_emit_scheduled = False
+        self._stream_emit_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------ config
 
@@ -190,6 +197,7 @@ class PanelRuntime:
             self._config.poll_interval_seconds,
             self._config.full_refresh_interval_seconds,
         )
+        self._loop = asyncio.get_running_loop()
         await self.refresh_all()
         self._poller_task = asyncio.create_task(self._poll_loop(), name="jablotron-panel-poller")
         LOGGER.info("Panel runtime started")
@@ -197,6 +205,8 @@ class PanelRuntime:
     async def close(self) -> None:
         LOGGER.info("Stopping panel runtime")
         self._closed = True
+        # Stop accepting stream-reader callbacks before tearing the session down.
+        self._loop = None
         if self._poller_task is not None:
             self._poller_task.cancel()
             try:
@@ -216,6 +226,51 @@ class PanelRuntime:
     async def _emit(self, topic: str, payload: dict) -> None:
         for listener in list(self._listeners):
             await listener(topic, payload)
+
+    # ----------------------------------------------- live device-state stream
+
+    def _on_device_states_changed(self, states: dict[int, str]) -> None:
+        """Called from the session's stream-reader thread on any latched device
+        on/off change. Hands the work to the event loop and returns immediately;
+        never touches the asyncio lock or self._status from the worker thread."""
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._handle_stream_device_states, states)
+        except RuntimeError:
+            # Loop already closed during shutdown; nothing to deliver.
+            pass
+
+    def _handle_stream_device_states(self, states: dict[int, str]) -> None:
+        # Runs on the event loop. Coalesce bursts: keep only the latest states
+        # and schedule at most one in-flight emit so a flurry of edges collapses
+        # to a single (latest) broadcast. This is safe — it never drops a rising
+        # edge — ONLY because the session holds a motion "on" for
+        # MOTION_ON_MIN_DWELL_SECONDS before reporting the following "off", so an
+        # on-edge and its off-edge arrive in different loop turns and cannot
+        # coalesce together. Do not weaken that dwell without revisiting this.
+        self._pending_stream_states = states
+        if not self._stream_emit_scheduled:
+            self._stream_emit_scheduled = True
+            task = asyncio.create_task(self._emit_stream_status())
+            # Keep a strong reference so the task is not GC'd mid-flight.
+            self._stream_emit_tasks.add(task)
+            task.add_done_callback(self._stream_emit_tasks.discard)
+
+    async def _emit_stream_status(self) -> None:
+        self._stream_emit_scheduled = False
+        states = self._pending_stream_states
+        base = self._status
+        if base is None or states is None:
+            return
+        devices = [
+            device.model_copy(update={"state": states[device.id]}) if device.id in states else device
+            for device in base.devices
+        ]
+        status = base.model_copy(update={"devices": devices, "source": "stream", "refreshed_at": utc_now()})
+        self._status = status
+        await self._emit("status", status.model_dump(mode="json"))
 
     async def _poll_loop(self) -> None:
         while not self._closed:
@@ -328,6 +383,8 @@ class PanelRuntime:
                 len(self._catalog.users),
                 None if self._catalog.initial_setup is None else self._catalog.initial_setup.exact,
             )
+            if self._status_session is not None:
+                self._configure_session_live_devices(self._status_session)
         await self._emit("catalog", self._catalog.model_dump(mode="json"))
         return self._catalog
 
@@ -601,10 +658,22 @@ class PanelRuntime:
 
     def _create_status_session(self) -> PersistentSnapshotSession:
         LOGGER.debug("Creating persistent panel status session")
-        return PersistentSnapshotSession(
+        session = PersistentSnapshotSession(
             port=self._config.port,
             code=self._config.auth_code,
             reset=self._config.reset,
+        )
+        session.set_on_device_state_change(self._on_device_states_changed)
+        self._configure_session_live_devices(session)
+        return session
+
+    def _configure_session_live_devices(self, session: PersistentSnapshotSession) -> None:
+        if self._catalog is None:
+            return
+        session.configure_live_devices(
+            self._catalog.devices,
+            pg_count=len(self._catalog.pgs),
+            panel_model=self._system_info.get("panel_model"),
         )
 
     async def _close_status_session_locked(self) -> None:
