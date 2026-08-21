@@ -9,11 +9,18 @@ The post-write verification policy (`verify_added_user`, `verify_edited_user`)
 preserves the 2026-04-27 fix: only fields the API caller explicitly supplied
 are compared; omitted optional create fields are not treated as mismatches
 when the panel writes its own concrete defaults.
+
+`apply_upsert` runs the shared user-table rules
+(`jablotron_api.domain.user_validation`) against the record that is about to
+be written, before the sector reaches the panel. The caller supplies the
+freshly read table as a `UserWritePreflight`; the rules are the same ones
+`jablotron_user_tool` runs for the CLI.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,11 +31,19 @@ from jablotron_re_tools import (
 )
 from jablotron_user_tool import build_delete_sector, build_upsert_sector
 
+from jablotron_api.domain.codes import CodeFormat
 from jablotron_api.domain.models import (
     UserCreateModel,
     UserModel,
     UserPatchModel,
 )
+from jablotron_api.domain.user_validation import (
+    UserTableEntry,
+    entry_from_record,
+    validate_user_write,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,6 +57,38 @@ class UserManagerConfig:
     stage_mode: str
     write_cleanup_mode: str
     read_cleanup_mode: str
+
+
+@dataclass(frozen=True)
+class UserWritePreflight:
+    """The panel state a user write is validated against.
+
+    Built by the runtime from a *fresh* read of the panel's user table,
+    taken under the panel lock immediately before the write. Passing a
+    cached view here would decide against a table that no longer exists.
+    """
+
+    existing: tuple[UserTableEntry, ...] = ()
+    current: UserTableEntry | None = None
+    # CodeFormat is frozen, so a plain default is safe here.
+    code_format: CodeFormat = CodeFormat(None, None, "unknown")
+
+    @classmethod
+    def from_records(
+        cls,
+        records,
+        *,
+        user_id: int,
+        code_format: CodeFormat,
+        include_current: bool,
+    ) -> "UserWritePreflight":
+        entries = tuple(entry_from_record(record) for record in records)
+        current = None
+        if include_current:
+            current = next(
+                (entry for entry in entries if entry.user_id == user_id), None
+            )
+        return cls(existing=entries, current=current, code_format=code_format)
 
 
 def build_user_args(
@@ -179,22 +226,64 @@ def user_to_record(user: UserModel) -> UserRecord:
     )
 
 
+def target_entry_from_summary(summary: dict, *, user_id: int) -> UserTableEntry:
+    """Adapt a `build_upsert_sector` payload summary into a rule input.
+
+    Mirrors `jablotron_user_tool._preflight_target`: the summary describes
+    the encoded sector, i.e. exactly the record the panel will store.
+    """
+
+    return UserTableEntry(
+        user_id=user_id,
+        code=str(summary.get("code") or ""),
+        cards=tuple(str(card) for card in summary.get("cards") or ()),
+        time_limited_group_raw=summary.get("time_limited_group_raw"),
+    )
+
+
 def apply_upsert(
     config: UserManagerConfig,
     *,
     user_id: int,
     payload: UserCreateModel | UserPatchModel,
     current: UserRecord | None,
+    preflight: UserWritePreflight,
     verify_prefix: str,
 ) -> None:
+    """Build the upsert sector, validate it, then write it to the panel.
+
+    Raises ``UserWriteRejected`` (a ``ValueError``) before the panel is
+    touched if the resulting record would break a user-table rule.
+    """
+
     args = build_user_args(
         config,
         command="edit" if current is not None else "add",
         user_id=user_id,
         payload=payload,
     )
-    sector_path, _, cleanup_sector = build_upsert_sector(args, current=current)
+    sector_path, summary, cleanup_sector = build_upsert_sector(args, current=current)
     try:
+        # Validate the record that will actually be written, not the request:
+        # unsupplied fields are carried over from `current` by the sector
+        # builder, and those carried-over values are subject to the rules too.
+        warnings = validate_user_write(
+            existing=preflight.existing,
+            user_id=user_id,
+            current=preflight.current,
+            target=target_entry_from_summary(summary, user_id=user_id),
+            code_format=preflight.code_format,
+        )
+        if preflight.code_format.source != "panel" and preflight.code_format.code_length is not None:
+            LOGGER.warning(
+                "User %s write validated against a %s code length of %s, not the panel's main_config.",
+                user_id,
+                preflight.code_format.source,
+                preflight.code_format.code_length,
+            )
+        for message in warnings:
+            LOGGER.warning("User %s write preflight warning: %s", user_id, message)
+
         verify_output = default_export_output(verify_prefix)
         apply_import_sector(
             sector_path=sector_path,

@@ -36,6 +36,7 @@ from jablotron_api.domain.serialization import (
     serialize_users,
     serialize_ws_payload,
 )
+from jablotron_api.domain.user_validation import UserWriteRejected
 from jablotron_api.panel.demo import DemoPanelRuntime
 from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
@@ -162,8 +163,14 @@ def _authorize_topic(token: AuthenticatedToken, topic: str) -> bool:
     return all(scope in token.scopes for scope in required_scopes)
 
 
+# A refused user record and a broken panel must not look alike to a
+# provisioning client: `UserWriteRejected` (400, with a machine-readable
+# reason in the body) means "that value is illegal, try another one", while
+# a RuntimeError from the write path (409) means the panel or the link
+# failed and the client should stop rather than retry.
 _RUNTIME_ERROR_MAP: tuple[tuple[type[Exception], int], ...] = (
     (PermissionError, status.HTTP_403_FORBIDDEN),
+    (UserWriteRejected, status.HTTP_400_BAD_REQUEST),
     (ValueError, status.HTTP_400_BAD_REQUEST),
     (RuntimeError, status.HTTP_409_CONFLICT),
 )
@@ -329,6 +336,19 @@ def create_app(
         LOGGER.info("%s requested: token=%s resource=%s", op, token_label, resource)
         try:
             result = await runtime_callable()
+        except UserWriteRejected as exc:
+            LOGGER.warning(
+                "%s rejected: token=%s resource=%s reason=%s conflicts=%s detail=%s",
+                op,
+                token_label,
+                resource,
+                exc.reason,
+                ",".join(str(item) for item in exc.conflicting_user_ids) or "-",
+                exc.summary(),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=exc.to_payload()
+            ) from exc
         except Exception as exc:
             http_status = _http_status_for(exc)
             if http_status is None:

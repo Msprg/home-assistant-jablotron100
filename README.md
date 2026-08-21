@@ -18,7 +18,7 @@ The `/v1` REST and WebSocket surface is being locked for the public alpha. Withi
 - Response shapes (the Pydantic models in `src/jablotron_api/domain/models.py`) will only be extended in backward-compatible ways: new optional fields, never removed or retyped existing ones.
 - The token scope vocabulary (the `Scope` enum) is fixed. Scope names will not be renamed; new scopes can be added. The legacy `status:read` and `sections:control` names are auto-migrated to the v1 names on TokenStore startup for the duration of the v1 alpha window.
 - WebSocket topic names (`status`, `events`, `users`, `catalog`, `system`) and the envelope shape (`{sequence, topic, event, timestamp, payload}`) are fixed.
-- Error responses use a consistent shape: HTTP status code plus a JSON body with `detail` containing either a string or `{error, missing|missing_any_of}` for scope denials.
+- Error responses use a consistent shape: HTTP status code plus a JSON body with `detail` containing either a string, `{error, missing|missing_any_of}` for scope denials, or `{error: "user_write_rejected", reason, message, violations, conflicting_user_ids}` when a user record breaks a panel rule (see [docs/user-code-rules.md](docs/user-code-rules.md)).
 
 The authoritative description is `docs/openapi.v1.json`, generated from the running FastAPI app. To regenerate it after changes:
 

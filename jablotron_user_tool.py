@@ -19,6 +19,13 @@ from import_cfg_tool import (
     encode_sector,
     write_output,
 )
+from jablotron_api.domain.codes import CodeFormat, resolve_code_format
+from jablotron_api.domain.user_validation import (
+    UserTableEntry,
+    UserWriteRejected,
+    entry_from_record,
+    validate_user_write,
+)
 from jablotron_re_tools import (
     DEFAULT_IMPORT_PATH,
     ExportSnapshot,
@@ -271,7 +278,9 @@ def build_delete_sector(args: argparse.Namespace) -> tuple[Path, dict[str, objec
 
 
 def _preflight_target(summary: dict[str, object]) -> dict[str, Any]:
-    cards = [str(card) for card in summary.get("cards", []) if str(card)]
+    # Card slots keep their position: an empty card1 must not renumber card2
+    # in a validation message.
+    cards = [str(card) for card in summary.get("cards", [])]
     return {
         "name": str(summary.get("name", "")),
         "phone": str(summary.get("phone", "")),
@@ -317,62 +326,62 @@ def _requested_fields_from_args(args: argparse.Namespace) -> set[str]:
     return requested
 
 
+def resolve_snapshot_code_format(snapshot: ExportSnapshot, *, server_auth_code: str | None) -> CodeFormat:
+    """Resolve the panel's code format from the export blob behind ``snapshot``.
+
+    ``ExportSnapshot`` carries the user records but not ``main_config``, so
+    the blob is re-parsed here. Falls back to inferring the format from the
+    session's own authorisation code, which the panel accepted and whose
+    length therefore matches ``code_length``.
+    """
+
+    main_config = None
+    try:
+        main_config = extract_export_catalog(snapshot.path).main_config
+    except (OSError, ValueError):
+        main_config = None
+    return resolve_code_format(
+        catalog_code_length=main_config.code_len_raw if main_config is not None else None,
+        catalog_code_prefix=main_config.code_prefix if main_config is not None else None,
+        server_auth_code=server_auth_code,
+    )
+
+
 def validate_preflight(
     *,
     snapshot: ExportSnapshot,
     user_id: int,
     current: UserRecord | None,
     target: dict[str, Any],
+    code_format: CodeFormat,
 ) -> None:
-    current_state = _compare_state(current)
-    current_cards = current_state["cards"] if isinstance(current_state["cards"], list) else []
-    errors: list[str] = []
-    warnings: list[str] = []
+    """Run the shared user-table rules over a freshly read snapshot.
 
-    code = target["code"] or ""
-    if code:
-        conflicts = sorted(
-            record.user_id
-            for record in snapshot.records
-            if record.user_id not in {None, user_id} and record.code == code
+    The rules themselves live in ``jablotron_api.domain.user_validation`` so
+    that this CLI and the HTTP write path enforce one implementation.
+    Failures raise ``UserWriteRejected``; ``main()`` turns that into the
+    CLI's non-zero exit.
+    """
+
+    warnings = validate_user_write(
+        existing=[entry_from_record(record) for record in snapshot.records],
+        user_id=user_id,
+        current=entry_from_record(current) if current is not None else None,
+        target=UserTableEntry(
+            user_id=user_id,
+            code=str(target.get("code") or ""),
+            cards=tuple(str(card) for card in target.get("cards") or ()),
+            time_limited_group_raw=target.get("time_limited_group_raw"),
+        ),
+        code_format=code_format,
+    )
+    if code_format.source != "panel" and code_format.code_length is not None:
+        print(
+            f"warning: preflight code length {code_format.code_length} was {code_format.source}, "
+            "not read from the panel's main_config"
         )
-        if conflicts:
-            message = f"duplicate code {code!r} already assigned to user(s): {', '.join(str(item) for item in conflicts)}"
-            if current_state["code"] == code:
-                warnings.append(message)
-            else:
-                errors.append(message)
-
-    cards = [card for card in target["cards"] if card]
-    if len(cards) != len(set(cards)):
-        errors.append("card1/card2 would contain the same card ID.")
-    for card in cards:
-        conflicts = sorted(
-            record.user_id
-            for record in snapshot.records
-            if record.user_id not in {None, user_id} and card in [value for value in record.cards if value]
-        )
-        if conflicts:
-            message = f"duplicate card {card!r} already assigned to user(s): {', '.join(str(item) for item in conflicts)}"
-            if card in current_cards:
-                warnings.append(message)
-            else:
-                errors.append(message)
-
-    time_limit_group = int(target["time_limited_group_raw"] or 0)
-    current_time_limit = int(current_state["time_limited_group_raw"] or 0) if current is not None else 0
-    current_code = current_state["code"] or "" if current is not None else ""
-    if time_limit_group > 0 and not code:
-        message = f"time-limited group {time_limit_group} requires a code."
-        if current_time_limit > 0 and not current_code:
-            warnings.append(message)
-        else:
-            errors.append(message)
-
     for message in warnings:
         print(f"warning: preflight {message}")
-    if errors:
-        raise SystemExit("Preflight validation failed:\n- " + "\n- ".join(errors))
 
 
 def verify_authoritatively(
@@ -576,6 +585,9 @@ def cmd_add(args: argparse.Namespace) -> None:
                 user_id=args.user_id,
                 current=None,
                 target=_preflight_target(summary),
+                code_format=resolve_snapshot_code_format(
+                    snapshot_before, server_auth_code=args.auth_code
+                ),
             )
         if args.no_apply:
             return
@@ -620,6 +632,9 @@ def cmd_edit(args: argparse.Namespace) -> None:
                 user_id=args.user_id,
                 current=current,
                 target=_preflight_target(summary),
+                code_format=resolve_snapshot_code_format(
+                    snapshot_before, server_auth_code=args.auth_code
+                ),
             )
         if args.no_apply:
             return
@@ -759,7 +774,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except UserWriteRejected as rejection:
+        # The CLI boundary: the rules raise a typed refusal so the HTTP
+        # server can map it to a 4xx; here it becomes the usual exit code.
+        raise SystemExit(rejection.cli_message()) from rejection
 
 
 if __name__ == "__main__":

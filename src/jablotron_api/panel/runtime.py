@@ -59,6 +59,7 @@ from jablotron_api.services.device_inference import infer_device_type as _infer_
 from jablotron_api.services.event_reader import EventReaderConfig, read_recent_events
 from jablotron_api.services.user_manager import (
     UserManagerConfig,
+    UserWritePreflight,
     apply_delete as _apply_delete_user,
     apply_upsert as _apply_upsert_user,
     user_to_record,
@@ -605,16 +606,54 @@ class PanelRuntime:
     def _verify_edited_user(self, user: UserModel, payload: UserPatchModel) -> None:
         _verify_edited_user_fn(user, payload)
 
+    def _snapshot_code_format(self, snapshot: ExportCatalogSnapshot) -> CodeFormat:
+        main_config = snapshot.main_config
+        return resolve_code_format(
+            catalog_code_length=main_config.code_len_raw if main_config is not None else None,
+            catalog_code_prefix=main_config.code_prefix if main_config is not None else None,
+            server_auth_code=self._config.auth_code or None,
+        )
+
+    def _user_write_preflight(
+        self,
+        snapshot: ExportCatalogSnapshot,
+        user_id: int,
+        *,
+        include_current: bool,
+    ) -> UserWritePreflight:
+        """Bind a freshly read user table to the write about to happen.
+
+        Read-then-decide: the rules are applied to the table as it is now,
+        read under the same lock that then performs the write, so the
+        decision cannot be made against a cached table that no longer
+        exists. The code format comes from the same read rather than from
+        the cached catalog.
+        """
+
+        return UserWritePreflight.from_records(
+            snapshot.users,
+            user_id=user_id,
+            code_format=self._snapshot_code_format(snapshot),
+            include_current=include_current,
+        )
+
     async def add_user(self, payload: UserCreateModel) -> UserModel:
         self._ensure_usable_user_id(payload.id)
         async with self._lock:
             await self._close_status_session_locked()
+            snapshot = await self._pull_catalog_snapshot_locked(
+                f"api-preflight-add-user{payload.id}"
+            )
+            preflight = self._user_write_preflight(
+                snapshot, payload.id, include_current=False
+            )
             await asyncio.to_thread(
                 _apply_upsert_user,
                 self._user_manager_config(),
                 user_id=payload.id,
                 payload=payload,
                 current=None,
+                preflight=preflight,
                 verify_prefix=f"api-add-user{payload.id}",
             )
         await self.refresh_catalog()
@@ -633,12 +672,25 @@ class PanelRuntime:
         current_record = user_to_record(current)
         async with self._lock:
             await self._close_status_session_locked()
+            snapshot = await self._pull_catalog_snapshot_locked(
+                f"api-preflight-edit-user{user_id}"
+            )
+            preflight = self._user_write_preflight(snapshot, user_id, include_current=True)
+            fresh_record = next(
+                (record for record in snapshot.users if record.user_id == user_id), None
+            )
+            if fresh_record is not None:
+                # Carry unsupplied fields over from the table we just read,
+                # not from the poller's cache, so an edit cannot silently
+                # rewrite a field with a value the panel has since changed.
+                current_record = user_to_record(_user_to_model(fresh_record))
             await asyncio.to_thread(
                 _apply_upsert_user,
                 self._user_manager_config(),
                 user_id=user_id,
                 payload=payload,
                 current=current_record,
+                preflight=preflight,
                 verify_prefix=f"api-edit-user{user_id}",
             )
         await self.refresh_catalog()

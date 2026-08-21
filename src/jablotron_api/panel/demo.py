@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from typing import Awaitable, Callable
 
 from jablotron_api.domain.codes import CodeFormat, resolve_code_format
@@ -25,7 +26,14 @@ from jablotron_api.domain.models import (
     UserModel,
     UserPatchModel,
 )
+from jablotron_api.domain.user_validation import (
+    UserTableEntry,
+    entry_from_record,
+    validate_user_write,
+)
 from jablotron_api.services.catalog_io import ensure_id_in_range
+
+LOGGER = logging.getLogger(__name__)
 
 
 StatusListener = Callable[[str, dict], Awaitable[None]]
@@ -97,6 +105,10 @@ class DemoPanelRuntime:
                 devices=InitialSetupRangeModel(first_id=1, last_id=4, count=4),
                 users=InitialSetupRangeModel(first_id=1, last_id=2, count=2),
                 pgs=InitialSetupRangeModel(first_id=1, last_id=2, count=2),
+                # The demo panel declares a code format so that user writes
+                # face the same code rules here as on a real panel.
+                code_length=4,
+                code_prefix=False,
             ),
             raw_counts=RawCatalogCountsModel(sections=2, devices=3, users=2, pgs=2),
             sha256="demo-catalog",
@@ -333,8 +345,50 @@ class DemoPanelRuntime:
         self._events.insert(0, EventRecordModel(timestamp=_utc_now(), kind="EVENT", text=f"PG {pg_id} set {'on' if enabled else 'off'}", source="demo"))
         return await self.refresh_status()
 
+    def _validate_user_write(
+        self,
+        user_id: int,
+        *,
+        code: str,
+        cards: tuple[str, ...],
+        time_limited_group_raw: int | None,
+        include_current: bool,
+    ) -> None:
+        """Apply the shared user-table rules to the in-memory table.
+
+        The demo runtime is what provisioning clients develop against, so it
+        refuses the same records the live runtime refuses — a client should
+        not first meet these rules on a real alarm panel.
+        """
+
+        existing = [entry_from_record(user) for user in self._catalog.users]
+        current = None
+        if include_current:
+            current = next((entry for entry in existing if entry.user_id == user_id), None)
+        warnings = validate_user_write(
+            existing=existing,
+            user_id=user_id,
+            current=current,
+            target=UserTableEntry(
+                user_id=user_id,
+                code=code,
+                cards=cards,
+                time_limited_group_raw=time_limited_group_raw,
+            ),
+            code_format=self.code_format(),
+        )
+        for message in warnings:
+            LOGGER.warning("User %s write preflight warning: %s", user_id, message)
+
     async def add_user(self, payload: UserCreateModel) -> UserModel:
         self._ensure_usable_user_id(payload.id)
+        self._validate_user_write(
+            payload.id,
+            code=payload.code,
+            cards=(payload.card1,) if payload.card1 else (),
+            time_limited_group_raw=payload.time_limited_group_raw,
+            include_current=False,
+        )
         user = UserModel(
             id=payload.id,
             name=payload.name,
@@ -358,7 +412,21 @@ class DemoPanelRuntime:
         user = await self.get_user(user_id)
         if user is None:
             raise RuntimeError(f"User {user_id} not found.")
-        for field, value in payload.model_dump(exclude_unset=True).items():
+        requested = payload.model_dump(exclude_unset=True)
+        self._validate_user_write(
+            user_id,
+            code=requested.get("code", user.code) or "",
+            cards=(
+                ((requested["card1"],) if requested["card1"] else ())
+                if "card1" in requested
+                else tuple(user.cards)
+            ),
+            time_limited_group_raw=requested.get(
+                "time_limited_group_raw", user.time_limited_group_raw
+            ),
+            include_current=True,
+        )
+        for field, value in requested.items():
             if field == "card1":
                 user.cards = [value] if value else []
             elif field == "sections":

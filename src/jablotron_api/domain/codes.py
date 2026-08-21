@@ -7,6 +7,11 @@ shape of every user code submitted to it:
 - ``code_prefix`` — whether codes must be supplied as ``<user_id>*<code>``
   (e.g. ``0*1234`` for the service user) or as the bare ``<code>``.
 
+``validate_user_code`` applies both settings to a code submitted for
+authentication. ``validate_user_table_code`` applies the digit/length half
+of it to a PIN being written into a user slot, where the prefix is typed at
+the keypad rather than stored.
+
 Both values come from the panel's exported ``main_config`` and arrive in
 :class:`InitialSetupModel`. Until the catalog has been pulled (e.g. during
 the very first poll cycle, or in tests that skip the export), we fall back
@@ -90,4 +95,36 @@ def validate_user_code(code: str | None, fmt: CodeFormat) -> None:
         digits = stripped
 
     if fmt.code_length is not None and len(digits) != fmt.code_length:
+        raise ValueError(f"Panel code must be exactly {fmt.code_length} digits.")
+
+
+def validate_user_table_code(code: str | None, fmt: CodeFormat) -> None:
+    """Validate a PIN destined for a slot in the panel's user table.
+
+    Distinct from :func:`validate_user_code`, which validates a code being
+    *submitted for authentication*. A user record stores the bare PIN: when
+    the panel is configured for prefixed codes the ``<user_id>*`` part is
+    typed at the keypad, not stored in the slot, so the prefix rule must not
+    be applied here.
+
+    ``fmt.code_length`` is the panel's own installation-wide setting and the
+    only authority on the required length. If it is unknown we refuse rather
+    than guess — writing a wrong-length PIN into a user slot is not
+    something to be optimistic about.
+
+    Raises ``ValueError``. The message never quotes the code: it travels
+    into HTTP responses and the server log.
+    """
+
+    digits = (code or "").strip()
+    if not digits:
+        raise ValueError("User code must not be empty.")
+    if not digits.isdigit():
+        raise ValueError("User code must be all digits.")
+    if fmt.code_length is None:
+        raise ValueError(
+            "The panel's code length is unknown, so the submitted code's shape "
+            "cannot be checked; refusing to write a user code rather than guessing it."
+        )
+    if len(digits) != fmt.code_length:
         raise ValueError(f"Panel code must be exactly {fmt.code_length} digits.")
