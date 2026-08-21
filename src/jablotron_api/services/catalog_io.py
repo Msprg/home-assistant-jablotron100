@@ -10,6 +10,7 @@ All logic here was previously inlined in `panel/runtime.py`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -33,6 +34,7 @@ from jablotron_api.domain.models import (
     RawCatalogCountsModel,
     SectionStatusModel,
     UserModel,
+    utc_now,
 )
 from jablotron_api.services.device_inference import (
     SYSTEM_OBJECT_IDS,
@@ -206,7 +208,22 @@ def ensure_id_in_range(
         )
 
 
-def catalog_to_model(snapshot: ExportCatalogSnapshot) -> ExportCatalogModel:
+def catalog_to_model(
+    snapshot: ExportCatalogSnapshot,
+    *,
+    as_of: datetime | None = None,
+    source: str = "panel",
+    trigger_used: bool = True,
+) -> ExportCatalogModel:
+    """Convert an export snapshot into the API model.
+
+    The freshness arguments describe the read that produced ``snapshot``:
+    when it happened, whether this response comes from that read or from a
+    cache of it, and whether obtaining it entered the panel's configuration
+    mode. They default to "a panel read that happened now" because every
+    caller that converts a snapshot has just performed one.
+    """
+
     initial_setup = build_initial_setup(snapshot)
     pg_names = {pg.name for pg in snapshot.pgs_by_id.values() if pg.name}
 
@@ -281,6 +298,9 @@ def catalog_to_model(snapshot: ExportCatalogSnapshot) -> ExportCatalogModel:
         ),
         sha256=getattr(snapshot, "sha256", None),
         path=str(getattr(snapshot, "path", "")) or None,
+        as_of=as_of if as_of is not None else utc_now(),
+        source=source,
+        trigger_used=trigger_used,
     )
 
 

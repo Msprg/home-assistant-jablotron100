@@ -24,6 +24,11 @@ class PanelSettings:
     fast_status_timeout_seconds: float = 0.6
     full_status_timeout_seconds: float = 2.0
     reset: bool = True
+    # How old a cached export catalog may be before a read pulls the panel
+    # again. Finite by design: an unbounded default is what let a 52-hour-old
+    # catalog be served as if it were current. Refreshes are demand-driven —
+    # nothing in the server refreshes the catalog on a timer.
+    catalog_max_age_seconds: float = 3600.0
 
 
 @dataclass
@@ -56,5 +61,8 @@ class ServerSettings:
             fast_status_timeout_seconds=float(os.getenv("JABLOTRON_PANEL_FAST_STATUS_TIMEOUT_SECONDS", "0.6")),
             full_status_timeout_seconds=float(os.getenv("JABLOTRON_PANEL_FULL_STATUS_TIMEOUT_SECONDS", "2")),
             reset=os.getenv("JABLOTRON_PANEL_RESET", "true").lower() not in {"0", "false", "no"},
+            catalog_max_age_seconds=float(
+                os.getenv("JABLOTRON_PANEL_CATALOG_MAX_AGE_SECONDS", "3600")
+            ),
         )
     )

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import math
 from pathlib import Path
 import time
 from typing import Awaitable, Callable
@@ -103,6 +104,9 @@ class PanelRuntimeConfig:
     fast_status_timeout_seconds: float = 0.6
     full_status_timeout_seconds: float = 2.0
     reset: bool = True
+    # Mirrors ServerSettings.panel.catalog_max_age_seconds; production passes
+    # a PanelSettings here, so the two dataclasses must stay in step.
+    catalog_max_age_seconds: float = 3600.0
 
 
 class PanelRuntime:
@@ -114,6 +118,16 @@ class PanelRuntime:
         self._listeners: list[StatusListener] = []
         self._status: PanelStatusModel | None = None
         self._catalog: ExportCatalogModel | None = None
+        # Raw snapshot behind `_catalog`, kept for the export endpoints that
+        # need fields the API model does not carry. Never handed to the
+        # user-write preflight: that must validate against its own fresh read.
+        self._catalog_snapshot: ExportCatalogSnapshot | None = None
+        # Freshness bookkeeping for the demand-driven cache, in monotonic time
+        # so a wall-clock jump cannot make a stale catalog look current.
+        self._catalog_completed_monotonic: float | None = None
+        self._catalog_started_monotonic_for_cache: float = float("-inf")
+        self._catalog_pull_task: asyncio.Task[None] | None = None
+        self._catalog_pull_started_monotonic: float = float("-inf")
         self._system_info: dict[str, str | None] = {
             "panel_model": None,
             "panel_hardware_version": None,
@@ -386,39 +400,144 @@ class PanelRuntime:
         await self._emit("status", status.model_dump(mode="json"))
         return status
 
+    # ------------------------------------------------------------ catalog cache
+    #
+    # Demand-driven, never scheduled. There is no timer, no poll-loop hook and
+    # no background task that refreshes the catalog: a pull happens only when a
+    # request arrives whose freshness requirement the cache cannot meet at that
+    # moment, so an idle server does no panel work at all. This is deliberate —
+    # every catalog read enters the panel's configuration mode (the panel only
+    # materialises EXPORT.CFG inside a session; see docs/panel-export-freshness.md),
+    # and that is not something to do on a timer.
+    #
+    # `max_age_seconds` conventions, shared by every read below:
+    #   None  -> use the configured default (`catalog_max_age_seconds`, finite)
+    #   0     -> require a pull that STARTED at or after this call arrived
+    #   inf   -> any cached catalog will do, however old
+    #   n > 0 -> cache is acceptable if it completed within n seconds
+
+    def _resolved_max_age(self, max_age_seconds: float | None) -> float:
+        if max_age_seconds is None:
+            return self._config.catalog_max_age_seconds
+        return float(max_age_seconds)
+
+    def _catalog_meets(self, max_age_seconds: float, requested_at: float) -> bool:
+        if self._catalog is None or self._catalog_completed_monotonic is None:
+            return False
+        if max_age_seconds == math.inf:
+            return True
+        if max_age_seconds <= 0:
+            # A pull that began before this request arrived answers a question
+            # about a panel state that predates the request. `board` reads with
+            # max_age=0 immediately before deleting panel entries, so "started
+            # earlier" is not good enough — chain another pull instead.
+            return self._catalog_started_monotonic_for_cache >= requested_at
+        return (time.monotonic() - self._catalog_completed_monotonic) <= max_age_seconds
+
+    def _inflight_meets(self, max_age_seconds: float, requested_at: float) -> bool:
+        if self._catalog_pull_task is None:
+            return False
+        if max_age_seconds <= 0:
+            return self._catalog_pull_started_monotonic >= requested_at
+        return True
+
+    async def _ensure_catalog(self, *, max_age_seconds: float, prefix: str) -> bool:
+        """Make the cache satisfy ``max_age_seconds``. Returns True if untouched.
+
+        Single-flight: concurrent requests that need a pull join the one
+        in-flight pull instead of queueing several behind the panel lock. With
+        a ~16 s pull and three clients that is the difference between one
+        interruption of the panel and three.
+        """
+
+        requested_at = time.monotonic()
+        served_from_cache = True
+        while not self._catalog_meets(max_age_seconds, requested_at):
+            task = self._catalog_pull_task
+            if task is None:
+                served_from_cache = False
+                started_at = time.monotonic()
+                self._catalog_pull_started_monotonic = started_at
+                task = asyncio.create_task(
+                    self._pull_catalog_into_cache(started_at=started_at, prefix=prefix)
+                )
+                self._catalog_pull_task = task
+            elif self._inflight_meets(max_age_seconds, requested_at):
+                served_from_cache = False
+            # Shielded: a client that disconnects mid-wait must not cancel a
+            # panel read the other waiters are relying on.
+            await asyncio.shield(task)
+        return served_from_cache
+
+    async def _pull_catalog_into_cache(self, *, started_at: float, prefix: str) -> None:
+        try:
+            async with self._lock:
+                await self._close_status_session_locked()
+                snapshot = await self._pull_catalog_snapshot_locked(prefix)
+                self._catalog_snapshot = snapshot
+                self._catalog = _catalog_to_model(
+                    snapshot,
+                    as_of=utc_now(),
+                    source="panel",
+                    # Every catalog read triggers the F-Link export refresh
+                    # sequence, which is the only thing that materialises
+                    # EXPORT.CFG on the FlexiCFG volume.
+                    trigger_used=True,
+                )
+                self._catalog_started_monotonic_for_cache = started_at
+                self._catalog_completed_monotonic = time.monotonic()
+                LOGGER.info(
+                    "Panel catalog refreshed: sections=%s pgs=%s devices=%s users=%s "
+                    "initial_setup_exact=%s took=%.1fs",
+                    len(self._catalog.sections),
+                    len(self._catalog.pgs),
+                    len(self._catalog.devices),
+                    len(self._catalog.users),
+                    None if self._catalog.initial_setup is None else self._catalog.initial_setup.exact,
+                    self._catalog_completed_monotonic - started_at,
+                )
+                if self._status_session is not None:
+                    self._configure_session_live_devices(self._status_session)
+            await self._emit("catalog", self._catalog.model_dump(mode="json"))
+        finally:
+            self._catalog_pull_task = None
+
+    async def _catalog_model(
+        self, *, max_age_seconds: float | None, prefix: str
+    ) -> ExportCatalogModel:
+        served_from_cache = await self._ensure_catalog(
+            max_age_seconds=self._resolved_max_age(max_age_seconds), prefix=prefix
+        )
+        catalog = self._catalog
+        if catalog is None:  # pragma: no cover - _ensure_catalog guarantees one
+            raise RuntimeError("Panel catalog unavailable after a read.")
+        if served_from_cache:
+            return catalog.model_copy(update={"source": "cache"})
+        return catalog
+
     async def refresh_catalog(self) -> ExportCatalogModel:
-        async with self._lock:
-            catalog = await self._pull_catalog_snapshot_locked("api-server-catalog")
-            self._catalog = _catalog_to_model(catalog)
-            LOGGER.info(
-                "Panel catalog refreshed: sections=%s pgs=%s devices=%s users=%s initial_setup_exact=%s",
-                len(self._catalog.sections),
-                len(self._catalog.pgs),
-                len(self._catalog.devices),
-                len(self._catalog.users),
-                None if self._catalog.initial_setup is None else self._catalog.initial_setup.exact,
-            )
-            if self._status_session is not None:
-                self._configure_session_live_devices(self._status_session)
-        await self._emit("catalog", self._catalog.model_dump(mode="json"))
-        return self._catalog
+        """Force a panel read and replace the cache. Never serves the cache."""
+
+        return await self._catalog_model(max_age_seconds=0.0, prefix="api-server-catalog")
 
     async def get_status(self) -> PanelStatusModel:
         if self._status is None:
             return await self.refresh_status()
         return self._status
 
-    async def get_catalog(self) -> ExportCatalogModel:
-        if self._catalog is None:
-            return await self.refresh_catalog()
-        return self._catalog
+    async def get_catalog(self, max_age_seconds: float | None = None) -> ExportCatalogModel:
+        return await self._catalog_model(
+            max_age_seconds=max_age_seconds, prefix="api-server-catalog"
+        )
 
-    async def get_users(self) -> list[UserModel]:
-        catalog = await self.get_catalog()
+    async def get_users(self, max_age_seconds: float | None = None) -> list[UserModel]:
+        catalog = await self.get_catalog(max_age_seconds)
         return filter_users_for_clients(catalog.users, catalog.initial_setup)
 
-    async def get_user(self, user_id: int) -> UserModel | None:
-        for user in await self.get_users():
+    async def get_user(
+        self, user_id: int, max_age_seconds: float | None = None
+    ) -> UserModel | None:
+        for user in await self.get_users(max_age_seconds):
             if user.id == user_id:
                 return user
         return None
@@ -453,8 +572,8 @@ class PanelRuntime:
 
     # ---------------------------------------------------------------- exports
 
-    async def get_export_users(self) -> list[UserModel]:
-        return (await self.get_catalog()).users
+    async def get_export_users(self, max_age_seconds: float | None = None) -> list[UserModel]:
+        return (await self.get_catalog(max_age_seconds)).users
 
     async def get_export_time_limits(self) -> list[dict[str, object]]:
         catalog = await self._refresh_export_snapshot()
@@ -465,8 +584,22 @@ class PanelRuntime:
         return export_communications_payload(catalog)
 
     async def _refresh_export_snapshot(self) -> ExportCatalogSnapshot:
-        async with self._lock:
-            return await self._pull_catalog_snapshot_locked("api-server-export")
+        """Always-fresh snapshot for the raw config-inspection endpoints.
+
+        These two endpoints keep the always-pull semantics they have always
+        had (`max_age_seconds=0`): they exist to inspect the panel's actual
+        configuration, where a cached answer is a footgun, and they are called
+        rarely. What changes is only their behaviour under concurrency —
+        routing them through the shared machinery means they join an in-flight
+        pull that started after they arrived instead of stacking pulls behind
+        the panel lock. They deliberately take no `max_age_seconds` parameter.
+        """
+
+        await self._ensure_catalog(max_age_seconds=0.0, prefix="api-server-export")
+        snapshot = self._catalog_snapshot
+        if snapshot is None:  # pragma: no cover - a completed pull always stores one
+            raise RuntimeError("Export catalog snapshot unavailable after a panel read.")
+        return snapshot
 
     async def _pull_catalog_snapshot_locked(self, output_prefix: str) -> ExportCatalogSnapshot:
         LOGGER.info(
@@ -630,6 +763,16 @@ class PanelRuntime:
         the cached catalog.
         """
 
+        if snapshot is self._catalog_snapshot:
+            # Structural guard, not a style rule. The duplicate, code-format
+            # and duress-adjacency rules only mean anything against the table
+            # the panel holds right now: a preflight that passes against a
+            # cached table can assign a code that is another user's silent-panic
+            # twin. If the catalog cache is ever wired in here, fail loudly.
+            raise RuntimeError(
+                "User-write preflight must validate against a fresh panel read, "
+                "not the cached catalog snapshot."
+            )
         return UserWritePreflight.from_records(
             snapshot.users,
             user_id=user_id,
@@ -666,7 +809,11 @@ class PanelRuntime:
 
     async def edit_user(self, user_id: int, payload: UserPatchModel) -> UserModel:
         self._ensure_usable_user_id(user_id)
-        current = await self.get_user(user_id)
+        # Any cached view will do for the existence check: the fresh read
+        # taken under the lock below is the authority for both the preflight
+        # and the carried-over field values, so making this lookup pull too
+        # would just spend a second ~16 s panel session on the same answer.
+        current = await self.get_user(user_id, max_age_seconds=math.inf)
         if current is None:
             raise RuntimeError(f"User {user_id} not found.")
         current_record = user_to_record(current)

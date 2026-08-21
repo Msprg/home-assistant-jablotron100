@@ -43,6 +43,7 @@ from jablotron_api.services.storage import TokenStore
 
 class FakeRuntime:
     def __init__(self) -> None:
+        self.max_age_calls: list[tuple[str, float | None]] = []
         self.system_info = {
             "panel_model": "JA-107K",
             "panel_hardware_version": "MD6112.09.1",
@@ -113,16 +114,20 @@ class FakeRuntime:
     async def get_status(self):
         return self.status
 
-    async def get_catalog(self):
+    async def get_catalog(self, max_age_seconds=None):
+        self.max_age_calls.append(("get_catalog", max_age_seconds))
         return self.catalog
 
-    async def get_users(self):
+    async def get_users(self, max_age_seconds=None):
+        self.max_age_calls.append(("get_users", max_age_seconds))
         return self.catalog.users
 
-    async def get_export_users(self):
+    async def get_export_users(self, max_age_seconds=None):
+        self.max_age_calls.append(("get_export_users", max_age_seconds))
         return self.catalog.users
 
-    async def get_user(self, user_id: int):
+    async def get_user(self, user_id: int, max_age_seconds=None):
+        self.max_age_calls.append(("get_user", max_age_seconds))
         for user in self.catalog.users:
             if user.id == user_id:
                 return user

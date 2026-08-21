@@ -40,7 +40,11 @@ StatusListener = Callable[[str, dict], Awaitable[None]]
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _utc_now_dt().isoformat()
+
+
+def _utc_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class DemoPanelRuntime:
@@ -237,16 +241,26 @@ class DemoPanelRuntime:
     async def get_status(self) -> PanelStatusModel:
         return self._status
 
-    async def get_catalog(self) -> ExportCatalogModel:
-        return self._catalog
+    async def get_catalog(self, max_age_seconds: float | None = None) -> ExportCatalogModel:
+        # The demo panel is in memory, so it is always current and no
+        # configuration mode is ever entered: the freshness fields say so
+        # honestly rather than echoing the live runtime's values.
+        del max_age_seconds
+        return self._catalog.model_copy(
+            update={"as_of": _utc_now_dt(), "source": "panel", "trigger_used": False}
+        )
 
-    async def get_users(self) -> list[UserModel]:
+    async def get_users(self, max_age_seconds: float | None = None) -> list[UserModel]:
+        del max_age_seconds
         user_range = self._catalog.initial_setup.users if self._catalog.initial_setup is not None else None
         if user_range is None:
             return self._catalog.users
         return [user for user in self._catalog.users if user_range.first_id <= user.id <= user_range.last_id]
 
-    async def get_user(self, user_id: int) -> UserModel | None:
+    async def get_user(
+        self, user_id: int, max_age_seconds: float | None = None
+    ) -> UserModel | None:
+        del max_age_seconds
         for user in self._catalog.users:
             if user.id == user_id:
                 return user
@@ -263,8 +277,8 @@ class DemoPanelRuntime:
         del include_raw, kinds, exclude_kinds
         return self._events[:limit]
 
-    async def get_export_users(self) -> list[UserModel]:
-        return await self.get_users()
+    async def get_export_users(self, max_age_seconds: float | None = None) -> list[UserModel]:
+        return await self.get_users(max_age_seconds)
 
     async def get_export_time_limits(self) -> list[dict[str, object]]:
         return [

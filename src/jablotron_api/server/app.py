@@ -550,14 +550,37 @@ def create_app(
         )
 
     @app.get("/v1/users")
-    async def users(token: AuthenticatedToken = Depends(require_token)):
+    async def users(
+        max_age_seconds: float | None = Query(
+            default=None,
+            ge=0,
+            description=(
+                "Serve the cached catalog only if it is at most this many seconds old; "
+                "otherwise read the panel. 0 forces a read that starts after this "
+                "request arrives. Omitted: the server's configured default."
+            ),
+        ),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
         require_scopes(token, Scope.USERS_READ.value)
-        return serialize_users(await runtime.get_users(), token)
+        return serialize_users(await runtime.get_users(max_age_seconds), token)
 
     @app.get("/v1/users/{user_id}")
-    async def user(user_id: int, token: AuthenticatedToken = Depends(require_token)):
+    async def user(
+        user_id: int,
+        max_age_seconds: float | None = Query(
+            default=None,
+            ge=0,
+            description=(
+                "Serve the cached catalog only if it is at most this many seconds old; "
+                "otherwise read the panel. 0 forces a read that starts after this "
+                "request arrives. Omitted: the server's configured default."
+            ),
+        ),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
         require_scopes(token, Scope.USERS_READ.value)
-        result = await runtime.get_user(user_id)
+        result = await runtime.get_user(user_id, max_age_seconds)
         if result is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
         return serialize_users([result], token)[0]
@@ -628,14 +651,36 @@ def create_app(
         return await events(limit, include_raw, kinds, exclude_kinds, token)
 
     @app.get("/v1/export/users")
-    async def export_users(token: AuthenticatedToken = Depends(require_token)):
+    async def export_users(
+        max_age_seconds: float | None = Query(
+            default=None,
+            ge=0,
+            description=(
+                "Serve the cached catalog only if it is at most this many seconds old; "
+                "otherwise read the panel. 0 forces a read that starts after this "
+                "request arrives. Omitted: the server's configured default."
+            ),
+        ),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
         require_scopes(token, Scope.USERS_READ.value)
-        return serialize_users(await runtime.get_export_users(), token)
+        return serialize_users(await runtime.get_export_users(max_age_seconds), token)
 
     @app.get("/v1/export/catalog")
-    async def export_catalog(token: AuthenticatedToken = Depends(require_token)):
+    async def export_catalog(
+        max_age_seconds: float | None = Query(
+            default=None,
+            ge=0,
+            description=(
+                "Serve the cached catalog only if it is at most this many seconds old; "
+                "otherwise read the panel. 0 forces a read that starts after this "
+                "request arrives. Omitted: the server's configured default."
+            ),
+        ),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
         require_scopes(token, Scope.CATALOG_READ.value)
-        return serialize_catalog(await runtime.get_catalog(), token)
+        return serialize_catalog(await runtime.get_catalog(max_age_seconds), token)
 
     @app.get("/v1/export/time-limits")
     async def export_time_limits(token: AuthenticatedToken = Depends(require_token)):

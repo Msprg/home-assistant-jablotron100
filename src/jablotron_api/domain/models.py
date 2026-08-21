@@ -269,6 +269,14 @@ class ExportCatalogModel(BaseModel):
     raw_counts: RawCatalogCountsModel | None = None
     sha256: str | None = None
     path: str | None = None
+    # Freshness provenance. A client must be able to verify how old this
+    # catalog is rather than trust it: `as_of` is when the underlying export
+    # was read from the panel, `source` says whether this response came from
+    # that read or from the server's cache of it, and `trigger_used` says
+    # whether obtaining it entered the panel's configuration mode.
+    as_of: datetime | None = None
+    source: str = "cache"
+    trigger_used: bool = False
 
 
 class PanelStatusModel(BaseModel):

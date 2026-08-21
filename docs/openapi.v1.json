@@ -713,6 +713,25 @@
         "operationId": "export_catalog_v1_export_catalog_get",
         "parameters": [
           {
+            "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+            "in": "query",
+            "name": "max_age_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+              "title": "Max Age Seconds"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -844,6 +863,25 @@
       "get": {
         "operationId": "export_users_v1_export_users_get",
         "parameters": [
+          {
+            "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+            "in": "query",
+            "name": "max_age_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+              "title": "Max Age Seconds"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -1525,6 +1563,25 @@
         "operationId": "users_v1_users_get",
         "parameters": [
           {
+            "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+            "in": "query",
+            "name": "max_age_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+              "title": "Max Age Seconds"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,
@@ -1678,6 +1735,25 @@
             "schema": {
               "title": "User Id",
               "type": "integer"
+            }
+          },
+          {
+            "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+            "in": "query",
+            "name": "max_age_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve the cached catalog only if it is at most this many seconds old; otherwise read the panel. 0 forces a read that starts after this request arrives. Omitted: the server's configured default.",
+              "title": "Max Age Seconds"
             }
           },
           {

@@ -26,6 +26,32 @@ The authoritative description is `docs/openapi.v1.json`, generated from the runn
 venv/bin/python -m jablotron_api.cli.main openapi-export docs/openapi.v1.json
 ```
 
+### Catalog freshness
+
+Reads of the exported catalog and the user table are **demand-driven**: the
+server caches the last panel read and refreshes it only when a request
+arrives whose freshness requirement the cache cannot meet. Nothing refreshes
+the catalog on a timer, so an idle server does no panel work — which matters
+because every catalog read enters the panel's configuration mode and takes
+~16 s (see [docs/panel-export-freshness.md](docs/panel-export-freshness.md)).
+
+- `GET /v1/export/catalog`, `GET /v1/users`, `GET /v1/users/{id}` and
+  `GET /v1/export/users` accept `?max_age_seconds=`. The cache is served when
+  it is at most that old; otherwise the panel is read.
+- Omitting the parameter uses the server's configured default,
+  `JABLOTRON_PANEL_CATALOG_MAX_AGE_SECONDS` (default `3600`). The default is
+  finite by design.
+- `max_age_seconds=0` means a read that *started at or after the request
+  arrived* — a request that joins a pull which began earlier chains its own.
+  Use it before acting on the panel's contents.
+- Concurrent requests that need a read join one in-flight read rather than
+  queueing several against the panel.
+- Every catalog response carries `as_of` (when the underlying export was
+  read), `source` (`panel` or `cache`) and `trigger_used`, so a client can
+  verify freshness instead of trusting it.
+- `GET /v1/export/time-limits` and `GET /v1/export/communications` keep their
+  always-fresh semantics and take no `max_age_seconds`.
+
 The `/v1/events/recent` path is a deprecated alias for `/v1/events?limit=...&kinds=...` and will be removed after the v1 alpha window.
 
 ### Quick start
