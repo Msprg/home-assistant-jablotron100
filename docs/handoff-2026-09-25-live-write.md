@@ -118,3 +118,26 @@ actions, no code changes.
   and revoke it at the end.
 - Fresh reads cost ~16 s and a configuration-mode session; the event read
   ~8-11 s. A write costs preflight read + write + refresh, ~80 s.
+
+## Result of step 1 (same day, later session)
+
+Step 1 was run: `jablotron_user_tool.py add 96` on the host with the
+container stopped and `/dev/hidraw0` free. Setup mode was reached
+(`saw_1b00`), and the panel refused the write the same way:
+
+| Attempt | Path | Result | Kernel journal (host, local time) |
+| --- | --- | --- | --- |
+| 14:09 UTC | host, filesystem (`sudo mount`, write `IMPORT.CFG`, fsync) | `IMPORT.CFG staging failed: ... [Errno 5] Input/output error`; exit 1 after 26 s, accept sequence not run | 16:09:43 `Write(10) ... 08 23` sector 2083 and `... 00 1b` sector 27, both *Hardware Error*, `lost async page write` |
+
+So the container is not the variable. The user table was compared again
+(tool's pre-attempt export against a fresh live `list`): 90 raw entries,
+identical, no slot 96. The host mount was removed afterwards and the
+container restarted with `docker compose up -d` (startup complete 14:13
+UTC, HA reconnected).
+
+The masked failure is fixed in `dd1e82c`: a write or fsync error in
+`stage_import` is fatal, and the filesystem path verifies the sector with
+an O_DIRECT read after unmount before the accept sequence.
+
+Next is step 2: replug or power-cycle the panel USB and retry from the
+host; and ask whether F-Link can still write to this panel today.
