@@ -51,7 +51,12 @@ def _build_archive_args(config: EventReaderConfig) -> SimpleNamespace:
         no_reset=not config.reset,
         verbose=False,
         mount_tool=config.mount_tool,
-        end_mode="logical",
+        # "physical" ends the window at the live FLEXILOG.OLD+TXT sizes, which
+        # the panel keeps current. LOGINDEX.BIN is checkpointed only every day
+        # or so, so an index-ended window trails reality by hours. This used to
+        # read "logical", which is not one of the two accepted values and fell
+        # through to the index path silently.
+        end_mode="physical",
         copy_files_dir=None,
         transport="archive",
         window_bytes=65536,

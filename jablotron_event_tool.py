@@ -2239,6 +2239,12 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
         records_format=getattr(args, "records_format", "jsonl"),
         save_records=bool(getattr(args, "records_output", None)),
     )
+    if args.end_mode not in {"index", "physical"}:
+        # Silently falling through to the index path is how the API server
+        # ended up serving a window that ended ~20 hours in the past.
+        raise ValueError(
+            f"Unsupported end mode: {args.end_mode!r} (expected 'index' or 'physical')."
+        )
     log_device = resolve_flexi_log_device(args.log_device)
     mountpoint = Path(args.mountpoint)
     catalog = resolve_decoder_catalog(

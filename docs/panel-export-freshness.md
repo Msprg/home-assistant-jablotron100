@@ -205,9 +205,78 @@ queue three.
   were performed. The log strongly suggests 48 accompanies any real config
   change regardless of channel, so a write by this server should be expected
   to emit 48 — but that is inference, not measurement.
-- **`/v1/events` cannot work in the deployed container at all.** Reading the
-  log requires mounting FLEXI_LOG, and the container runs without
-  `CAP_SYS_ADMIN` (`CapEff=0x00000000a80425fb`, bit 21 clear). This is a
-  pre-existing defect unrelated to catalog freshness, found while looking for
-  a way to answer the event question; it is why probe 2 had to run on the
-  host.
+- **`/v1/events` could not work in the deployed container.** Fixed on
+  2026-08-21; see "Postscript" below.
+
+
+## Postscript (2026-08-21): the event endpoint, and what it does not buy
+
+`/v1/events` returned 500 in the container. Two independent pre-existing
+defects, both now fixed:
+
+1. **It tried to mount FLEXI_LOG.** The first failure was not the capability
+   wall but `FileNotFoundError: 'sudo'` — the image ships no `sudo` binary
+   and `mount_device` shelled out to it unconditionally, although the
+   container already runs as root. Bypassing that only reaches the second
+   wall: `mount(2)` needs `CAP_SYS_ADMIN` and `CapEff=0x00000000a80425fb`
+   has bit 21 clear. Both are avoided by not mounting: `FatVolumeReader`
+   reads the volume with raw block reads, the same technique the export path
+   has always used for `EXPORT.CFG`. Measured on the live volume: geometry
+   plus directory in 0.28 s, `LOGINDEX.BIN` in 0.25 s, a 64 KiB window in
+   0.25 s. The `sudo`-when-root fix landed too, since the user-write path
+   hits the identical wall (see below).
+
+2. **The window ended in the past.** `pull_live_archive` accepts
+   `end_mode` of `"index"` (end at the newest `LOGINDEX.BIN` checkpoint) or
+   `"physical"` (end at the live `FLEXILOG.OLD`+`TXT` sizes). The API
+   service passed `"logical"` — neither — which silently fell through to the
+   index path. `LOGINDEX.BIN` on this panel is checkpointed roughly daily
+   and currently lags the live sizes by ~62 KB, so the endpoint returned
+   events ending **~20 hours in the past**. The `recent` CLI subcommand
+   defaults to `"physical"`, which is why the investigation's own event read
+   saw current data. The service now passes `"physical"`, and an
+   unrecognised `end_mode` raises instead of being ignored.
+
+After both fixes, `/v1/events?limit=15` returns HTTP 200 in **7.3 s** with
+events up to 56 seconds old — the last two entries being the read's own
+`150 Autorizácia OK`.
+
+**What this does not buy.** The hoped-for chain was: working event feed →
+cheap tripwire on events 44/48 → a cached catalog read that can be *proven*
+fresh, at ~150 ms and with no configuration-mode entry. That does not follow
+on this hardware:
+
+- The log volume is materialised only inside a session, exactly like
+  `EXPORT.CFG`. Re-checked 17.5 hours after the investigation's own event
+  read had filled it with 30,510 records: `FLEXILOG.TXT` scanned end to end
+  was **all zeros again**. There is no session-free way to read events.
+- So an event read costs a configuration-mode session of its own: **7.3 s**
+  against **15.9 s** for a catalog pull. Polling the tripwire is roughly
+  half the price of just pulling the catalog — worth having, but it is not
+  free, and it does not avoid configuration mode.
+
+The one genuinely free signal is the FAT directory: `FLEXILOG.OLD` and
+`FLEXILOG.TXT` sizes advance live without any session (observed moving
+across four sessionless reads), readable in ~0.25 s. Since a configuration
+change always writes an event, *no growth since a known-good read* proves no
+change occurred. It is one-directional and of limited use here — the panel
+logs an ARC heartbeat every ~15 minutes, so the counter almost always
+advances within a 900 s window and the proof rarely holds.
+
+**Related, unfixed, and more serious.** `apply_import_sector` with the
+default `stage_mode="filesystem"` also calls `mount_device`, so **user
+writes through the deployed container fail the same way**. The
+`sudo`-when-root fix removes the first wall; `CAP_SYS_ADMIN` remains, so
+that path still needs either `JABLOTRON_PANEL_STAGE_MODE=direct` (an
+existing mount-free staging mode that writes the sector by LBA) or the same
+treatment the event path just received. Not changed here: it writes to the
+panel, and that is not a change to make as a side effect of fixing a read.
+
+**Observation worth a look.** During the seven minutes containing two
+container restarts and two event reads, the panel logged seven
+`119 Neplatná autorizace` events on the USB channel, sourced to
+`Periféria 0: Ústredňa`, interleaved with our `150 Autorizácia OK`. The
+39-day baseline is ~1/hour. No wrong code was ever submitted — the
+configured code authorises successfully every time — so this looks like
+session-churn handshake noise from the persistent-session reconnect rather
+than anything this change introduced. Flagging it rather than concluding.

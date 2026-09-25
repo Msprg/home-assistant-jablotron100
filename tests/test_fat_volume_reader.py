@@ -363,3 +363,50 @@ def test_the_server_event_path_never_mounts(monkeypatch, tmp_path):
     assert all(event.text for event in events)
 
 
+# ------------------------------------------------------------------ end mode
+
+
+def test_the_server_asks_for_the_live_window_not_the_stale_index():
+    """`end_mode` decides how old the returned events are."""
+
+    from jablotron_api.services.event_reader import EventReaderConfig, _build_archive_args
+
+    args = _build_archive_args(
+        EventReaderConfig(
+            flexi_log_device="/dev/null", port="auto", auth_code="0", reset=True, mount_tool="sudo"
+        )
+    )
+    assert args.end_mode == "physical"
+
+
+def test_an_unknown_end_mode_is_rejected_rather_than_silently_ignored():
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(end_mode="logical", log_device="/dev/null", mountpoint="/mnt",
+                           output=None, metadata_output=None, records_output=None,
+                           output_prefix="x", records_format="jsonl", save_records=False)
+    with pytest.raises(ValueError, match="end mode"):
+        event_tool.pull_live_archive(args)
+
+
+def test_window_end_follows_the_live_sizes_when_the_index_lags():
+    """The regression that made /v1/events return ~20-hour-old events."""
+
+    # Position-encoded payload: a repeating marker would make two different
+    # windows compare equal by accident.
+    old_payload = b"".join(f"O{index:09d}".encode() for index in range(400))
+    current_payload = b"".join(f"N{index:09d}".encode() for index in range(300))
+    img = _log_image(old_payload, current_payload)
+    volume = img.reader()
+    physical_total = volume.size(FLEXILOG_OLD_83) + volume.size(FLEXILOG_TXT_83)
+    # An index checkpoint far behind the live write position.
+    stale_index_end = physical_total - 2500
+
+    from_index = read_volume_log_range(
+        volume=volume, old_size=4000, start=stale_index_end - 100, length=100
+    )
+    from_physical = read_volume_log_range(
+        volume=volume, old_size=4000, start=physical_total - 100, length=100
+    )
+    assert from_index != from_physical
+    assert from_physical == current_payload[-100:]
