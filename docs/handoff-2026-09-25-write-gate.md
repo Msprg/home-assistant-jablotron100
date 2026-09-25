@@ -198,3 +198,57 @@ Still open:
   talks to the real panel when one is attached: it failed with "System is
   already in configuration mode" while a live session was open, and passes
   alone. It should be hermetic.
+
+## Correction (16:48-17:05 UTC): the gate follows the login code, not the clock
+
+The "stopped on their own" reading above is probably wrong. After the
+container was rebuilt (`777e43d`, then `43fa279`), writes through the
+running container were tried against the host tool, minutes apart:
+
+| UTC | Path | Login code | Result |
+| --- | --- | --- | --- |
+| 16:48 | API `POST /v1/users` (container) | container's configured code | Refused (*Hardware Error* on sectors 2083 and 27); the old image's `SystemExit` stopped uvicorn and Docker restarted the container |
+| 16:56 | API `POST /v1/users` (container, `43fa279`) | container's code | Refused; HTTP 409, no restart |
+| 16:56 | host `add 96`, container stopped | tool default (the service code, per `research/notes/2026-03-10_setup-mode-handshake.txt`) | Accepted, user 96 created, event 48 |
+| 16:59 | API `PATCH /v1/users/96` (container), usbmon recording | container's code | Refused; 409, no restart |
+| 17:02 | host `delete 96` | tool default | Write accepted and verified, 48 logged, but user 96 still present (see below) |
+| 17:04 | host `delete 96` again | tool default | Absent; table identical to the pre-add baseline |
+
+- **The container has what filesystem staging needs.** `CAP_SYS_ADMIN`,
+  AppArmor unconfined, root, `mount` present; the mount succeeds and the
+  Write(10) reaches the panel. `direct` mode is not the answer: raw sector
+  writes never trigger an import (March transport review).
+- **The two paths differ in one input.** The usbmon captures of the
+  accepted host write (`linux-host3.pcapng`) and the refused container
+  write (`linux-ctr1.pcapng`) match in HID timing (same bursts, same last
+  three commands 3.5, 1.2 and 0.6 s before the write) and in the SCSI
+  commands before the write. The container logs in with its configured
+  code, which is not the tool's default service code (compared for
+  equality only, neither value printed). With the container's code the
+  panel still reaches setup mode, and staging runs. But it answers the
+  storage write with an immediate CHECK CONDITION.
+- **This fits the whole day** if the morning host runs used the container's
+  code: the earlier handoff says the host runs read the code from a private
+  file. That was not re-checked (reading it was out of bounds for this
+  session), so it is the one unconfirmed link. The F-Link capture fits too:
+  refused before F-Link authenticated as service, accepted after.
+- **Proof still owed:** one API write with the container logging in with the
+  service code. That is an owner decision (which code the API holds), see
+  below.
+- **The 17:02 delete that did not apply:** our import was accepted at
+  19:02:25 local, while a cloud "Server" channel session was open (156 at
+  19:02:20, 157 at 19:02:43). The panel logged 48, but the delete did not
+  persist; the retry two minutes later did. Likely the cloud session wrote
+  its own configuration back. The tool still exited 0 while printing user 96
+  as present after a delete, which it should treat as a failure.
+
+Options for the owner, not done here:
+
+1. Point `JABLOTRON_PANEL_AUTH_CODE` at the service code. Simplest; the API
+   then holds the service code for every operation, including arming.
+2. Add a separate write-only code (for example
+   `JABLOTRON_PANEL_WRITE_AUTH_CODE`) used only by `apply_import_sector`.
+   Keeps arming and polling on the current code.
+
+Until one of those is in place, every user write through the API will be
+refused with 409, not a coin toss.
