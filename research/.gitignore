@@ -2,6 +2,10 @@
 *
 !/.gitignore
 !/README.md
+!/2026-07-13_f-link-component-map.md
+!/2026-07-14_f-link-boundary-callgraphs.md
+!/2026-07-14_f-link-communication-protocol-boundaries.md
+!/2026-07-14_api-server-communication-roadmap.md
 !/**/.gitkeep
 !/notes/
 !/notes/2026-03-10_setup-mode-handshake.txt

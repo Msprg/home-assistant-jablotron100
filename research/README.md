@@ -13,6 +13,23 @@ Start with [`research/2026-03-07_usb-protocol-research-report.md`](2026-03-07_us
 for the original breakthrough narrative, then use this README as the authoritative
 cross-referenced summary of what is currently known.
 
+For static analysis of the Windows application, see
+[`2026-07-13_f-link-component-map.md`](2026-07-13_f-link-component-map.md). It maps the
+major F-Link subsystems to recovered Delphi types and executable virtual addresses and
+provides entry points for deeper reverse engineering.
+The follow-up
+[`2026-07-14_f-link-boundary-callgraphs.md`](2026-07-14_f-link-boundary-callgraphs.md)
+resolves the priority RTTI records to VMTs and published methods, bounds the firmware
+state machine, and records the package-to-transport call graph.
+The communication-focused continuation,
+[`2026-07-14_f-link-communication-protocol-boundaries.md`](2026-07-14_f-link-communication-protocol-boundaries.md),
+recovers direct-HID and streamed transport VMTs, application framing, fragment
+reassembly, heartbeat/retry layers, and exact next targets for a more robust client.
+The implementation sequence is tracked in
+[`2026-07-14_api-server-communication-roadmap.md`](2026-07-14_api-server-communication-roadmap.md),
+which turns those findings into staged codec, dispatcher, liveness, write-reliability,
+correlation, and rollout work for the API server.
+
 ---
 
 ## 1. Directory layout
