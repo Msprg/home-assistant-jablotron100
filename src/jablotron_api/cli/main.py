@@ -29,25 +29,36 @@ def cmd_bootstrap_token(args: argparse.Namespace) -> None:
     print(f"scopes {','.join(token_info.scopes)}")
 
 
+def build_uvicorn_log_config() -> dict:
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s %(levelprefix)s %(message)s"
+    log_config["formatters"]["access"]["fmt"] = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    log_config["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    # Redact sensitive query parameters (token=, fingerprint=) before they
+    # hit any file or stdout sink. HTTP requests go through "uvicorn.access";
+    # the WebSocket '"WebSocket /v1/ws?token=..." [accepted]' line is written
+    # by the protocol implementation through "uvicorn.error", so both loggers
+    # carry the filter (the filter reads the record's args, which is where
+    # both put the path).
+    log_config.setdefault("filters", {})["redact_sensitive_query"] = {
+        "()": "jablotron_api.server.app.SensitiveQueryAccessLogFilter",
+    }
+    for logger_name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+        logger = log_config["loggers"].setdefault(logger_name, {})
+        filters = logger.setdefault("filters", [])
+        if "redact_sensitive_query" not in filters:
+            filters.append("redact_sensitive_query")
+    return log_config
+
+
 def cmd_server(_args: argparse.Namespace) -> None:
     from jablotron_api.server.app import create_app
     from jablotron_api.server.config import ServerSettings
 
     settings = ServerSettings()
     app = create_app(settings=settings)
-    log_config = copy.deepcopy(LOGGING_CONFIG)
-    log_config["formatters"]["default"]["fmt"] = "%(asctime)s %(levelprefix)s %(message)s"
-    log_config["formatters"]["access"]["fmt"] = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
-    log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    log_config["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    # Redact sensitive query parameters (token=, fingerprint=) from
-    # uvicorn's access log before they hit any file or stdout sink.
-    log_config.setdefault("filters", {})["redact_sensitive_query"] = {
-        "()": "jablotron_api.server.app.SensitiveQueryAccessLogFilter",
-    }
-    log_config["loggers"]["uvicorn.access"].setdefault("filters", []).append(
-        "redact_sensitive_query"
-    )
+    log_config = build_uvicorn_log_config()
     uvicorn_kwargs: dict = dict(
         host=settings.host,
         port=settings.port,

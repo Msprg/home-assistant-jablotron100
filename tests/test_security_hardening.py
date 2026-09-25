@@ -55,6 +55,34 @@ def test_sensitive_query_access_log_filter_rewrites_record_args():
     assert "SECRET" not in (record.args[1] if isinstance(record.args, tuple) else "")
 
 
+def test_sensitive_query_filter_also_covers_the_websocket_accept_line():
+    """uvicorn logs '"WebSocket %s" [accepted]' through uvicorn.error, not
+    uvicorn.access; the token used to reach the container log that way."""
+
+    flt = SensitiveQueryAccessLogFilter()
+    record = logging.LogRecord(
+        name="uvicorn.error",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "WebSocket %s" [accepted]',
+        args=("10.0.0.2:4321", "/v1/ws?token=SECRET"),
+        exc_info=None,
+    )
+    assert flt.filter(record) is True
+    assert "SECRET" not in record.getMessage()
+    assert "token=<redacted>" in record.getMessage()
+
+
+def test_uvicorn_log_config_attaches_the_redaction_filter_to_every_uvicorn_logger():
+    from jablotron_api.cli.main import build_uvicorn_log_config
+
+    config = build_uvicorn_log_config()
+    assert "redact_sensitive_query" in config["filters"]
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        assert "redact_sensitive_query" in config["loggers"][name]["filters"], name
+
+
 def test_bearer_token_from_headers_accepts_authorization_header():
     headers = {"authorization": "Bearer abc.def.ghi"}
     assert _bearer_token_from_headers(headers) == "abc.def.ghi"
