@@ -462,7 +462,7 @@ No code changes needed right now to support this; the requirements above are for
     - `python3 -m compileall jablotron100-api-HASS/custom_components/jablotron100_api_hass src/jablotron_api/domain/models.py` passed
 - Tightened status responsiveness without turning every cycle into a full device sweep:
   - `PanelRuntimeConfig.poll_interval_seconds` now defaults to `2.0s` instead of `15.0s`
-  - added `full_refresh_interval_seconds` (default `15.0s`) so sections/PGs refresh quickly while full device-info sweeps remain slower
+  - added `full_refresh_interval_seconds` (now default `3600.0s`, matching the legacy hourly device-info cadence) so sections/PGs refresh quickly while full device-info sweeps remain slower
   - added `fast_status_timeout_seconds` (default `0.6s`) and `full_status_timeout_seconds` (default `2.0s`)
   - `PersistentSnapshotSession.query_snapshot(...)` now supports a lightweight mode that only requests section/PG state and reuses any already-streamed device packets, instead of sending full per-device info requests every cycle
   - `PanelRuntime.refresh_status()` now runs:

@@ -20,7 +20,7 @@ class PanelSettings:
     read_cleanup_mode: str = "auto"
     write_cleanup_mode: str = "auto"
     poll_interval_seconds: float = 1.0
-    full_refresh_interval_seconds: float = 15.0
+    full_refresh_interval_seconds: float = 3600.0
     fast_status_timeout_seconds: float = 0.6
     full_status_timeout_seconds: float = 2.0
     reset: bool = True
@@ -57,7 +57,7 @@ class ServerSettings:
             read_cleanup_mode=os.getenv("JABLOTRON_PANEL_READ_CLEANUP_MODE", "auto"),
             write_cleanup_mode=os.getenv("JABLOTRON_PANEL_WRITE_CLEANUP_MODE", "auto"),
             poll_interval_seconds=float(os.getenv("JABLOTRON_PANEL_POLL_INTERVAL_SECONDS", "2")),
-            full_refresh_interval_seconds=float(os.getenv("JABLOTRON_PANEL_FULL_REFRESH_INTERVAL_SECONDS", "15")),
+            full_refresh_interval_seconds=float(os.getenv("JABLOTRON_PANEL_FULL_REFRESH_INTERVAL_SECONDS", "3600")),
             fast_status_timeout_seconds=float(os.getenv("JABLOTRON_PANEL_FAST_STATUS_TIMEOUT_SECONDS", "0.6")),
             full_status_timeout_seconds=float(os.getenv("JABLOTRON_PANEL_FULL_STATUS_TIMEOUT_SECONDS", "2")),
             reset=os.getenv("JABLOTRON_PANEL_RESET", "true").lower() not in {"0", "false", "no"},

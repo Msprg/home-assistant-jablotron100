@@ -100,7 +100,7 @@ class PanelRuntimeConfig:
     read_cleanup_mode: str = "auto"
     write_cleanup_mode: str = "auto"
     poll_interval_seconds: float = 2.0
-    full_refresh_interval_seconds: float = 15.0
+    full_refresh_interval_seconds: float = 3600.0
     fast_status_timeout_seconds: float = 0.6
     full_status_timeout_seconds: float = 2.0
     reset: bool = True

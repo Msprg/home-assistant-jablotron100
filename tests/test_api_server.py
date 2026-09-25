@@ -435,7 +435,7 @@ def test_panel_runtime_uses_fast_lightweight_refresh_after_initial_full_poll() -
         runtime = PanelRuntime(
             PanelRuntimeConfig(
                 poll_interval_seconds=2.0,
-                full_refresh_interval_seconds=15.0,
+                full_refresh_interval_seconds=3600.0,
                 fast_status_timeout_seconds=0.6,
                 full_status_timeout_seconds=2.0,
             )
