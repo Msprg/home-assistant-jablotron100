@@ -22,6 +22,7 @@ from typing import TextIO
 from jablotron_re_tools import (
     CONFIGURATION_SECTIONS_MODE,
     EXITED_SECTIONS_MODE,
+    FatVolumeReader,
     JablotronUSBClient,
     add_flexi_log_device_argument,
     cleanup_read_session,
@@ -42,6 +43,10 @@ from jablotron_usb_debug import JablotronUSBStreamError, ensure_serial_port, per
 DEFAULT_FLEXI_LOG_MOUNTPOINT = Path("/mnt/flexi_log")
 DEFAULT_WINDOW_BYTES = 102400
 DEFAULT_FILES = ("FLEXILOG.OLD", "FLEXILOG.TXT", "LOGINDEX.BIN")
+# 8.3 directory names, for reading the volume without mounting it.
+FLEXILOG_OLD_83 = b"FLEXILOGOLD"
+FLEXILOG_TXT_83 = b"FLEXILOGTXT"
+LOGINDEX_83 = b"LOGINDEXBIN"
 MIN_VALID_UNIX_TS = 946684800
 COMPACT_NUMERIC_TRANSLATION = str.maketrans(
     {
@@ -215,7 +220,10 @@ class AlignedEventRow:
     status: str
 
 def read_log_index_points(path: Path) -> list[LogPoint]:
-    blob = path.read_bytes()
+    return parse_log_index_points(path.read_bytes())
+
+
+def parse_log_index_points(blob: bytes) -> list[LogPoint]:
     points: list[LogPoint] = []
     for offset in range(0, len(blob), 16):
         chunk = blob[offset : offset + 16]
@@ -242,6 +250,29 @@ def find_last_nonzero_offset(data: bytes) -> int | None:
     if not stripped:
         return None
     return len(stripped) - 1
+
+
+def read_volume_log_range(*, volume: FatVolumeReader, old_size: int, start: int, length: int) -> bytes:
+    """`read_combined_log_range` over an unmounted volume.
+
+    Same address space: FLEXILOG.OLD first, then FLEXILOG.TXT.
+    """
+
+    output = bytearray()
+    remaining = length
+    position = start
+
+    if position < old_size:
+        chunk = min(remaining, old_size - position)
+        output.extend(volume.read_file(FLEXILOG_OLD_83, start=position, length=chunk))
+        remaining -= chunk
+        position = old_size
+
+    if remaining > 0:
+        output.extend(
+            volume.read_file(FLEXILOG_TXT_83, start=max(0, position - old_size), length=remaining)
+        )
+    return bytes(output)
 
 
 def read_combined_log_range(*, old_path: Path, current_path: Path, start: int, length: int) -> bytes:
@@ -2225,22 +2256,28 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
         pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=args.verbose)
         enter_setup_mode(client, verbose=args.verbose, initial_packets=pre_packets)
 
-        mount_device(log_device, mountpoint, mount_tool=args.mount_tool)
-        mounted = True
+        # Read the volume without mounting it. The panel materialises the
+        # log files only inside this session, so the directory has to be read
+        # here rather than earlier — but it does not have to be read through
+        # a kernel mount, which needs CAP_SYS_ADMIN the API server container
+        # does not have. Mount only for --copy-files-dir, which copies whole
+        # multi-megabyte files and is a debugging convenience.
+        volume = FatVolumeReader(log_device)
+        volume.refresh()
 
-        old_path = mountpoint / "FLEXILOG.OLD"
-        current_path = mountpoint / "FLEXILOG.TXT"
-        index_path = mountpoint / "LOGINDEX.BIN"
+        copy_files_dir = getattr(args, "copy_files_dir", None)
+        if copy_files_dir:
+            mount_device(log_device, mountpoint, mount_tool=args.mount_tool)
+            mounted = True
 
-        old_size = old_path.stat().st_size
-        current_size = current_path.stat().st_size
+        old_size = volume.size(FLEXILOG_OLD_83)
+        current_size = volume.size(FLEXILOG_TXT_83)
         physical_total = old_size + current_size
-        index_points = read_log_index_points(index_path)
+        index_points = parse_log_index_points(volume.read_file(LOGINDEX_83))
         logical_end = max((point.offset for point in index_points), default=physical_total)
         if args.end_mode == "physical":
             logical_end = physical_total
         full_mode = bool(getattr(args, "full", False))
-        copy_files_dir = getattr(args, "copy_files_dir", None)
         if copy_files_dir:
             copy_archive_files(mountpoint=mountpoint, output_dir=Path(copy_files_dir))
 
@@ -2250,8 +2287,9 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
                     "--full is not supported with --transport direct; the panel rejects JA100_READ_FILE "
                     "reads that span the whole FLEXILOG.OLD+TXT archive. Use --transport archive."
                 )
-            unmount_device(log_device, mount_tool=args.mount_tool)
-            mounted = False
+            if mounted:
+                unmount_device(log_device, mount_tool=args.mount_tool)
+                mounted = False
             logical_end = physical_total
             data = read_direct_recent_log(
                 client=client,
@@ -2268,9 +2306,9 @@ def pull_live_archive(args: argparse.Namespace) -> EventArchiveSnapshot:
             else:
                 window_start = max(0, logical_end - args.window_bytes)
                 read_length = args.window_bytes
-            data = read_combined_log_range(
-                old_path=old_path,
-                current_path=current_path,
+            data = read_volume_log_range(
+                volume=volume,
+                old_size=old_size,
                 start=window_start,
                 length=read_length,
             )

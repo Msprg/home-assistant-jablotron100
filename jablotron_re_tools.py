@@ -1667,41 +1667,16 @@ def read_export_direct(
 
 
 def _read_export_file_via_fat(*, device: str) -> bytes | None:
+    """Read EXPORT.CFG by walking the FAT, or None if that is not possible.
+
+    Falls back to the caller's raw-LBA read when it returns None.
+    """
+
     try:
-        boot_sector = read_device_direct_bytes(device=device, start_lba=0, sectors=1)
-        geometry = _parse_fat_geometry(boot_sector)
-        root_dir = read_device_direct_bytes(
-            device=device,
-            start_lba=geometry["root_dir_start_sector"],
-            sectors=geometry["root_dir_sectors"],
-        )
-        entry = _find_fat_root_entry(root_dir, EXPORT_FILENAME_83)
-        if entry is None:
-            return None
-        start_cluster, file_size = entry
-        if file_size <= 0 or start_cluster < 2:
-            return None
-        fat = read_device_direct_bytes(
-            device=device,
-            start_lba=geometry["reserved_sectors"],
-            sectors=geometry["sectors_per_fat"],
-        )
-        clusters = _follow_fat16_chain(
-            fat=fat,
-            start_cluster=start_cluster,
-            max_clusters=(file_size + geometry["cluster_size_bytes"] - 1) // geometry["cluster_size_bytes"],
-        )
-        if not clusters:
-            return None
-        runs = _cluster_runs(clusters)
-        parts: list[bytes] = []
-        for run_start, run_length in runs:
-            start_sector = geometry["data_start_sector"] + (run_start - 2) * geometry["sectors_per_cluster"]
-            sector_count = run_length * geometry["sectors_per_cluster"]
-            parts.append(read_device_direct_bytes(device=device, start_lba=start_sector, sectors=sector_count))
-        return b"".join(parts)[:file_size]
+        data = FatVolumeReader(device).read_file(EXPORT_FILENAME_83)
     except Exception:
         return None
+    return data or None
 
 
 def _parse_fat_geometry(boot_sector: bytes) -> dict[str, int]:
@@ -1782,6 +1757,166 @@ def _cluster_runs(clusters: list[int]) -> list[tuple[int, int]]:
         run_length = 1
     runs.append((run_start, run_length))
     return runs
+
+
+@dataclass(frozen=True)
+class FatDirEntry:
+    """One 8.3 entry from a FAT16 root directory."""
+
+    name_83: bytes
+    attributes: int
+    size: int
+    start_cluster: int
+    modified: str
+
+
+class FatVolumeReader:
+    """Read files off a FAT16 volume with raw block reads, without mounting.
+
+    The panel exposes FLEXI_CFG and FLEXI_LOG as USB mass storage. Going
+    through a kernel mount needs ``CAP_SYS_ADMIN`` — and, the way
+    :func:`mount_device` is written, a ``sudo`` binary — neither of which an
+    unprivileged container has. Everything here reads the block device
+    directly instead: boot sector, root directory, FAT, then the file's
+    cluster runs. No mount, no privilege beyond read access to the device.
+
+    The volume's directory is re-read by :meth:`refresh`, which callers must
+    do *after* the panel has materialised the files they want: the panel
+    fills these volumes only inside a configuration session and zeroes them
+    afterwards, so sizes and contents change under you.
+
+    ``read_sectors`` exists so the reader can be tested against a synthetic
+    image without a block device.
+    """
+
+    def __init__(
+        self,
+        device: str,
+        *,
+        read_sectors: Callable[[int, int], bytes] | None = None,
+    ) -> None:
+        self._device = device
+        self._read_sectors = read_sectors or self._read_sectors_from_device
+        self._geometry: dict[str, int] | None = None
+        self._entries: dict[bytes, FatDirEntry] | None = None
+        self._fat: bytes | None = None
+
+    def _read_sectors_from_device(self, start_lba: int, sectors: int) -> bytes:
+        return read_device_direct_bytes(device=self._device, start_lba=start_lba, sectors=sectors)
+
+    def refresh(self) -> None:
+        """(Re-)read geometry, root directory and allocation table."""
+
+        geometry = _parse_fat_geometry(self._read_sectors(0, 1))
+        root_dir = self._read_sectors(
+            geometry["root_dir_start_sector"], geometry["root_dir_sectors"]
+        )
+        self._geometry = geometry
+        self._entries = _parse_fat_root_entries(root_dir)
+        self._fat = self._read_sectors(geometry["reserved_sectors"], geometry["sectors_per_fat"])
+
+    def _ensure_loaded(self) -> None:
+        if self._geometry is None or self._entries is None or self._fat is None:
+            self.refresh()
+
+    @property
+    def geometry(self) -> dict[str, int]:
+        self._ensure_loaded()
+        assert self._geometry is not None
+        return self._geometry
+
+    def entries(self) -> dict[bytes, FatDirEntry]:
+        self._ensure_loaded()
+        assert self._entries is not None
+        return dict(self._entries)
+
+    def entry(self, filename_83: bytes) -> FatDirEntry | None:
+        self._ensure_loaded()
+        assert self._entries is not None
+        return self._entries.get(filename_83)
+
+    def size(self, filename_83: bytes) -> int:
+        entry = self.entry(filename_83)
+        return 0 if entry is None else entry.size
+
+    def read_file(self, filename_83: bytes, *, start: int = 0, length: int | None = None) -> bytes:
+        """Read ``length`` bytes of a root-directory file from ``start``.
+
+        Returns fewer bytes than asked for when the range runs past the end
+        of the file, and ``b""`` when the file is absent or empty.
+        """
+
+        self._ensure_loaded()
+        assert self._geometry is not None and self._fat is not None
+        entry = self.entry(filename_83)
+        if entry is None or entry.size <= 0 or entry.start_cluster < 2:
+            return b""
+        if start < 0:
+            raise ValueError("start must not be negative")
+        available = max(0, entry.size - start)
+        wanted = available if length is None else min(length, available)
+        if wanted <= 0:
+            return b""
+
+        geometry = self._geometry
+        cluster_size = geometry["cluster_size_bytes"]
+        clusters = _follow_fat16_chain(
+            fat=self._fat,
+            start_cluster=entry.start_cluster,
+            max_clusters=(entry.size + cluster_size - 1) // cluster_size,
+        )
+        first_index = start // cluster_size
+        last_index = (start + wanted - 1) // cluster_size
+        selected = clusters[first_index : last_index + 1]
+        if not selected:
+            return b""
+        parts: list[bytes] = []
+        for run_start, run_length in _cluster_runs(selected):
+            start_sector = (
+                geometry["data_start_sector"]
+                + (run_start - 2) * geometry["sectors_per_cluster"]
+            )
+            parts.append(
+                self._read_sectors(start_sector, run_length * geometry["sectors_per_cluster"])
+            )
+        blob = b"".join(parts)
+        offset = start - first_index * cluster_size
+        return blob[offset : offset + wanted]
+
+
+def _parse_fat_root_entries(root_dir: bytes) -> dict[bytes, FatDirEntry]:
+    entries: dict[bytes, FatDirEntry] = {}
+    for offset in range(0, len(root_dir), 32):
+        raw = root_dir[offset : offset + 32]
+        if len(raw) < 32 or raw[0] == 0x00:
+            break
+        if raw[0] == 0xE5:
+            continue
+        attributes = raw[11]
+        if attributes & 0x0F == 0x0F:  # long-file-name fragment
+            continue
+        entries[raw[:11]] = FatDirEntry(
+            name_83=raw[:11],
+            attributes=attributes,
+            size=unpack_from("<I", raw, 28)[0],
+            start_cluster=unpack_from("<H", raw, 26)[0],
+            modified=_format_fat_timestamp(
+                unpack_from("<H", raw, 24)[0], unpack_from("<H", raw, 22)[0]
+            ),
+        )
+    return entries
+
+
+def _format_fat_timestamp(date_raw: int, time_raw: int) -> str:
+    if not date_raw:
+        return ""
+    year = 1980 + ((date_raw >> 9) & 0x7F)
+    month = (date_raw >> 5) & 0x0F
+    day = date_raw & 0x1F
+    hour = (time_raw >> 11) & 0x1F
+    minute = (time_raw >> 5) & 0x3F
+    second = (time_raw & 0x1F) * 2
+    return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
 
 
 def read_device_direct_bytes(*, device: str, start_lba: int, sectors: int) -> bytes:
@@ -2118,6 +2253,20 @@ def ensure_import_path_available(*, import_path: Path, device: str, mount_tool: 
         raise SystemExit(f"IMPORT.CFG is still missing after remount: {import_path}")
 
 
+def _privileged_command(command: list[str]) -> list[str]:
+    """Prefix a command with ``sudo -n`` only when we are not already root.
+
+    The API server container runs as root and ships no ``sudo`` binary, so
+    an unconditional prefix fails with ``FileNotFoundError: 'sudo'`` before
+    the command is even attempted — which is what made /v1/events return
+    500 there. Mirrors what the direct-read helpers already do.
+    """
+
+    if os.geteuid() == 0:
+        return list(command)
+    return ["sudo", "-n"] + list(command)
+
+
 def _user_mount_options() -> str:
     return f"uid={os.getuid()},gid={os.getgid()},umask=022"
 
@@ -2136,12 +2285,12 @@ def mount_device(
         options = _user_mount_options()
         if is_device_mounted(resolved_device):
             result = run_command(
-                ["sudo", "-n", "mount", "-o", f"remount,{options}", resolved_device, str(mountpoint)],
+                _privileged_command(["mount", "-o", f"remount,{options}", resolved_device, str(mountpoint)]),
                 check=False,
             )
         else:
             result = run_command(
-                ["sudo", "-n", "mount", "-o", options, resolved_device, str(mountpoint)],
+                _privileged_command(["mount", "-o", options, resolved_device, str(mountpoint)]),
                 check=False,
             )
         stderr = result.stderr.lower()
@@ -2183,7 +2332,7 @@ def unmount_device(device: str, *, mount_tool: str) -> None:
     resolved_device = resolve_flexi_cfg_device(device)
     suppress_message = False
     if mount_tool == "sudo":
-        result = run_command(["sudo", "-n", "umount", resolved_device], check=False)
+        result = run_command(_privileged_command(["umount", resolved_device]), check=False)
         stderr = result.stderr.lower()
         suppress_message = result.returncode != 0 and "not mounted" in stderr
         if result.returncode != 0 and not suppress_message:
