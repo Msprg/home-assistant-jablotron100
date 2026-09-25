@@ -17,6 +17,10 @@ services:
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-/dev/hidraw0}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-/dev/sdb1}"
       JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-/dev/sdc1}"
+      # User writes stage the import sector by writing it at its LBA. The
+      # default "filesystem" mode mounts FLEXI_CFG, which needs CAP_SYS_ADMIN
+      # and does not work in a container.
+      JABLOTRON_PANEL_STAGE_MODE: "direct"
     volumes:
       - ./.dev-data:/data
       - ./.dev-certs:/data/certs:ro
