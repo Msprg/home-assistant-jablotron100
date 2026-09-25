@@ -240,15 +240,17 @@ def test_stage_import_direct_writes_the_sector_at_its_lba_and_verifies_it(
         lambda *, device, start_lba, data: written.append((device, start_lba, data)),
     )
     monkeypatch.setattr(tools, "read_import_sector_direct", lambda *, device: payload)
+    monkeypatch.setattr(tools, "resolve_import_sector_lba", lambda device: 2082)
 
     assert tools.stage_import_direct(device="/dev/sdb1", sector_path=sector) == payload
-    assert written == [("/dev/sdb1", tools.IMPORT_START_LBA, payload)]
+    assert written == [("/dev/sdb1", 2082, payload)]
 
 
 def test_stage_import_direct_fails_when_the_readback_differs(monkeypatch, tmp_path: Path) -> None:
     sector = tmp_path / "sector.bin"
     sector.write_bytes(b"\x01" * tools.SECTOR_SIZE)
     monkeypatch.setattr(tools, "write_device_direct_bytes", lambda **k: None)
+    monkeypatch.setattr(tools, "resolve_import_sector_lba", lambda device: 2082)
     monkeypatch.setattr(tools, "read_import_sector_direct", lambda *, device: b"\x02" * tools.SECTOR_SIZE)
     with pytest.raises(SystemExit, match="verification"):
         tools.stage_import_direct(device="/dev/sdb1", sector_path=sector)
@@ -340,3 +342,54 @@ def test_stage_mode_reaches_the_user_manager_from_the_environment(monkeypatch) -
 
     monkeypatch.delenv("JABLOTRON_PANEL_STAGE_MODE")
     assert ServerSettings().panel.stage_mode == "filesystem"
+
+
+# ------------------------------------------------------- resolve_import_sector_lba
+
+
+def test_import_sector_lba_comes_from_the_fat_directory(monkeypatch) -> None:
+    """The capture constant 2083 is an absolute disk LBA; the partition we
+    open starts at sector 1, so the directory walk must win."""
+
+    class Reader:
+        def __init__(self, device: str) -> None:
+            assert device == "/dev/sdb1"
+
+        def first_sector(self, name: bytes) -> int:
+            assert name == tools.IMPORT_FILENAME_83
+            return 2082
+
+    monkeypatch.setattr(tools, "resolve_flexi_cfg_device", lambda device: "/dev/sdb1")
+    monkeypatch.setattr(tools, "FatVolumeReader", Reader)
+    assert tools.resolve_import_sector_lba("auto") == 2082
+
+
+def test_import_sector_lba_falls_back_to_the_constant_minus_the_partition_offset(monkeypatch) -> None:
+    class Reader:
+        def __init__(self, device: str) -> None:
+            pass
+
+        def first_sector(self, name: bytes) -> int | None:
+            raise OSError("no device")
+
+    monkeypatch.setattr(tools, "resolve_flexi_cfg_device", lambda device: "/dev/sdb1")
+    monkeypatch.setattr(tools, "FatVolumeReader", Reader)
+    monkeypatch.setattr(tools, "partition_start_sector", lambda device: 1)
+    assert tools.resolve_import_sector_lba("auto") == tools.IMPORT_START_LBA - 1
+
+
+def test_partition_start_sector_reads_sysfs(monkeypatch, tmp_path: Path) -> None:
+    sysfs = tmp_path / "sdz1"
+    sysfs.mkdir()
+    (sysfs / "start").write_text("1\n")
+    real_path = tools.Path
+
+    class FakePath(type(real_path())):
+        def __new__(cls, *parts):
+            if parts and parts[0] == "/sys/class/block":
+                return real_path(tmp_path, *parts[1:])
+            return real_path(*parts)
+
+    monkeypatch.setattr(tools, "Path", FakePath)
+    assert tools.partition_start_sector("/dev/sdz1") == 1
+    assert tools.partition_start_sector("/dev/sdq1") == 0

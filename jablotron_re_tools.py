@@ -34,6 +34,7 @@ SECTOR_SIZE = 512
 EXPORT_START_LBA = 35
 EXPORT_SECTORS = 2048
 EXPORT_FILENAME_83 = b"EXPORT  CFG"
+IMPORT_FILENAME_83 = b"IMPORT  CFG"
 DEFAULT_FLEXI_CFG_LABEL = "FLEXI_CFG"
 DEFAULT_FLEXI_CFG_LINK = Path("/dev/disk/by-label") / DEFAULT_FLEXI_CFG_LABEL
 DEFAULT_FLEXI_LOG_LABEL = "FLEXI_LOG"
@@ -1839,6 +1840,15 @@ class FatVolumeReader:
         entry = self.entry(filename_83)
         return 0 if entry is None else entry.size
 
+    def first_sector(self, filename_83: bytes) -> int | None:
+        """Device-relative LBA of the file's first data sector, or None if absent."""
+
+        entry = self.entry(filename_83)
+        if entry is None or entry.start_cluster < 2:
+            return None
+        geometry = self.geometry
+        return geometry["data_start_sector"] + (entry.start_cluster - 2) * geometry["sectors_per_cluster"]
+
     def read_file(self, filename_83: bytes, *, start: int = 0, length: int | None = None) -> bytes:
         """Read ``length`` bytes of a root-directory file from ``start``.
 
@@ -1988,8 +1998,39 @@ def write_device_direct_bytes(*, device: str, start_lba: int, data: bytes) -> No
             pass
 
 
+def partition_start_sector(device: str) -> int:
+    """Where a partition device starts on its disk, in sectors (0 if unknown)."""
+
+    try:
+        return int(Path("/sys/class/block", Path(device).name, "start").read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def resolve_import_sector_lba(device: str) -> int:
+    """LBA of IMPORT.CFG's first sector, relative to the device we open.
+
+    ``IMPORT_START_LBA`` (2083) is the absolute disk LBA seen in USB
+    captures. The device we open is the FLEXI_CFG partition, which starts at
+    absolute sector 1 on this panel, so the constant applied to the
+    partition lands on IMPORT.CFG+512 (a sector nobody writes). Walk the FAT
+    root directory instead, which is what mounting does; fall back to the
+    constant corrected by the partition offset when the directory cannot be
+    read.
+    """
+
+    resolved_device = resolve_flexi_cfg_device(device)
+    try:
+        lba = FatVolumeReader(resolved_device).first_sector(IMPORT_FILENAME_83)
+    except Exception:
+        lba = None
+    if lba is not None:
+        return lba
+    return IMPORT_START_LBA - partition_start_sector(resolved_device)
+
+
 def read_import_sector_direct(*, device: str) -> bytes:
-    data = read_device_direct_bytes(device=device, start_lba=IMPORT_START_LBA, sectors=1)
+    data = read_device_direct_bytes(device=device, start_lba=resolve_import_sector_lba(device), sectors=1)
     if len(data) < SECTOR_SIZE:
         raise SystemExit(f"Short direct read for IMPORT.CFG sector 0: got {len(data)} bytes.")
     return data[:SECTOR_SIZE]
@@ -2010,7 +2051,7 @@ def verify_import_sector_direct(
         if attempt + 1 < retries:
             time.sleep(retry_delay)
     raise SystemExit(
-        "Direct IMPORT.CFG verification failed at LBA 2083 after unmount: "
+        f"Direct IMPORT.CFG verification failed at LBA {resolve_import_sector_lba(device)} after unmount: "
         "the staged sector was not readable back from the block device."
     )
 
@@ -2034,10 +2075,11 @@ def stage_import_direct(*, device: str, sector_path: Path) -> bytes:
     expected_sector = sector_path.read_bytes()[:SECTOR_SIZE]
     if len(expected_sector) != SECTOR_SIZE:
         raise SystemExit(f"Expected a 512-byte encoded IMPORT sector in {sector_path}.")
-    write_device_direct_bytes(device=device, start_lba=IMPORT_START_LBA, data=expected_sector)
+    lba = resolve_import_sector_lba(device)
+    write_device_direct_bytes(device=device, start_lba=lba, data=expected_sector)
     current = read_import_sector_direct(device=device)
     if current != expected_sector:
-        raise SystemExit("Direct IMPORT.CFG staging failed verification at LBA 2083.")
+        raise SystemExit(f"Direct IMPORT.CFG staging failed verification at LBA {lba}.")
     return expected_sector
 
 
@@ -2667,11 +2709,11 @@ def apply_import_sector(
                 expected_sector = sector_path.read_bytes()[:SECTOR_SIZE]
                 verify_import_sector_direct(device=resolved_device, expected_sector=expected_sector)
                 if verbose:
-                    print("import_sector_verified", {"lba": IMPORT_START_LBA})
+                    print("import_sector_verified", {"lba": resolve_import_sector_lba(resolved_device)})
             else:
                 stage_import_direct(device=resolved_device, sector_path=sector_path)
                 if verbose:
-                    print("import_sector_lba", IMPORT_START_LBA)
+                    print("import_sector_lba", resolve_import_sector_lba(resolved_device))
             perform_import_accept_sequence(client, verbose=verbose)
             exit_packets = graceful_exit_session(client, verbose=verbose)
             post_exit_packets = drain_packets(client, timeout=0.5, prefix="exit-post", verbose=verbose)

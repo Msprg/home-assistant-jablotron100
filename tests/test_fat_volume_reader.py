@@ -410,3 +410,16 @@ def test_window_end_follows_the_live_sizes_when_the_index_lags():
     )
     assert from_index != from_physical
     assert from_physical == current_payload[-100:]
+
+
+# --------------------------------------------------------------- first_sector
+
+
+def test_first_sector_is_the_data_start_of_the_first_cluster(image):
+    reader = image.reader()
+    assert reader.first_sector(b"CONTIG  BIN") == DATA_START
+    assert reader.first_sector(b"FRAGMENTBIN") == DATA_START + 3 * SECTORS_PER_CLUSTER
+
+
+def test_first_sector_of_a_missing_file_is_none(image):
+    assert image.reader().first_sector(b"MISSING BIN") is None
