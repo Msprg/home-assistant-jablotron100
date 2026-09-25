@@ -96,6 +96,7 @@ __all__ = [
     "REASON_NAME_TOO_LONG",
     "REASON_PANIC_CODE_COLLISION",
     "REASON_TIME_LIMITED_GROUP_REQUIRES_CODE",
+    "UserSlotOccupied",
     "UserTableEntry",
     "UserWriteRejected",
     "UserWriteViolation",
@@ -175,6 +176,32 @@ class UserWriteRejected(ValueError):
             "message": self.summary(),
             "violations": [violation.as_dict() for violation in self.violations],
             "conflicting_user_ids": list(self.conflicting_user_ids),
+        }
+
+
+class UserSlotOccupied(Exception):
+    """A create was aimed at a slot that already holds a named user.
+
+    The panel's import is an upsert, so without this check a ``POST`` onto
+    an occupied slot would silently overwrite whoever is there. It is not a
+    :class:`UserWriteRejected` — the record itself may be perfectly legal —
+    and it is not a panel failure either: the HTTP layer reports it as
+    ``409`` with ``error: user_slot_occupied``, and the caller either picks
+    another slot or repeats the request with ``replace=1``.
+    """
+
+    def __init__(self, user_id: int) -> None:
+        self.user_id = user_id
+        super().__init__(
+            f"User slot {user_id} already holds a named user; pass replace=1 to "
+            "overwrite it, or edit it with PATCH."
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "error": "user_slot_occupied",
+            "user_id": self.user_id,
+            "message": str(self),
         }
 
 

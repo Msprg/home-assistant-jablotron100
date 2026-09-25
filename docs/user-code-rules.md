@@ -129,6 +129,32 @@ every unrelated edit, such as a rename.
 The same demotion applies to the format rules: a write that carries an
 unchanged code forward is not refused for that code's shape.
 
+## Creating onto an occupied slot: `409 user_slot_occupied`
+
+The panel's import is an upsert, so a `POST /v1/users` aimed at a slot that
+already holds a user would silently overwrite that user. The server refuses
+it instead, deciding on the **fresh read** taken under the panel lock (never
+the cache: a stale "occupied" would refuse a slot F-Link has since freed,
+and a stale "free" is exactly the overwrite this check prevents):
+
+```json
+{
+  "detail": {
+    "error": "user_slot_occupied",
+    "user_id": 4,
+    "message": "User slot 4 already holds a named user; pass replace=1 to overwrite it, or edit it with PATCH."
+  }
+}
+```
+
+A slot counts as occupied when its record has a non-empty name; the panel
+keeps empty records for unused slots. `POST /v1/users?replace=1` overwrites
+the occupant, and `PATCH` edits it. This is a `409` with `error` set — a
+`409` whose `detail` is a plain string is still a panel or link failure (see
+below).
+
+The demo runtime (`JABLOTRON_API_RUNTIME_MODE=demo`) applies the same check.
+
 ## How a refusal is reported
 
 `UserWriteRejected` (a `ValueError` subclass) carries every rule that fired,
@@ -155,9 +181,11 @@ each with a reason code, a human message, and the conflicting user IDs.
   ```
 
   A `400` with this body means *"that value is illegal, try another one"*. A
-  `409` from a user write means the panel or the link failed and the client
-  should stop rather than retry. A provisioning client must not confuse the
-  two: retrying blind against a live alarm panel is not acceptable.
+  `409` whose `detail` is a plain string means the panel or the link failed
+  and the client should stop rather than retry (a `409` with
+  `error: user_slot_occupied` is the occupied-slot refusal above, and is not
+  a failure). A provisioning client must not confuse the two: retrying blind
+  against a live alarm panel is not acceptable.
 
 - **CLI** — the refusal is caught at the `main()` boundary and becomes the
   usual non-zero exit with `Preflight validation failed:` followed by one
@@ -174,6 +202,7 @@ The rules are unit-tested offline against synthetic user tables in
 `tests/test_user_write_validation.py` (arithmetic, both directions of the
 panic rule, order independence, every `code_length`, the 5-per-prefix
 ceiling, the 60-byte widths in bytes rather than characters) and the wiring
-of both write paths in `tests/test_user_write_paths.py`. Never test these
-against the live panel: a wrong code write is exactly the failure mode the
-rules exist to prevent.
+of both write paths and the occupied-slot refusal in
+`tests/test_user_write_paths.py` and `tests/test_api_server.py`. Never test
+these against the live panel: a wrong code write is exactly the failure mode
+the rules exist to prevent.

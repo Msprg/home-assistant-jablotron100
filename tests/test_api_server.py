@@ -39,6 +39,7 @@ from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.ws import ConnectionManager
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
 from jablotron_api.services.storage import TokenStore
+from jablotron_api.domain.user_validation import UserSlotOccupied
 
 
 class FakeRuntime:
@@ -165,10 +166,16 @@ class FakeRuntime:
         self.status.pgs[0].state = "on" if enabled else "off"
         return self.status
 
-    async def add_user(self, payload: UserCreateModel):
+    async def add_user(self, payload: UserCreateModel, *, replace: bool = False):
         if payload.id < 1 or payload.id > 100:
             raise ValueError(f"User {payload.id} is outside the client-facing usable range 1-100.")
-        user = UserModel(id=payload.id, name=payload.name, rights="coUserNoSelfedit")
+        occupant = await self.get_user(payload.id)
+        if occupant is not None and occupant.name.strip() and not replace:
+            raise UserSlotOccupied(payload.id)
+        self.catalog.users = [user for user in self.catalog.users if user.id != payload.id]
+        user = UserModel(
+            id=payload.id, name=payload.name, code=payload.code, rights="coUserNoSelfedit"
+        )
         self.catalog.users.append(user)
         return user
 
@@ -1440,7 +1447,7 @@ def test_section_control_ack_failure_returns_conflict(tmp_path: Path) -> None:
 def test_user_mutation_verification_failures_return_conflict(tmp_path: Path) -> None:
     runtime = FakeRuntime()
 
-    async def fail_add(payload):
+    async def fail_add(payload, *, replace=False):
         raise RuntimeError("User 81 post-add verification failed for: name.")
 
     async def fail_edit(user_id, payload):
@@ -1653,3 +1660,25 @@ def test_legacy_scope_migration_rewrites_old_token_names(tmp_path: Path) -> None
         "sections:disarm",
         "codes:impersonate",
     }
+
+
+def test_post_onto_an_occupied_slot_is_refused_unless_replace(tmp_path: Path) -> None:
+    client, token = build_client(tmp_path)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    refused = client.post("/v1/users", headers=headers, json={"id": 80, "name": "Intruder"})
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert detail["error"] == "user_slot_occupied"
+    assert detail["user_id"] == 80
+    assert "replace=1" in detail["message"]
+    assert client.get("/v1/users/80", headers=headers).json()["name"] == "User 80"
+
+    replaced = client.post(
+        "/v1/users", params={"replace": "1"}, headers=headers, json={"id": 80, "name": "Replacement"}
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["name"] == "Replacement"
+
+    free_slot = client.post("/v1/users", headers=headers, json={"id": 82, "name": "New"})
+    assert free_slot.status_code == 200

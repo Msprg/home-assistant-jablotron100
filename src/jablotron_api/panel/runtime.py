@@ -59,6 +59,7 @@ from jablotron_api.services.catalog_io import (
 )
 from jablotron_api.services.device_inference import infer_device_type as _infer_device_type
 from jablotron_api.services.event_reader import EventReaderConfig, read_recent_events
+from jablotron_api.domain.user_validation import UserSlotOccupied
 from jablotron_api.services.user_manager import (
     UserManagerConfig,
     UserWritePreflight,
@@ -830,13 +831,23 @@ class PanelRuntime:
             include_current=include_current,
         )
 
-    async def add_user(self, payload: UserCreateModel) -> UserModel:
+    async def add_user(self, payload: UserCreateModel, *, replace: bool = False) -> UserModel:
         self._ensure_usable_user_id(payload.id)
         async with self._lock:
             await self._close_status_session_locked()
             snapshot = await self._pull_catalog_snapshot_locked(
                 f"api-preflight-add-user{payload.id}"
             )
+            # The panel's import is an upsert, so a create aimed at an
+            # occupied slot would silently overwrite its user. Decided on the
+            # table just read, never on the cache: a stale "occupied" would
+            # refuse a slot F-Link has since freed, and a stale "free" is the
+            # overwrite this check exists to prevent.
+            occupant = next(
+                (record for record in snapshot.users if record.user_id == payload.id), None
+            )
+            if occupant is not None and (occupant.name or "").strip() and not replace:
+                raise UserSlotOccupied(payload.id)
             preflight = self._user_write_preflight(
                 snapshot, payload.id, include_current=False
             )

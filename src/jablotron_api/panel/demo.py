@@ -27,6 +27,7 @@ from jablotron_api.domain.models import (
     UserPatchModel,
 )
 from jablotron_api.domain.user_validation import (
+    UserSlotOccupied,
     UserTableEntry,
     entry_from_record,
     validate_user_write,
@@ -401,8 +402,11 @@ class DemoPanelRuntime:
         for message in warnings:
             LOGGER.warning("User %s write preflight warning: %s", user_id, message)
 
-    async def add_user(self, payload: UserCreateModel) -> UserModel:
+    async def add_user(self, payload: UserCreateModel, *, replace: bool = False) -> UserModel:
         self._ensure_usable_user_id(payload.id)
+        occupant = await self.get_user(payload.id)
+        if occupant is not None and occupant.name.strip() and not replace:
+            raise UserSlotOccupied(payload.id)
         self._validate_user_write(
             payload.id,
             code=payload.code,
@@ -412,6 +416,8 @@ class DemoPanelRuntime:
             name=payload.name,
             comment=payload.comment,
         )
+        if occupant is not None:
+            self._catalog.users = [user for user in self._catalog.users if user.id != payload.id]
         user = UserModel(
             id=payload.id,
             name=payload.name,

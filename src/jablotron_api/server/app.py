@@ -36,7 +36,7 @@ from jablotron_api.domain.serialization import (
     serialize_users,
     serialize_ws_payload,
 )
-from jablotron_api.domain.user_validation import UserWriteRejected
+from jablotron_api.domain.user_validation import UserSlotOccupied, UserWriteRejected
 from jablotron_api.panel.demo import DemoPanelRuntime
 from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
@@ -349,6 +349,16 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=exc.to_payload()
             ) from exc
+        except UserSlotOccupied as exc:
+            LOGGER.warning(
+                "%s refused: token=%s resource=%s reason=user_slot_occupied",
+                op,
+                token_label,
+                resource,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=exc.to_payload()
+            ) from exc
         except Exception as exc:
             http_status = _http_status_for(exc)
             if http_status is None:
@@ -586,14 +596,25 @@ def create_app(
         return serialize_users([result], token)[0]
 
     @app.post("/v1/users")
-    async def add_user(payload: UserCreateModel, token: AuthenticatedToken = Depends(require_token)):
+    async def add_user(
+        payload: UserCreateModel,
+        replace: bool = Query(
+            default=False,
+            description=(
+                "The panel's import is an upsert. Without this flag a create aimed "
+                "at a slot that already holds a named user is refused with 409 "
+                "user_slot_occupied; with replace=1 the slot is overwritten."
+            ),
+        ),
+        token: AuthenticatedToken = Depends(require_token),
+    ):
         require_scopes(token, Scope.USERS_WRITE.value)
         return await _execute_runtime_call(
             token=token,
             op="add_user",
             resource=f"user:{payload.id}",
-            audit_details=payload.model_dump(mode="json"),
-            runtime_callable=lambda: runtime.add_user(payload),
+            audit_details={**payload.model_dump(mode="json"), "replace": replace},
+            runtime_callable=lambda: runtime.add_user(payload, replace=replace),
         )
 
     @app.patch("/v1/users/{user_id}")

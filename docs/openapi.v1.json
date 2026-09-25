@@ -1624,6 +1624,18 @@
         "operationId": "add_user_v1_users_post",
         "parameters": [
           {
+            "description": "The panel's import is an upsert. Without this flag a create aimed at a slot that already holds a named user is refused with 409 user_slot_occupied; with replace=1 the slot is overwritten.",
+            "in": "query",
+            "name": "replace",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "The panel's import is an upsert. Without this flag a create aimed at a slot that already holds a named user is refused with 409 user_slot_occupied; with replace=1 the slot is overwritten.",
+              "title": "Replace",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "authorization",
             "required": false,

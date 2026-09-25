@@ -29,6 +29,7 @@ from jablotron_api.domain.user_validation import (
     REASON_COMMENT_TOO_LONG,
     REASON_NAME_TOO_LONG,
     REASON_PANIC_CODE_COLLISION,
+    UserSlotOccupied,
     UserTableEntry,
     UserWriteRejected,
     UserWriteViolation,
@@ -50,11 +51,12 @@ from jablotron_api.services.storage import TokenStore
 class _Record:
     """Stand-in for the RE tools' UserRecord as read from a panel export."""
 
-    def __init__(self, user_id, code="", cards=(), time_limited_group_raw=None):
+    def __init__(self, user_id, code="", cards=(), time_limited_group_raw=None, name=""):
         self.user_id = user_id
         self.code = code
         self.cards = list(cards)
         self.time_limited_group_raw = time_limited_group_raw
+        self.name = name
 
 
 def _manager_config(tmp_path: Path) -> UserManagerConfig:
@@ -506,3 +508,72 @@ def test_http_add_user_rejects_over_long_fields_with_a_typed_reason(tmp_path: Pa
     name = client.patch("/v1/users/3", json={"name": "n" * 61}, headers=headers)
     assert name.status_code == 400
     assert name.json()["detail"]["reason"] == REASON_NAME_TOO_LONG
+
+
+# ------------------------------------------------------------ occupied slots
+
+
+def test_http_add_user_onto_an_occupied_slot_is_409_unless_replace(tmp_path: Path) -> None:
+    client, headers, runtime = _demo_client(tmp_path)
+    before = client.get("/v1/users/1", headers=headers).json()
+    assert before["name"]
+
+    refused = client.post("/v1/users", json={"id": 1, "name": "Guard"}, headers=headers)
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert detail["error"] == "user_slot_occupied"
+    assert detail["user_id"] == 1
+    assert "replace=1" in detail["message"]
+    assert client.get("/v1/users/1", headers=headers).json()["name"] == before["name"]
+
+    replaced = client.post(
+        "/v1/users?replace=1", json={"id": 1, "name": "Guard"}, headers=headers
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["name"] == "Guard"
+    assert [user.id for user in runtime._catalog.users].count(1) == 1
+
+
+def test_runtime_refuses_a_create_onto_an_occupied_slot_from_the_fresh_read(monkeypatch) -> None:
+    """The cached catalog holds no users; only the fresh read can show the slot
+    is taken, and the refusal must arrive before anything is written."""
+
+    runtime = _runtime()
+    captured: dict = {}
+
+    async def fake_pull(prefix: str):
+        return _snapshot([_Record(7, "1483", name="Existing user")])
+
+    def fake_apply(config, **kwargs):
+        captured["written"] = kwargs["user_id"]
+
+    async def fake_close() -> None:
+        return None
+
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
+    monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", fake_apply)
+    monkeypatch.setattr(runtime, "refresh_catalog", fake_close)
+    monkeypatch.setattr(runtime, "get_user", lambda user_id: _async_value(None))
+
+    with pytest.raises(UserSlotOccupied):
+        asyncio.run(runtime.add_user(UserCreateModel(id=7, name="New", code="1486")))
+    assert "written" not in captured
+
+    # A slot whose record has no name is free: the panel keeps empty records.
+    async def fake_pull_unnamed(prefix: str):
+        return _snapshot([_Record(7, "", name="")])
+
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull_unnamed)
+    with pytest.raises(RuntimeError, match="not present after add"):
+        asyncio.run(runtime.add_user(UserCreateModel(id=7, name="New", code="1486")))
+    assert captured["written"] == 7
+
+    # replace=True overwrites a named occupant.
+    captured.clear()
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
+    with pytest.raises(RuntimeError, match="not present after add"):
+        asyncio.run(
+            runtime.add_user(UserCreateModel(id=7, name="New", code="1486"), replace=True)
+        )
+    assert captured["written"] == 7
