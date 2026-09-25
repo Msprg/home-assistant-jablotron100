@@ -167,7 +167,7 @@ def test_runtime_stream_emit_overlays_latched_state_and_broadcasts() -> None:
     assert {d.id: d.state for d in runtime._status.devices} == {1: "on", 2: "off"}
 
 
-def test_runtime_stream_emit_coalesces_to_latest_states() -> None:
+def test_runtime_stream_emit_preserves_ordered_edges() -> None:
     emitted: list[dict] = []
 
     async def listener(topic: str, payload: dict) -> None:
@@ -180,16 +180,65 @@ def test_runtime_stream_emit_coalesces_to_latest_states() -> None:
         runtime._status = PanelStatusModel(
             devices=[DeviceStatusModel(id=1, name="PIR", inferred_entity_type="motion", state="off")]
         )
-        # Two notifications scheduled on the same loop turn coalesce; the latest
-        # wins and at least one broadcast carries the rising edge's final value.
+        # Two notifications scheduled on the same loop turn must still be
+        # broadcast as ordered edges. HA motion automations depend on observing
+        # the rising "on" transition, not only the eventual final "off".
         runtime._handle_stream_device_states({1: "on"})
         runtime._handle_stream_device_states({1: "off"})
         await asyncio.sleep(0.05)
 
     asyncio.run(run())
 
-    assert emitted, "coalesced emit should still broadcast"
-    assert emitted[-1]["devices"][0]["state"] == "off"
+    assert [payload["devices"][0]["state"] for payload in emitted] == ["on", "off"]
+
+
+def test_runtime_stream_emit_compacts_backlog_without_losing_rising_edges() -> None:
+    emitted: list[dict] = []
+
+    async def run() -> None:
+        first_emit_seen = asyncio.Event()
+        release_first_emit = asyncio.Event()
+
+        async def listener(topic: str, payload: dict) -> None:
+            emitted.append(payload)
+            if len(emitted) == 1:
+                first_emit_seen.set()
+                await release_first_emit.wait()
+
+        runtime = PanelRuntime(PanelRuntimeConfig(auth_code="1812"))
+        runtime.add_listener(listener)
+        runtime._loop = asyncio.get_running_loop()
+        runtime._status = PanelStatusModel(
+            devices=[
+                DeviceStatusModel(id=1, name="PIR A", inferred_entity_type="motion", state="off"),
+                DeviceStatusModel(id=2, name="PIR B", inferred_entity_type="motion", state="off"),
+            ]
+        )
+
+        runtime._handle_stream_device_states({1: "on", 2: "off"})
+        await first_emit_seen.wait()
+
+        # These arrive while the first websocket/status emit is blocked. The
+        # runtime must not replay every stale full snapshot after the listener
+        # resumes, but PIR B's not-yet-published rising edge still has to show up.
+        runtime._handle_stream_device_states({1: "off", 2: "off"})
+        runtime._handle_stream_device_states({1: "off", 2: "on"})
+        runtime._handle_stream_device_states({1: "on", 2: "on"})
+        runtime._handle_stream_device_states({1: "off", 2: "off"})
+
+        release_first_emit.set()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    states = [
+        {device["id"]: device["state"] for device in payload["devices"]}
+        for payload in emitted
+    ]
+    assert len(states) == 3
+    assert states[0] == {1: "on", 2: "off"}
+    assert states[1][2] == "on"
+    assert states[-1] == {1: "off", 2: "off"}
 
 
 def test_runtime_stream_callback_is_a_noop_without_a_loop() -> None:

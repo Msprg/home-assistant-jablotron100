@@ -16,6 +16,7 @@ aliases until the test suite is updated.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 import logging
 import math
@@ -262,14 +263,12 @@ class PanelRuntime:
             pass
 
     def _handle_stream_device_states(self, states: dict[int, str]) -> None:
-        # Runs on the event loop. Coalesce bursts: keep only the latest states
-        # and schedule at most one in-flight emit so a flurry of edges collapses
-        # to a single (latest) broadcast. This is safe — it never drops a rising
-        # edge — ONLY because the session holds a motion "on" for
-        # MOTION_ON_MIN_DWELL_SECONDS before reporting the following "off", so an
-        # on-edge and its off-edge arrive in different loop turns and cannot
-        # coalesce together. Do not weaken that dwell without revisiting this.
-        self._pending_stream_states = states
+        # Runs on the event loop. Preserve every latched edge in callback order:
+        # HA motion automations need to observe the rising "on" transition even
+        # if a following "off" is already queued before the emit task gets CPU.
+        self._pending_stream_states.append(dict(states))
+        if len(self._pending_stream_states) > 2:
+            self._compact_pending_stream_states()
         if not self._stream_emit_scheduled:
             self._stream_emit_scheduled = True
             task = asyncio.create_task(self._emit_stream_status())
@@ -278,18 +277,60 @@ class PanelRuntime:
             task.add_done_callback(self._stream_emit_tasks.discard)
 
     async def _emit_stream_status(self) -> None:
-        self._stream_emit_scheduled = False
-        states = self._pending_stream_states
-        base = self._status
-        if base is None or states is None:
+        try:
+            while self._pending_stream_states:
+                states = self._pending_stream_states.popleft()
+                base = self._status
+                if base is None:
+                    continue
+                devices = [
+                    device.model_copy(update={"state": states[device.id]}) if device.id in states else device
+                    for device in base.devices
+                ]
+                status = base.model_copy(update={"devices": devices, "source": "stream", "refreshed_at": utc_now()})
+                self._status = status
+                await self._emit("status", status.model_dump(mode="json"))
+        finally:
+            self._stream_emit_scheduled = False
+            if self._pending_stream_states:
+                if len(self._pending_stream_states) > 2:
+                    self._compact_pending_stream_states()
+                self._stream_emit_scheduled = True
+                task = asyncio.create_task(self._emit_stream_status())
+                self._stream_emit_tasks.add(task)
+                task.add_done_callback(self._stream_emit_tasks.discard)
+
+    def _compact_pending_stream_states(self) -> None:
+        """Bound sustained-motion backlog without losing rising motion edges.
+
+        Stream callbacks carry full latched state maps. When websocket delivery is
+        slower than incoming PIR changes, replaying every old full snapshot makes
+        HA display stale motion tens of seconds late. Compact pending frames to at
+        most a synthetic rising-edge frame plus the latest frame: listeners still
+        observe any not-yet-published ``off -> on`` transition, then catch up to
+        the current panel state immediately.
+        """
+        if len(self._pending_stream_states) <= 2:
             return
-        devices = [
-            device.model_copy(update={"state": states[device.id]}) if device.id in states else device
-            for device in base.devices
-        ]
-        status = base.model_copy(update={"devices": devices, "source": "stream", "refreshed_at": utc_now()})
-        self._status = status
-        await self._emit("status", status.model_dump(mode="json"))
+        frames = list(self._pending_stream_states)
+        latest = frames[-1]
+        base_states = {
+            device.id: device.state
+            for device in self._status.devices
+        } if self._status is not None else {}
+
+        rising_frame = dict(latest)
+        has_rising = False
+        for frame in frames:
+            for device_id, state in frame.items():
+                if state == "on" and base_states.get(device_id) != "on":
+                    rising_frame[device_id] = "on"
+                    has_rising = True
+
+        self._pending_stream_states.clear()
+        if has_rising and rising_frame != latest:
+            self._pending_stream_states.append(rising_frame)
+        self._pending_stream_states.append(latest)
 
     async def _poll_loop(self) -> None:
         while not self._closed:
@@ -505,15 +546,24 @@ class PanelRuntime:
     async def _catalog_model(
         self, *, max_age_seconds: float | None, prefix: str
     ) -> ExportCatalogModel:
+        requested_at = time.monotonic()
         served_from_cache = await self._ensure_catalog(
             max_age_seconds=self._resolved_max_age(max_age_seconds), prefix=prefix
         )
         catalog = self._catalog
         if catalog is None:  # pragma: no cover - _ensure_catalog guarantees one
             raise RuntimeError("Panel catalog unavailable after a read.")
+        # The causal fact, in this process's monotonic clock: did the pull behind
+        # what we are about to return begin at or after this call arrived? A client
+        # cannot derive it — it has no access to this clock, and wall clocks across
+        # two hosts are exactly what this backstops.
+        started = self._catalog_started_monotonic_for_cache
+        began_after = None if started is None else started >= requested_at
         if served_from_cache:
-            return catalog.model_copy(update={"source": "cache"})
-        return catalog
+            return catalog.model_copy(
+                update={"source": "cache", "pull_started_after_request": began_after}
+            )
+        return catalog.model_copy(update={"pull_started_after_request": began_after})
 
     async def refresh_catalog(self) -> ExportCatalogModel:
         """Force a panel read and replace the cache. Never serves the cache."""
