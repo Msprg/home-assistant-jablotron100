@@ -147,7 +147,7 @@ class PanelRuntime:
         # Event loop captured at start() so the session's stream-reader thread
         # can hand device-state edges back via call_soon_threadsafe.
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._pending_stream_states: dict[int, str] | None = None
+        self._pending_stream_states: deque[dict[int, str]] = deque()
         self._stream_emit_scheduled = False
         self._stream_emit_tasks: set[asyncio.Task[None]] = set()
 

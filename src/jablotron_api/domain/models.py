@@ -277,6 +277,16 @@ class ExportCatalogModel(BaseModel):
     as_of: datetime | None = None
     source: str = "cache"
     trigger_used: bool = False
+    # Whether the panel read behind this response BEGAN at or after the request
+    # arrived, answered in this process's monotonic clock. `as_of` alone cannot
+    # settle that for a caller: comparing it against the caller's own clock
+    # compares two hosts with no stated NTP relationship, so a server clock a
+    # minute fast would let a client believe a minute-old cache was read for it.
+    # This is the same comparison `_catalog_meets` already makes to decide
+    # whether to pull (max_age_seconds <= 0); reporting it lets the client
+    # require both statements and fail closed if they disagree.
+    # `None` where the question does not apply: a cache served without a pull.
+    pull_started_after_request: bool | None = None
 
 
 class PanelStatusModel(BaseModel):
