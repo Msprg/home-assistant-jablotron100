@@ -155,6 +155,14 @@ below).
 
 The demo runtime (`JABLOTRON_API_RUNTIME_MODE=demo`) applies the same check.
 
+## What comes back from a write
+
+`POST /v1/users` and `PATCH /v1/users/{id}` return the user as the panel now
+holds it, through the same redaction as `GET /v1/users`: `code` is empty
+unless the token holds `users:codes:read`, even for the caller that just
+wrote it, and even for the code carried over by a `PATCH` that sent none.
+The `users` WebSocket topic redacts write events the same way.
+
 ## How a refusal is reported
 
 `UserWriteRejected` (a `ValueError` subclass) carries every rule that fired,
@@ -202,7 +210,7 @@ The rules are unit-tested offline against synthetic user tables in
 `tests/test_user_write_validation.py` (arithmetic, both directions of the
 panic rule, order independence, every `code_length`, the 5-per-prefix
 ceiling, the 60-byte widths in bytes rather than characters) and the wiring
-of both write paths and the occupied-slot refusal in
+of both write paths, the occupied-slot refusal and the response redaction in
 `tests/test_user_write_paths.py` and `tests/test_api_server.py`. Never test
 these against the live panel: a wrong code write is exactly the failure mode
 the rules exist to prevent.

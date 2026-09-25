@@ -609,13 +609,16 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.USERS_WRITE.value)
-        return await _execute_runtime_call(
+        user = await _execute_runtime_call(
             token=token,
             op="add_user",
             resource=f"user:{payload.id}",
             audit_details={**payload.model_dump(mode="json"), "replace": replace},
             runtime_callable=lambda: runtime.add_user(payload, replace=replace),
         )
+        # Same redaction as GET /v1/users: the PIN only goes back to a token
+        # holding users:codes:read, even though the caller just wrote it.
+        return serialize_users([user], token)[0]
 
     @app.patch("/v1/users/{user_id}")
     async def edit_user(
@@ -624,13 +627,16 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.USERS_WRITE.value)
-        return await _execute_runtime_call(
+        user = await _execute_runtime_call(
             token=token,
             op="edit_user",
             resource=f"user:{user_id}",
             audit_details=payload.model_dump(exclude_unset=True, mode="json"),
             runtime_callable=lambda: runtime.edit_user(user_id, payload),
         )
+        # A PATCH that did not send a code still carries the panel's code in
+        # the result; redact it exactly as a read would.
+        return serialize_users([user], token)[0]
 
     @app.delete("/v1/users/{user_id}")
     async def delete_user(user_id: int, token: AuthenticatedToken = Depends(require_token)):

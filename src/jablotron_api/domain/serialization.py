@@ -54,5 +54,12 @@ def serialize_ws_payload(token: AuthenticatedToken, topic: str, payload):
     if topic == "users":
         if can_read_user_codes(token):
             return payload
+        if isinstance(payload, dict):
+            # A write event: {"action": ..., "user": {...}} (or "user_id" for
+            # a delete). Only the embedded user carries a code.
+            user_payload = payload.get("user")
+            if isinstance(user_payload, dict):
+                return {**payload, "user": {**user_payload, "code": ""}}
+            return payload
         return [{**user_payload, "code": ""} for user_payload in payload]
     return payload

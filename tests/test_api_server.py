@@ -1662,6 +1662,41 @@ def test_legacy_scope_migration_rewrites_old_token_names(tmp_path: Path) -> None
     }
 
 
+def test_user_writes_redact_codes_without_users_codes_scope(tmp_path: Path) -> None:
+    """POST and PATCH answer with the same redaction as GET: a writer token
+    without users:codes:read never sees a PIN, not even the one it just sent,
+    and not the carried-over one on a PATCH that sent none."""
+
+    runtime = FakeRuntime()
+    store = TokenStore(tmp_path / "tokens.db")
+    writer, _ = store.create_token(label="writer", scopes=[Scope.USERS_WRITE.value])
+    writer_with_codes, _ = store.create_token(
+        label="writer-codes", scopes=[Scope.USERS_WRITE.value, Scope.USERS_CODES_READ.value]
+    )
+    app = create_app(
+        settings=ServerSettings(db_path=tmp_path / "tokens.db"),
+        runtime=runtime,
+        token_store=store,
+    )
+    client = TestClient(app)
+    plain = {"Authorization": f"Bearer {writer}"}
+    sensitive = {"Authorization": f"Bearer {writer_with_codes}"}
+
+    created = client.post("/v1/users", headers=plain, json={"id": 81, "name": "User 81", "code": "1486"})
+    assert created.status_code == 200
+    assert created.json()["code"] == ""
+    assert runtime.catalog.users[-1].code == "1486", "redacted in the response, not lost"
+
+    edited = client.patch("/v1/users/80", headers=plain, json={"name": "Renamed 80"})
+    assert edited.status_code == 200
+    assert edited.json()["name"] == "Renamed 80"
+    assert edited.json()["code"] == ""
+
+    unredacted = client.patch("/v1/users/80", headers=sensitive, json={"name": "User 80"})
+    assert unredacted.status_code == 200
+    assert unredacted.json()["code"] == "1812"
+
+
 def test_post_onto_an_occupied_slot_is_refused_unless_replace(tmp_path: Path) -> None:
     client, token = build_client(tmp_path)
     headers = {"Authorization": f"Bearer {token}"}
@@ -1682,3 +1717,26 @@ def test_post_onto_an_occupied_slot_is_refused_unless_replace(tmp_path: Path) ->
 
     free_slot = client.post("/v1/users", headers=headers, json={"id": 82, "name": "New"})
     assert free_slot.status_code == 200
+
+
+def test_ws_user_write_events_are_redacted_without_the_sensitive_scope() -> None:
+    from jablotron_api.domain.models import AuthenticatedToken
+    from jablotron_api.domain.serialization import serialize_ws_payload
+
+    plain = AuthenticatedToken(id="t", label="plain", scopes=[Scope.USERS_READ.value])
+    sensitive = AuthenticatedToken(
+        id="t", label="sensitive", scopes=[Scope.USERS_READ.value, Scope.USERS_CODES_READ.value]
+    )
+    event = {"action": "edited", "user": {"id": 80, "name": "User 80", "code": "1812"}}
+
+    assert serialize_ws_payload(plain, "users", event) == {
+        "action": "edited",
+        "user": {"id": 80, "name": "User 80", "code": ""},
+    }
+    assert serialize_ws_payload(sensitive, "users", event) == event
+    deleted = {"action": "deleted", "user_id": 80}
+    assert serialize_ws_payload(plain, "users", deleted) == deleted
+    # The subscribe-time snapshot is a list and is redacted element-wise.
+    assert serialize_ws_payload(plain, "users", [event["user"]]) == [
+        {"id": 80, "name": "User 80", "code": ""}
+    ]
