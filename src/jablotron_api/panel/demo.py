@@ -107,14 +107,17 @@ class DemoPanelRuntime:
                 exact=True,
                 sections=InitialSetupRangeModel(first_id=1, last_id=2, count=2),
                 devices=InitialSetupRangeModel(first_id=1, last_id=4, count=4),
-                users=InitialSetupRangeModel(first_id=1, last_id=2, count=2),
+                # Ten user slots with two populated, so a provisioning client
+                # can exercise creates without first deleting a demo user
+                # now that a create onto an occupied slot is refused.
+                users=InitialSetupRangeModel(first_id=1, last_id=10, count=10),
                 pgs=InitialSetupRangeModel(first_id=1, last_id=2, count=2),
                 # The demo panel declares a code format so that user writes
                 # face the same code rules here as on a real panel.
                 code_length=4,
                 code_prefix=False,
             ),
-            raw_counts=RawCatalogCountsModel(sections=2, devices=3, users=2, pgs=2),
+            raw_counts=RawCatalogCountsModel(sections=2, devices=3, users=10, pgs=2),
             sha256="demo-catalog",
             path="/demo/EXPORT.CFG",
         )

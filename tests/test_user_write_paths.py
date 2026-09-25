@@ -345,7 +345,7 @@ def test_http_add_user_returns_400_with_a_machine_readable_reason(tmp_path: Path
     assert client.patch("/v1/users/1", json={"code": "1483"}, headers=headers).status_code == 200
 
     clash = client.post(
-        "/v1/users", json={"id": 2, "name": "Guard", "code": "1484"}, headers=headers
+        "/v1/users", json={"id": 3, "name": "Guard 3", "code": "1484"}, headers=headers
     )
     assert clash.status_code == 400
     detail = clash.json()["detail"]
@@ -397,7 +397,7 @@ def test_http_edit_user_is_validated_too(tmp_path: Path) -> None:
 def test_http_add_user_rejects_a_wrong_length_code(tmp_path: Path) -> None:
     client, headers, _ = _demo_client(tmp_path)
     response = client.post(
-        "/v1/users", json={"id": 2, "name": "Guard", "code": "148300"}, headers=headers
+        "/v1/users", json={"id": 3, "name": "Guard 3", "code": "148300"}, headers=headers
     )
     assert response.status_code == 400
     assert response.json()["detail"]["reason"] == "invalid_user_code"
@@ -442,12 +442,12 @@ def test_cli_main_turns_the_refusal_into_an_exit_code(monkeypatch) -> None:
 def test_demo_runtime_enforces_the_same_rules() -> None:
     async def run() -> None:
         runtime = DemoPanelRuntime()
-        await runtime.add_user(UserCreateModel(id=1, name="Installer", code="1483"))
+        await runtime.add_user(UserCreateModel(id=3, name="Guard 3", code="1483"))
         with pytest.raises(UserWriteRejected):
-            await runtime.add_user(UserCreateModel(id=2, name="Guard", code="1484"))
+            await runtime.add_user(UserCreateModel(id=4, name="Guard 4", code="1484"))
         # The mirrored direction, against a table built in the other order.
-        await runtime.add_user(UserCreateModel(id=2, name="Guard", code="1486"))
+        await runtime.add_user(UserCreateModel(id=4, name="Guard 4", code="1486"))
         with pytest.raises(UserWriteRejected):
-            await runtime.edit_user(2, UserPatchModel(code="1482"))
+            await runtime.edit_user(4, UserPatchModel(code="1482"))
 
     asyncio.run(run())
