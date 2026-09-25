@@ -130,3 +130,71 @@ and expose it to the API server through `user_manager.py`.
   guards, no staging fix, WebSocket token visible in its access log).
   Rebuild when convenient; it is unrelated to the write gate.
 - Suite: 303 passing.
+
+## Resolution (same evening, 16:04-16:27 UTC)
+
+Writes work from Linux again. The full owner-approved cycle ran from the
+host with the container stopped (each step one `jablotron_user_tool.py`
+invocation, usbmon on bus 9 recording, container restarted with `up -d`
+afterwards):
+
+| UTC | Step | Result |
+| --- | --- | --- |
+| 16:04 | `add 96` (plan step 1, capture) | Panel **accepted** both `Write(10)`s (no kernel error, IMPORT.CFG directory mtime updated); the tool's own read-back verify failed, accept sequence not run. tshark had failed to open its output file, so no capture. |
+| 16:18 | `add 96`, verify fixed (`c7649ce`) | Accepted, read-back matched, accept sequence ran, authoritative refetch shows user 96 (92 raw users). Event 48 at 18:18:29 panel time, then 157, 156. |
+| 16:21 | `edit 96 --comment <same value>` | `requested_unchanged comment`; the panel still logs a 48. |
+| 16:22 | `edit 96 --comment rt-a_b~c` | Reads back exactly (`-`, `_`, `~` survive the round trip). 48 logged. |
+| 16:25 | `jablotron_event_tool.py recent` | Only 119/150/48/157/156/123 today; no alarm or tamper events from the test. |
+| 16:25 | `delete 96` | "user 96 absent after delete", 91 raw users; the decoded table is identical to the 16:04 pre-add export, line for line. |
+
+Two separate facts explain the day:
+
+1. **The refusals were real and stopped on their own.** Every attempt from
+   13:31 to 15:42 UTC got sense *Hardware Error* on the same two sectors;
+   from 16:04 UTC on the panel accepted the same sequence, unchanged
+   (no reload, no delay, no `sg_*` command, filesystem staging). The usbmon
+   capture of the accepted 16:18 write shows Linux sending no READ CAPACITY
+   at all and only the kernel's PREVENT/ALLOW pair at mount and unmount:
+   `Write(10)` LBA 2083, `Write(10)` LBA 27 four milliseconds later, LBA 27
+   again 1.8 s later at unmount, all CSW status 0. So hypotheses 2-5 above
+   (time gate, revalidation, prevent-removal, write shape) are not what the
+   panel wants; whatever gated it between 13:31 and 15:42 was panel state
+   that cleared by itself. The F-Link capture's "refused at connect,
+   accepted 20 s later" fits the same picture. If it happens again: wait
+   and retry, do not change the sequence.
+2. **The read-back verify read the wrong sector.** `IMPORT_START_LBA`
+   (2083, from `flexi_pcap_tool`) is an absolute disk LBA; the device the
+   tooling opens is the partition `/dev/sdb1`, which starts at absolute
+   sector 1 (`/sys/class/block/sdb1/start`). Applied to the partition, 2083
+   is absolute 2084, IMPORT.CFG+512, which nobody writes. So the O_DIRECT
+   verify added in `dd1e82c` could never pass, and `stage_import_direct`
+   (debug mode) wrote the wrong sector (the 13:31 kernel log says
+   `sector 2084`). The export read was never affected: it walks the FAT.
+   `resolve_import_sector_lba` now does the same walk for IMPORT.CFG
+   (fallback: constant minus partition start). This is also why the March
+   note says the probe "sometimes matched": it was reading a zero sector.
+
+Evidence (private, contains the config export): `.git/claude-scratch/usbmon/`
+holds `linux-cap2.pcapng` (the accepted add), `linux-batch1.pcapng` (both
+edits), `linux-batch2.pcapng` (event pull and delete), the tool logs, and
+`events-batch2.jsonl`. Decode the usbmon files with
+`tshark -o usb.try_heuristics:TRUE -Y usbms -T fields -e scsi_sbc.opcode -e scsi_sbc.rdwr10.lba -e usbms.dCSWStatus`
+(the `-d usb.bulk==8,...` form does not work on usbmon captures).
+
+Still open:
+
+- The live container runs the 2026-08-21 image. It needs a rebuild to get
+  `c7649ce`, `dd1e82c` and the user-write guards; until then API writes
+  will fail at the read-back verify in the same way the 16:04 run did, or
+  worse, run the accept sequence against unverified storage (the old
+  image predates `dd1e82c`). Rebuild deliberately, not as a dropout fix.
+- `--reload-before-stage` stays opt-in; it was not needed.
+- The FAT dirty flag on FLEXI_CFG is still set (every mount logs "Volume
+  was not properly unmounted"); Windows saw the same. Harmless so far.
+- The old image logs a pre-existing crash in device-info parsing
+  (`binary_to_int` on an empty string from
+  `_parse_device_battery_level_packet`); unrelated to writes.
+- `tests/test_fat_volume_reader.py::test_the_server_event_path_never_mounts`
+  talks to the real panel when one is attached: it failed with "System is
+  already in configuration mode" while a live session was open, and passes
+  alone. It should be hermetic.
