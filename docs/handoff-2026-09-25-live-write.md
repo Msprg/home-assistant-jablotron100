@@ -141,3 +141,27 @@ an O_DIRECT read after unmount before the accept sequence.
 
 Next is step 2: replug or power-cycle the panel USB and retry from the
 host; and ask whether F-Link can still write to this panel today.
+
+## Result of step 2 (USB replug)
+
+The owner replugged the panel; it re-enumerated as USB device 6 (same
+`sd 7:0:0:0`, `Write Protect is off` on the 100 MiB config volume, the log
+volume read-only as always). The same host-side create was repeated at
+14:35 UTC with the container stopped:
+
+| Attempt | Path | Result | Kernel journal (host, local time) |
+| --- | --- | --- | --- |
+| 14:35 UTC | host, filesystem, after replug | `IMPORT.CFG staging failed: ... [Errno 5]`; exit 1 after 27 s | 16:36:04 `Write(10)` sector 2083 and sector 27, both *Hardware Error*, `lost async page write` |
+
+Unchanged. The refusal survives re-enumeration, so it is not a wedged USB
+session on the host side. The user table was compared again (pre-attempt
+export against a fresh live `list`): 90 raw entries, identical, no slot 96.
+Host mount removed, container restarted with `up -d`.
+
+What remains: whether F-Link can write to this panel today. If it cannot,
+the panel state (or a cloud-side lock not visible in the export) is the
+cause. If it can, the next diagnostic is a USB capture of an F-Link write
+(`usbmon`) to compare the SCSI sequence F-Link uses against ours; the
+March pcap in `flexi_pcap_tool.py` is the last known-good write capture,
+and the panel firmware may have changed since (cloud-side writes on
+2026-08-19 are the latest known successful `IMPORT.CFG` writes).
