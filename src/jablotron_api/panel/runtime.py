@@ -87,6 +87,24 @@ __all__ = [
 ]
 
 
+async def _run_panel_write(func, /, *args, **kwargs):
+    """Run a blocking user write in a worker thread, SystemExit-safe.
+
+    The write tooling (``jablotron_re_tools``) reports failures with
+    ``SystemExit``: a refused IMPORT.CFG write, a failed read-back, setup
+    mode not reached. ``SystemExit`` is a ``BaseException``, so it passes
+    every ``except Exception`` and, raised out of ``asyncio.to_thread``,
+    stops uvicorn; on 2026-09-25 a panel refusal restarted the container
+    that way. Re-raised as ``RuntimeError`` it becomes the 409 the HTTP
+    layer already uses for "the panel or the link failed, stop".
+    """
+
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    except SystemExit as exc:
+        raise RuntimeError(f"Panel write failed: {exc}") from None
+
+
 @dataclass
 class PanelRuntimeConfig:
     port: str = "auto"
@@ -851,7 +869,7 @@ class PanelRuntime:
             preflight = self._user_write_preflight(
                 snapshot, payload.id, include_current=False
             )
-            await asyncio.to_thread(
+            await _run_panel_write(
                 _apply_upsert_user,
                 self._user_manager_config(),
                 user_id=payload.id,
@@ -892,7 +910,7 @@ class PanelRuntime:
                 # not from the poller's cache, so an edit cannot silently
                 # rewrite a field with a value the panel has since changed.
                 current_record = user_to_record(_user_to_model(fresh_record))
-            await asyncio.to_thread(
+            await _run_panel_write(
                 _apply_upsert_user,
                 self._user_manager_config(),
                 user_id=user_id,
@@ -913,7 +931,7 @@ class PanelRuntime:
         self._ensure_usable_user_id(user_id)
         async with self._lock:
             await self._close_status_session_locked()
-            await asyncio.to_thread(
+            await _run_panel_write(
                 _apply_delete_user,
                 self._user_manager_config(),
                 user_id=user_id,

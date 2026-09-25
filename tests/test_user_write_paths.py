@@ -320,6 +320,36 @@ def test_runtime_validates_against_a_fresh_read_not_the_cached_catalog(monkeypat
     assert captured["preflight"].code_format == CodeFormat(4, False, "panel")
 
 
+def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch) -> None:
+    """The write tooling signals a refused IMPORT.CFG write with SystemExit.
+    Out of asyncio.to_thread that stopped uvicorn (the container restarted on
+    2026-09-25); it must reach the HTTP layer as RuntimeError, i.e. 409."""
+
+    runtime = _runtime()
+
+    async def fake_pull(prefix: str):
+        return _snapshot([])
+
+    def refused(config, **kwargs):
+        raise SystemExit("IMPORT.CFG staging failed: [Errno 5] Input/output error")
+
+    async def fake_close() -> None:
+        return None
+
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
+    monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", refused)
+    monkeypatch.setattr(runtime_module, "_apply_delete_user", refused)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="Panel write failed: IMPORT.CFG staging failed"):
+            await runtime.add_user(UserCreateModel(id=4, name="New"))
+        with pytest.raises(RuntimeError, match="Panel write failed"):
+            await runtime.delete_user(4)
+
+    asyncio.run(run())
+
+
 async def _async_value(value):
     return value
 
