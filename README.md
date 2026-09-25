@@ -126,6 +126,12 @@ The reference client covers the full `/v1` API surface, including `users list|ge
 section/PG control, and WebSocket subscriptions.
 
 6. Switch `JABLOTRON_API_RUNTIME_MODE=live` and provide the panel USB/block devices to start validating the real hardware path.
+   User create/edit/delete needs the panel's service code: the panel accepts the
+   user-table write (`IMPORT.CFG`) only from a session logged in with it, and
+   refuses it from any other code (the API then answers `409`). If
+   `JABLOTRON_PANEL_AUTH_CODE` is not the service code, set
+   `JABLOTRON_PANEL_WRITE_AUTH_CODE` to the service code; it is used only for user
+   writes, and every other session keeps using `JABLOTRON_PANEL_AUTH_CODE`.
 
 ### Home Assistant alpha path
 

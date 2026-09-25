@@ -65,6 +65,7 @@ def _manager_config(tmp_path: Path) -> UserManagerConfig:
         flexi_cfg_device="/dev/null",
         port="auto",
         auth_code="1812",
+        write_auth_code="",
         reset=True,
         mount_tool="sudo",
         stage_mode="filesystem",
@@ -141,6 +142,23 @@ def test_apply_upsert_writes_when_the_record_is_legal(monkeypatch, tmp_path: Pat
     )
 
     assert len(writes) == 1
+
+
+def test_apply_upsert_can_use_a_write_only_auth_code(monkeypatch, tmp_path: Path) -> None:
+    writes = _stub_sector(monkeypatch, tmp_path, {"code": "1486", "cards": [], "time_limited_group_raw": 0})
+    config = _manager_config(tmp_path)
+    config.write_auth_code = "9999"
+
+    apply_upsert(
+        config,
+        user_id=4,
+        payload=UserCreateModel(id=4, name="New", code="1486"),
+        current=None,
+        preflight=UserWritePreflight(code_format=CodeFormat(4, False, "panel")),
+        verify_prefix="test",
+    )
+
+    assert writes[0]["code"] == "9999"
 
 
 def test_apply_upsert_validates_the_encoded_record_not_the_request(
@@ -272,6 +290,16 @@ def test_runtime_takes_the_code_format_from_the_snapshot_it_just_read() -> None:
     assert fmt == CodeFormat(6, True, "panel")
 
 
+def test_runtime_passes_write_auth_code_only_to_user_writes() -> None:
+    runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="1812", write_auth_code="9999"))
+
+    assert runtime._catalog_pull_config().auth_code == "1812"
+    assert runtime._event_reader_config().auth_code == "1812"
+    manager_config = runtime._user_manager_config()
+    assert manager_config.auth_code == "1812"
+    assert manager_config.write_auth_code == "9999"
+
+
 def test_runtime_falls_back_to_the_session_code_when_main_config_is_absent() -> None:
     runtime = _runtime()
     snapshot = SimpleNamespace(users=[], main_config=None)
@@ -348,6 +376,59 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
             await runtime.delete_user(4)
 
     asyncio.run(run())
+
+
+def _refusing_runtime(monkeypatch, **config):
+    runtime = _runtime()
+    for key, value in config.items():
+        setattr(runtime._config, key, value)
+
+    async def fake_pull(prefix: str):
+        return _snapshot([])
+
+    async def fake_close() -> None:
+        return None
+
+    def refused(config, **kwargs):
+        raise SystemExit("IMPORT.CFG staging failed: the write raised [Errno 5] Input/output error")
+
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
+    monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", refused)
+    return runtime
+
+
+def test_a_refused_write_without_a_write_code_points_at_the_setting(monkeypatch) -> None:
+    runtime = _refusing_runtime(monkeypatch)
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="JABLOTRON_PANEL_WRITE_AUTH_CODE"):
+            await runtime.add_user(UserCreateModel(id=4, name="New"))
+
+    asyncio.run(run())
+
+
+def test_a_refused_write_with_a_write_code_does_not_repeat_the_hint(monkeypatch) -> None:
+    runtime = _refusing_runtime(monkeypatch, write_auth_code="9999")
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError) as excinfo:
+            await runtime.add_user(UserCreateModel(id=4, name="New"))
+        assert "JABLOTRON_PANEL_WRITE_AUTH_CODE" not in str(excinfo.value)
+
+    asyncio.run(run())
+
+
+def test_panel_codes_stay_out_of_config_reprs(tmp_path: Path) -> None:
+    from jablotron_api.server.config import PanelSettings
+
+    configs = [
+        PanelSettings(auth_code="1812", write_auth_code="9999"),
+        PanelRuntimeConfig(port="auto", auth_code="1812", write_auth_code="9999"),
+        PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="1812", write_auth_code="9999"))._user_manager_config(),
+    ]
+    for config in configs:
+        assert "1812" not in repr(config) and "9999" not in repr(config), type(config).__name__
 
 
 async def _async_value(value):

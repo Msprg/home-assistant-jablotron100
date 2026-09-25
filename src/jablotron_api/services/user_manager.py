@@ -19,7 +19,7 @@ freshly read table as a `UserWritePreflight`; the rules are the same ones
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,7 +51,8 @@ class UserManagerConfig:
     import_path: Path
     flexi_cfg_device: str
     port: str
-    auth_code: str
+    auth_code: str = field(repr=False)
+    write_auth_code: str = field(repr=False)
     reset: bool
     mount_tool: str
     stage_mode: str
@@ -292,7 +293,7 @@ def apply_upsert(
             import_path=config.import_path,
             device=config.flexi_cfg_device,
             port=config.port,
-            code=config.auth_code,
+            code=config.write_auth_code or config.auth_code,
             reset=config.reset,
             mount_tool=config.mount_tool,
             stage_mode=config.stage_mode,
@@ -320,7 +321,7 @@ def apply_delete(
             import_path=config.import_path,
             device=config.flexi_cfg_device,
             port=config.port,
-            code=config.auth_code,
+            code=config.write_auth_code or config.auth_code,
             reset=config.reset,
             mount_tool=config.mount_tool,
             stage_mode=config.stage_mode,

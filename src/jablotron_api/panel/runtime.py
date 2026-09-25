@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 from pathlib import Path
@@ -87,7 +87,13 @@ __all__ = [
 ]
 
 
-async def _run_panel_write(func, /, *args, **kwargs):
+_WRITE_CODE_HINT = (
+    " The panel refuses IMPORT.CFG writes from sessions that are not logged in"
+    " with its service code; set JABLOTRON_PANEL_WRITE_AUTH_CODE to the service code."
+)
+
+
+async def _run_panel_write(func, /, *args, failure_hint: str | None = None, **kwargs):
     """Run a blocking user write in a worker thread, SystemExit-safe.
 
     The write tooling (``jablotron_re_tools``) reports failures with
@@ -102,16 +108,24 @@ async def _run_panel_write(func, /, *args, **kwargs):
     try:
         return await asyncio.to_thread(func, *args, **kwargs)
     except SystemExit as exc:
-        raise RuntimeError(f"Panel write failed: {exc}") from None
+        message = f"Panel write failed: {exc}"
+        if failure_hint and "IMPORT.CFG staging failed" in message:
+            message += failure_hint
+        raise RuntimeError(message) from None
 
 
 @dataclass
 class PanelRuntimeConfig:
     port: str = "auto"
-    # No default: the panel service code is installation-specific and must
-    # be provided explicitly. ServerSettings reads it from
+    # No default: the panel code is installation-specific and must be
+    # provided explicitly. ServerSettings reads it from
     # JABLOTRON_PANEL_AUTH_CODE; tests pass it directly.
-    auth_code: str = ""
+    auth_code: str = field(default="", repr=False)
+    # Optional: the service code for user writes only
+    # (JABLOTRON_PANEL_WRITE_AUTH_CODE). The panel refuses IMPORT.CFG writes
+    # from sessions logged in with any other code, even though they reach
+    # setup mode and read exports. Empty means writes use auth_code.
+    write_auth_code: str = field(default="", repr=False)
     flexi_cfg_device: str = "auto"
     flexi_log_device: str = "auto"
     import_path: Path = DEFAULT_IMPORT_PATH
@@ -181,12 +195,18 @@ class PanelRuntime:
             read_cleanup_mode=self._config.read_cleanup_mode,
         )
 
+    def _write_failure_hint(self) -> str | None:
+        """Hint appended to a refused user write when no write code is set."""
+
+        return None if self._config.write_auth_code else _WRITE_CODE_HINT
+
     def _user_manager_config(self) -> UserManagerConfig:
         return UserManagerConfig(
             import_path=self._config.import_path,
             flexi_cfg_device=self._config.flexi_cfg_device,
             port=self._config.port,
             auth_code=self._config.auth_code,
+            write_auth_code=self._config.write_auth_code,
             reset=self._config.reset,
             mount_tool=self._config.mount_tool,
             stage_mode=self._config.stage_mode,
@@ -239,7 +259,10 @@ class PanelRuntime:
         self._loop = asyncio.get_running_loop()
         await self.refresh_all()
         self._poller_task = asyncio.create_task(self._poll_loop(), name="jablotron-panel-poller")
-        LOGGER.info("Panel runtime started")
+        LOGGER.info(
+            "Panel runtime started: user writes log in with %s",
+            "the separate write code" if self._config.write_auth_code else "the session code",
+        )
 
     async def close(self) -> None:
         LOGGER.info("Stopping panel runtime")
@@ -872,6 +895,7 @@ class PanelRuntime:
             await _run_panel_write(
                 _apply_upsert_user,
                 self._user_manager_config(),
+                failure_hint=self._write_failure_hint(),
                 user_id=payload.id,
                 payload=payload,
                 current=None,
@@ -913,6 +937,7 @@ class PanelRuntime:
             await _run_panel_write(
                 _apply_upsert_user,
                 self._user_manager_config(),
+                failure_hint=self._write_failure_hint(),
                 user_id=user_id,
                 payload=payload,
                 current=current_record,
@@ -934,6 +959,7 @@ class PanelRuntime:
             await _run_panel_write(
                 _apply_delete_user,
                 self._user_manager_config(),
+                failure_hint=self._write_failure_hint(),
                 user_id=user_id,
                 verify_prefix=f"api-delete-user{user_id}",
             )

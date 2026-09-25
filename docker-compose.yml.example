@@ -14,6 +14,9 @@ services:
       JABLOTRON_API_TLS_CA_CERTS: /data/certs/ca.crt
       # Required in live mode. Set in .env (gitignored).
       JABLOTRON_PANEL_AUTH_CODE: "${JABLOTRON_PANEL_AUTH_CODE:?must be set in .env for live mode}"
+      # Optional: the panel's service code, used only for user writes
+      # (IMPORT.CFG). Defaults to JABLOTRON_PANEL_AUTH_CODE when unset.
+      JABLOTRON_PANEL_WRITE_AUTH_CODE: "${JABLOTRON_PANEL_WRITE_AUTH_CODE:-}"
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-auto}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-auto}"
       JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-auto}"

@@ -334,12 +334,15 @@ def test_stage_mode_reaches_the_user_manager_from_the_environment(monkeypatch) -
     from jablotron_api.server.config import ServerSettings
 
     monkeypatch.setenv("JABLOTRON_PANEL_AUTH_CODE", "1812")
+    monkeypatch.setenv("JABLOTRON_PANEL_WRITE_AUTH_CODE", "9999")
     monkeypatch.setenv("JABLOTRON_PANEL_STAGE_MODE", "direct")
     settings = ServerSettings()
     assert settings.panel.stage_mode == "direct"
     runtime = PanelRuntime(settings.panel)
     assert runtime._user_manager_config().stage_mode == "direct"
+    assert runtime._user_manager_config().write_auth_code == "9999"
 
+    monkeypatch.delenv("JABLOTRON_PANEL_WRITE_AUTH_CODE")
     monkeypatch.delenv("JABLOTRON_PANEL_STAGE_MODE")
     assert ServerSettings().panel.stage_mode == "filesystem"
 
