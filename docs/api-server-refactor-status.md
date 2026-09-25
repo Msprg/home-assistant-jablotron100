@@ -251,6 +251,9 @@ Implications to keep in mind from now on so we do not paint the add-on into a co
 No code changes needed right now to support this; the requirements above are forward-looking guardrails so v1.x decisions don't accidentally rule it out.
 
 ## Progress Log
+### 2026-09-25 (night — confirmed: the login code selects the write path)
+- The owner's second F-Link capture compared the service code with the container's code for the same slot-96 create and delete. With the service code, F-Link writes IMPORT.CFG as before. With the container's code, it never writes the volume and sends the change as HID SET_REPORT bursts, and the panel applies them. The API writes were refused because the container logs in with the second code and uses the storage path.
+- The HID save burst carries the name and comment in plain ASCII, but none of the IMPORT sector's bytes, so it is a different record format. The owner decides between a write-only service code for the storage path and implementing the HID write. Details in `docs/handoff-2026-09-25-write-gate.md`, "Confirmed".
 ### 2026-09-25 (late evening — container rebuilt; API writes refused because of the login code)
 - **Container rebuilt** from the current tree (`c7649ce`, plus `777e43d`: the WebSocket `?token=` is now redacted on the `uvicorn.error` logger too, where uvicorn writes the accept line).
 - **API writes are refused; host writes minutes apart are accepted.** Container attempts at 16:48, 16:56 and 16:59 UTC all got *Hardware Error*; host `add`/`delete` at 16:56 and 17:04 were accepted. HID and SCSI timing match in usbmon captures of both. The one difference found is the login code: the container's configured code is not the tool's default service code. The earlier "refusals stopped on their own" reading is probably wrong. Details and the owner decision (use the service code for the API, or add a write-only code) in `docs/handoff-2026-09-25-write-gate.md`, "Correction".

@@ -252,3 +252,50 @@ Options for the owner, not done here:
 
 Until one of those is in place, every user write through the API will be
 refused with 409, not a coin toss.
+
+## Confirmed (owner's second F-Link capture, 20:19-20:33 local)
+
+The owner ran the same F-Link create and delete of a test user in slot 96
+twice: once logged in with the service code, once with the code the
+container uses. Evidence (private, contains both codes and the config
+export): `.git/claude-scratch/flink-logincode/`, with the original zip beside it.
+
+| | Service code | Container's code |
+| --- | --- | --- |
+| Write(10) to FLEXI_CFG | 10 (connect burst, then LBA 2083 + 27 per save) | 0 |
+| F-Link opens IMPORT.CFG | yes, 512 bytes at offset 0 per save | never, only reads EXPORT.CFG |
+| Host-to-panel HID SET_REPORTs | 312, flat keepalive rate | 572, bursts of 118 (save) and 128 (delete) |
+| Panel applied the change | yes | yes |
+
+So the login code selects the write path. With the service code the panel
+takes configuration through IMPORT.CFG after setup mode. With the
+container's code it refuses storage writes, and F-Link instead sends the
+change over HID. That is why every API write was refused. The container
+logs in with the second code and uses the storage path. The HID
+path is a separate protocol the tooling does not implement yet.
+
+What a first look at the HID save burst shows (script:
+`.git/claude-scratch/flink-logincode/compare.py`, statistics only):
+
+- The user's name and comment are in the burst as plain ASCII.
+- None of the IMPORT.CFG sector's content appears in it (0 of 61 8-byte
+  windows), so the HID record format differs from the IMPORT sector
+  encoding; `build_upsert_sector` does not carry over as is.
+- The 118 save reports use seven distinct 2-byte heads; one head accounts
+  for 78 of them. The dumps are 64-byte payloads (the capture agent's
+  "72 bytes" counts the setup packet).
+- F-Link's comm log has no command names for these messages.
+
+Choices, in order of cost:
+
+1. **Write-only service code for the storage path.** Works with today's
+   tooling (host runs with the service code succeeded all evening). A
+   `JABLOTRON_PANEL_WRITE_AUTH_CODE` passthrough is already in the working
+   tree, uncommitted, not written in this session. Cost: the API holds the
+   service code.
+2. **Implement the HID configuration write.** No mount, no
+   `CAP_SYS_ADMIN`, no dependence on the FAT volume, and no service code in
+   the API. Cost: a new reverse-engineering project, the record format and
+   the handshake around the burst. The two captures give one save and one
+   delete of a known record, which is a good start but not enough to
+   generalise to every field.
