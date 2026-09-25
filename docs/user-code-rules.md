@@ -92,6 +92,30 @@ installation-wide `code_length` (4, 6 or 8), read from the exported
 | `duplicate_card` | Another user already holds this access card. |
 | `card_repeated_in_request` | `card1` and `card2` are the same card. |
 | `time_limited_group_requires_code` | A user in a time-limited group must have a code. |
+| `name_too_long` | `name` exceeds 60 bytes of UTF-8. |
+| `comment_too_long` | `comment` exceeds 60 bytes of UTF-8. |
+
+## Field widths: 60 bytes, measured
+
+`name` and `comment` are `CFG_MAX_TEXT_LEN` = 60 byte fields in the panel's
+configuration schema. The limit is **bytes of UTF-8, not characters**: a
+30-character comment of two-byte letters is full.
+
+The usable length is **60, not 59**. This was measured, not read off the
+schema: the live panel's own `EXPORT.CFG` carries a user whose comment is
+exactly 60 bytes (58 characters, non-ASCII, decodes cleanly with no split
+character), written through F-Link and read back through the export path.
+So the field holds 60 bytes with no terminator inside it. The record encoder
+(`import_cfg_tool.pack_msgpack`) does not clip; without these rules an
+over-long value would reach the panel and be cut there, and the write would
+then fail post-write verification as a mismatch with nothing in the response
+saying why. The rule is applied to the record that will actually be encoded,
+so it also catches a value carried over from an earlier write.
+
+Both violations are reported together when both fields are over-long, and
+neither is ever demoted to a warning: an over-long value cannot already be
+on the panel, so it is always being introduced by the write being checked.
+Messages give the byte count, never the value.
 
 ## Self-collisions are warnings, not refusals
 
@@ -149,6 +173,7 @@ server log.
 The rules are unit-tested offline against synthetic user tables in
 `tests/test_user_write_validation.py` (arithmetic, both directions of the
 panic rule, order independence, every `code_length`, the 5-per-prefix
-ceiling) and the wiring of both write paths in
-`tests/test_user_write_paths.py`. Never test these against the live panel:
-a wrong code write is exactly the failure mode the rules exist to prevent.
+ceiling, the 60-byte widths in bytes rather than characters) and the wiring
+of both write paths in `tests/test_user_write_paths.py`. Never test these
+against the live panel: a wrong code write is exactly the failure mode the
+rules exist to prevent.

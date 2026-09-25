@@ -370,6 +370,8 @@ class DemoPanelRuntime:
         cards: tuple[str, ...],
         time_limited_group_raw: int | None,
         include_current: bool,
+        name: str = "",
+        comment: str = "",
     ) -> None:
         """Apply the shared user-table rules to the in-memory table.
 
@@ -391,6 +393,8 @@ class DemoPanelRuntime:
                 code=code,
                 cards=cards,
                 time_limited_group_raw=time_limited_group_raw,
+                name=name,
+                comment=comment,
             ),
             code_format=self.code_format(),
         )
@@ -405,6 +409,8 @@ class DemoPanelRuntime:
             cards=(payload.card1,) if payload.card1 else (),
             time_limited_group_raw=payload.time_limited_group_raw,
             include_current=False,
+            name=payload.name,
+            comment=payload.comment,
         )
         user = UserModel(
             id=payload.id,
@@ -442,6 +448,8 @@ class DemoPanelRuntime:
                 "time_limited_group_raw", user.time_limited_group_raw
             ),
             include_current=True,
+            name=requested.get("name", user.name) or "",
+            comment=requested.get("comment", user.comment) or "",
         )
         for field, value in requested.items():
             if field == "card1":

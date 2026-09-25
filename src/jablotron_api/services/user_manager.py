@@ -238,6 +238,8 @@ def target_entry_from_summary(summary: dict, *, user_id: int) -> UserTableEntry:
         code=str(summary.get("code") or ""),
         cards=tuple(str(card) for card in summary.get("cards") or ()),
         time_limited_group_raw=summary.get("time_limited_group_raw"),
+        name=str(summary.get("name") or ""),
+        comment=str(summary.get("comment") or ""),
     )
 
 

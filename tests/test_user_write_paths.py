@@ -26,6 +26,8 @@ from jablotron_api.domain.models import (
 )
 from jablotron_api.domain.user_validation import (
     REASON_CODE_LENGTH_UNKNOWN,
+    REASON_COMMENT_TOO_LONG,
+    REASON_NAME_TOO_LONG,
     REASON_PANIC_CODE_COLLISION,
     UserTableEntry,
     UserWriteRejected,
@@ -451,3 +453,56 @@ def test_demo_runtime_enforces_the_same_rules() -> None:
             await runtime.edit_user(4, UserPatchModel(code="1482"))
 
     asyncio.run(run())
+
+
+# ------------------------------------------------------------- field widths
+
+
+def test_apply_upsert_refuses_an_over_long_encoded_name_before_the_write(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The summary describes the record as it would be written; that is what
+    is measured, so a carried-over or defaulted value is checked too."""
+
+    writes = _stub_sector(
+        monkeypatch,
+        tmp_path,
+        {"name": "n" * 61, "code": "1486", "cards": [], "comment": "", "time_limited_group_raw": None},
+    )
+    with pytest.raises(UserWriteRejected) as excinfo:
+        apply_upsert(
+            _manager_config(tmp_path),
+            user_id=4,
+            payload=UserCreateModel(id=4, name="n" * 61, code="1486"),
+            current=None,
+            preflight=UserWritePreflight(code_format=CodeFormat(4, False, "panel")),
+            verify_prefix="test",
+        )
+    assert [v.reason for v in excinfo.value.violations] == [REASON_NAME_TOO_LONG]
+    assert writes == []
+
+
+def test_http_add_user_rejects_over_long_fields_with_a_typed_reason(tmp_path: Path) -> None:
+    client, headers, _ = _demo_client(tmp_path)
+
+    fits = client.post(
+        "/v1/users", json={"id": 3, "name": "Guard", "comment": "c" * 60}, headers=headers
+    )
+    assert fits.status_code == 200
+    assert fits.json()["comment"] == "c" * 60
+
+    too_long = client.post(
+        "/v1/users", json={"id": 4, "name": "Guard", "comment": "c" * 61}, headers=headers
+    )
+    assert too_long.status_code == 400
+    assert too_long.json()["detail"]["error"] == "user_write_rejected"
+    assert too_long.json()["detail"]["reason"] == REASON_COMMENT_TOO_LONG
+
+    # UTF-8 bytes, not characters: 31 two-byte characters are 62 bytes.
+    multibyte = client.patch("/v1/users/3", json={"comment": "é" * 31}, headers=headers)
+    assert multibyte.status_code == 400
+    assert multibyte.json()["detail"]["reason"] == REASON_COMMENT_TOO_LONG
+
+    name = client.patch("/v1/users/3", json={"name": "n" * 61}, headers=headers)
+    assert name.status_code == 400
+    assert name.json()["detail"]["reason"] == REASON_NAME_TOO_LONG

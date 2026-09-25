@@ -372,6 +372,8 @@ def validate_preflight(
             code=str(target.get("code") or ""),
             cards=tuple(str(card) for card in target.get("cards") or ()),
             time_limited_group_raw=target.get("time_limited_group_raw"),
+            name=str(target.get("name") or ""),
+            comment=str(target.get("comment") or ""),
         ),
         code_format=code_format,
     )

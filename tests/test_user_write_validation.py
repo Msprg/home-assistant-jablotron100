@@ -13,9 +13,11 @@ from jablotron_api.domain.codes import CodeFormat, validate_user_table_code
 from jablotron_api.domain.user_validation import (
     REASON_CARD_REPEATED,
     REASON_CODE_LENGTH_UNKNOWN,
+    REASON_COMMENT_TOO_LONG,
     REASON_DUPLICATE_CARD,
     REASON_DUPLICATE_CODE,
     REASON_INVALID_USER_CODE,
+    REASON_NAME_TOO_LONG,
     REASON_PANIC_CODE_COLLISION,
     REASON_TIME_LIMITED_GROUP_REQUIRES_CODE,
     UserTableEntry,
@@ -449,3 +451,93 @@ def test_validate_user_table_code_accepts_each_panel_length():
 def test_validate_user_table_code_rejects_empty():
     with pytest.raises(ValueError, match="empty"):
         validate_user_table_code("", PANEL_4)
+
+
+# ------------------------------------------------------------ field widths
+
+
+def _wide(user_id, *, name="", comment=""):
+    return UserTableEntry(user_id=user_id, name=name, comment=comment)
+
+
+def test_name_and_comment_fit_at_exactly_sixty_bytes():
+    warnings = validate_user_write(
+        existing=[],
+        user_id=4,
+        current=None,
+        target=_wide(4, name="n" * 60, comment="c" * 60),
+        code_format=PANEL_4,
+    )
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "field, reason",
+    [("name", REASON_NAME_TOO_LONG), ("comment", REASON_COMMENT_TOO_LONG)],
+)
+def test_a_sixty_first_byte_is_refused(field, reason):
+    with pytest.raises(UserWriteRejected) as excinfo:
+        validate_user_write(
+            existing=[],
+            user_id=4,
+            current=None,
+            target=_wide(4, **{field: "x" * 61}),
+            code_format=PANEL_4,
+        )
+    assert reasons(excinfo) == [reason]
+    # The message says how long the value was, never what it was.
+    assert "61 bytes" in excinfo.value.summary()
+    assert "xxx" not in excinfo.value.summary()
+
+
+def test_the_limit_is_utf8_bytes_not_characters():
+    # 30 two-byte characters are 60 bytes and fit; 31 are 62 and do not.
+    validate_user_write(
+        existing=[], user_id=4, current=None, target=_wide(4, comment="é" * 30), code_format=PANEL_4
+    )
+    with pytest.raises(UserWriteRejected) as excinfo:
+        validate_user_write(
+            existing=[], user_id=4, current=None, target=_wide(4, comment="é" * 31), code_format=PANEL_4
+        )
+    assert reasons(excinfo) == [REASON_COMMENT_TOO_LONG]
+    assert "62 bytes" in excinfo.value.summary()
+
+
+def test_both_over_long_fields_are_reported_together():
+    with pytest.raises(UserWriteRejected) as excinfo:
+        validate_user_write(
+            existing=[],
+            user_id=4,
+            current=None,
+            target=_wide(4, name="n" * 61, comment="c" * 61),
+            code_format=PANEL_4,
+        )
+    assert reasons(excinfo) == [REASON_NAME_TOO_LONG, REASON_COMMENT_TOO_LONG]
+
+
+def test_an_over_long_field_is_never_demoted_to_a_warning():
+    """Unlike a pre-existing code collision, an over-long value cannot already
+    be on the panel, so 'unchanged' is not a reason to let it through."""
+
+    current = _wide(4, name="n" * 61)
+    with pytest.raises(UserWriteRejected) as excinfo:
+        validate_user_write(
+            existing=[current],
+            user_id=4,
+            current=current,
+            target=_wide(4, name="n" * 61),
+            code_format=PANEL_4,
+        )
+    assert reasons(excinfo) == [REASON_NAME_TOO_LONG]
+
+
+def test_entry_from_record_carries_name_and_comment():
+    from types import SimpleNamespace
+
+    adapted = entry_from_record(
+        SimpleNamespace(user_id=7, code="", cards=[], name="Guard", comment="note")
+    )
+    assert adapted.name == "Guard"
+    assert adapted.comment == "note"
+    # Records without those attributes (older shapes) still adapt.
+    assert entry_from_record(SimpleNamespace(user_id=7, code="", cards=[])).name == ""

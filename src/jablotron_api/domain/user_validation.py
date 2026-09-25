@@ -42,6 +42,15 @@ Rules enforced here:
 ``time_limited_group_requires_code``
     A user in a time-limited group must have a code.
 
+``name_too_long`` / ``comment_too_long``
+    ``name`` and ``comment`` are 60-byte fields on the panel
+    (``CFG_MAX_TEXT_LEN`` in its configuration schema). The limit is in
+    UTF-8 bytes, not characters. The usable length is 60, not 59: the live
+    panel exports a comment of exactly 60 bytes that decodes cleanly, so
+    the field carries no terminator. The record encoder does not clip an
+    over-long value, so without this rule it would reach the panel and be
+    cut there with nothing in the response to say so.
+
 The arithmetic is deliberately length-agnostic (see :func:`panic_code`): it
 rewrites the last digit of the code string, so it generalises to whatever
 ``code_length`` the panel reports without a 4-digit assumption anywhere.
@@ -67,13 +76,24 @@ REASON_PANIC_CODE_COLLISION = "panic_code_collision"
 REASON_DUPLICATE_CARD = "duplicate_card"
 REASON_CARD_REPEATED = "card_repeated_in_request"
 REASON_TIME_LIMITED_GROUP_REQUIRES_CODE = "time_limited_group_requires_code"
+REASON_NAME_TOO_LONG = "name_too_long"
+REASON_COMMENT_TOO_LONG = "comment_too_long"
+
+# CFG_MAX_TEXT_LEN. Measured rather than assumed: a live record's comment is
+# exactly 60 UTF-8 bytes in the panel's own export and decodes cleanly.
+NAME_MAX_BYTES = 60
+COMMENT_MAX_BYTES = 60
 
 __all__ = [
+    "COMMENT_MAX_BYTES",
+    "NAME_MAX_BYTES",
     "REASON_CARD_REPEATED",
     "REASON_CODE_LENGTH_UNKNOWN",
+    "REASON_COMMENT_TOO_LONG",
     "REASON_DUPLICATE_CARD",
     "REASON_DUPLICATE_CODE",
     "REASON_INVALID_USER_CODE",
+    "REASON_NAME_TOO_LONG",
     "REASON_PANIC_CODE_COLLISION",
     "REASON_TIME_LIMITED_GROUP_REQUIRES_CODE",
     "UserTableEntry",
@@ -93,6 +113,8 @@ class UserTableEntry:
     code: str = ""
     cards: tuple[str, ...] = ()
     time_limited_group_raw: int | None = None
+    name: str = ""
+    comment: str = ""
 
 
 @dataclass(frozen=True)
@@ -173,6 +195,8 @@ def entry_from_record(record: Any) -> UserTableEntry:
         code=getattr(record, "code", "") or "",
         cards=tuple(card for card in (getattr(record, "cards", ()) or ()) if card),
         time_limited_group_raw=getattr(record, "time_limited_group_raw", None),
+        name=getattr(record, "name", "") or "",
+        comment=getattr(record, "comment", "") or "",
     )
 
 
@@ -237,6 +261,28 @@ def validate_user_write(
         for entry in existing
         if entry.user_id is not None and entry.user_id != user_id
     ]
+
+    # Field widths, in UTF-8 bytes. Never demoted to a warning: a value the
+    # panel already holds fits by construction, so an over-long one is
+    # always being introduced by this write.
+    name_bytes = len((target.name or "").encode("utf-8"))
+    if name_bytes > NAME_MAX_BYTES:
+        errors.append(
+            UserWriteViolation(
+                REASON_NAME_TOO_LONG,
+                f"The name is {name_bytes} bytes of UTF-8; the panel's name field "
+                f"holds at most {NAME_MAX_BYTES}.",
+            )
+        )
+    comment_bytes = len((target.comment or "").encode("utf-8"))
+    if comment_bytes > COMMENT_MAX_BYTES:
+        errors.append(
+            UserWriteViolation(
+                REASON_COMMENT_TOO_LONG,
+                f"The comment is {comment_bytes} bytes of UTF-8; the panel's comment "
+                f"field holds at most {COMMENT_MAX_BYTES}.",
+            )
+        )
 
     code = (target.code or "").strip()
     current_code = (current.code or "").strip() if current is not None else ""
