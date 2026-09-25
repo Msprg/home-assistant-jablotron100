@@ -2220,8 +2220,18 @@ def write_file_prefix_with_sudo(*, source: Path, target: Path, size: int) -> Non
 
 
 def stage_import(import_path: Path, sector_path: Path) -> None:
+    """Write the encoded sector over the start of the mounted IMPORT.CFG.
+
+    Any OSError from the write or the fsync is fatal. When the panel refuses
+    the SCSI write the kernel reports EIO here, and re-reading the file
+    afterwards only returns the page cache, which proves nothing about the
+    panel's storage (the 2026-09-25 live attempt ran the accept sequence
+    against unchanged storage that way). The read-back below is a sanity
+    check of the file content only; the authoritative check is the O_DIRECT
+    read of the sector after unmount in ``apply_import_sector``.
+    """
+
     sector = sector_path.read_bytes()[:SECTOR_SIZE]
-    write_error: OSError | None = None
 
     try:
         with import_path.open("r+b", buffering=0) as handle:
@@ -2231,18 +2241,15 @@ def stage_import(import_path: Path, sector_path: Path) -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
             except OSError as exc:
-                write_error = exc
+                raise SystemExit(
+                    f"IMPORT.CFG staging failed: the write to {import_path} raised {exc}"
+                ) from exc
     except PermissionError:
         write_file_prefix_with_sudo(source=sector_path, target=import_path, size=SECTOR_SIZE)
 
     current = import_path.read_bytes()[:SECTOR_SIZE]
     if current != sector:
-        if write_error is not None:
-            raise SystemExit(f"IMPORT.CFG staging failed and did not verify: {write_error}") from write_error
         raise SystemExit("IMPORT.CFG staging failed verification.")
-
-    if write_error is not None:
-        print(f"warning: write raised {write_error}; continuing because staged bytes verified exactly")
 
 
 def ensure_import_path_available(*, import_path: Path, device: str, mount_tool: str) -> None:
@@ -2635,9 +2642,14 @@ def apply_import_sector(
                 ensure_import_path_available(import_path=import_path, device=resolved_device, mount_tool=mount_tool)
                 stage_import(import_path, sector_path)
                 unmount_device(resolved_device, mount_tool=mount_tool)
+                # The page cache is gone with the unmount, so this O_DIRECT
+                # read shows what the panel actually stored. A refused write
+                # (directory sector or data sector) stops here, before the
+                # panel is asked to accept an import that never landed.
+                expected_sector = sector_path.read_bytes()[:SECTOR_SIZE]
+                verify_import_sector_direct(device=resolved_device, expected_sector=expected_sector)
                 if verbose:
-                    expected_sector = sector_path.read_bytes()[:SECTOR_SIZE]
-                    print("import_sector_probe", {"lba": IMPORT_START_LBA, "matched": probe_import_sector_direct(device=resolved_device, expected_sector=expected_sector)})
+                    print("import_sector_verified", {"lba": IMPORT_START_LBA})
             else:
                 stage_import_direct(device=resolved_device, sector_path=sector_path)
                 if verbose:

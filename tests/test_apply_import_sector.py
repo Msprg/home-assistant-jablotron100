@@ -10,6 +10,7 @@ order.
 
 from __future__ import annotations
 
+import errno
 import subprocess
 from pathlib import Path
 
@@ -44,6 +45,11 @@ def _stub_session(monkeypatch: pytest.MonkeyPatch, calls: list, *, mounted: bool
         lambda **k: calls.append(("stage_import_direct", k["device"], k["sector_path"])),
     )
     monkeypatch.setattr(tools, "stage_import", lambda *a: calls.append(("stage_import",)))
+    monkeypatch.setattr(
+        tools,
+        "verify_import_sector_direct",
+        lambda **k: calls.append(("verify_direct", k["device"], k["expected_sector"])),
+    )
     monkeypatch.setattr(
         tools,
         "ensure_import_path_available",
@@ -109,6 +115,88 @@ def test_filesystem_stage_mode_mounts_which_the_container_cannot(monkeypatch, tm
     assert "mount_device" in names
     assert "stage_import" in names
     assert "stage_import_direct" not in names
+
+
+def test_filesystem_stage_mode_verifies_the_sector_directly_before_accepting(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """After unmount the staged sector is read back with O_DIRECT, so a write
+    the panel refused (which the page cache would have hidden) is caught
+    before the accept sequence runs."""
+
+    calls: list = []
+    _stub_session(monkeypatch, calls)
+
+    sector, _ = _apply(tmp_path, stage_mode="filesystem")
+
+    names = [call[0] for call in calls]
+    assert ("verify_direct", "/dev/sdb1", sector.read_bytes()) in calls
+    assert (
+        names.index("stage_import")
+        < names.index("unmount_device")
+        < names.index("verify_direct")
+        < names.index("accept")
+    )
+
+
+def test_filesystem_stage_mode_does_not_accept_when_the_sector_did_not_land(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list = []
+    _stub_session(monkeypatch, calls)
+
+    def refused(**kwargs):
+        calls.append(("verify_direct",))
+        raise SystemExit("Direct IMPORT.CFG verification failed")
+
+    monkeypatch.setattr(tools, "verify_import_sector_direct", refused)
+
+    with pytest.raises(SystemExit, match="verification failed"):
+        _apply(tmp_path, stage_mode="filesystem")
+
+    names = [call[0] for call in calls]
+    assert "accept" not in names
+    assert names[-1] == "mount_device", "the host mount is restored on the way out"
+
+
+# --------------------------------------------------------------------- stage_import
+
+
+def test_stage_import_writes_the_sector_prefix_in_place(tmp_path: Path) -> None:
+    sector = tmp_path / "sector.bin"
+    payload = bytes(range(256)) * 2
+    sector.write_bytes(payload)
+    import_file = tmp_path / "IMPORT.CFG"
+    import_file.write_bytes(b"\xff" * (tools.SECTOR_SIZE * 3))
+
+    tools.stage_import(import_file, sector)
+
+    assert import_file.read_bytes() == payload + b"\xff" * (tools.SECTOR_SIZE * 2)
+
+
+def test_stage_import_treats_a_refused_write_as_fatal_even_if_the_readback_matches(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The 2026-09-25 live attempt: the panel answered the SCSI write with a
+    sense error, the kernel raised EIO on fsync, and the file still read back
+    correctly from the page cache. That must not count as staged."""
+
+    sector = tmp_path / "sector.bin"
+    sector.write_bytes(b"\x01" * tools.SECTOR_SIZE)
+    import_file = tmp_path / "IMPORT.CFG"
+    import_file.write_bytes(b"\x00" * tools.SECTOR_SIZE)
+
+    def refuse(fd):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(tools.os, "fsync", refuse)
+
+    with pytest.raises(SystemExit, match=r"staging failed.*Input/output error"):
+        tools.stage_import(import_file, sector)
+
+    # The bytes did reach the page cache; that is exactly the misleading
+    # signal the fatal exit exists for.
+    assert import_file.read_bytes() == b"\x01" * tools.SECTOR_SIZE
 
 
 def test_direct_stage_mode_unmounts_a_host_mount_first_and_restores_it(
