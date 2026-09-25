@@ -17,13 +17,20 @@ services:
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-/dev/hidraw0}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-/dev/sdb1}"
       JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-/dev/sdc1}"
-      # User writes stage the import sector by writing it at its LBA. The
-      # default "filesystem" mode mounts FLEXI_CFG, which needs CAP_SYS_ADMIN
-      # and does not work in a container.
-      JABLOTRON_PANEL_STAGE_MODE: "direct"
+      # User writes stage IMPORT.CFG through a mount of FLEXI_CFG (the panel
+      # refuses raw sector writes and ignores them even when they land), so
+      # the container needs mount(2): see cap_add and security_opt below.
+      JABLOTRON_PANEL_STAGE_MODE: "filesystem"
     volumes:
       - ./.dev-data:/data
       - ./.dev-certs:/data/certs:ro
+    # mount(2) for user writes: CAP_SYS_ADMIN, and an AppArmor profile that
+    # allows mount (docker-default denies it). The container already runs as
+    # root with raw access to the panel devices; this adds only the mount.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
     device_cgroup_rules:
       - "c 13:* rmw"
       - "b *:* rmw"
