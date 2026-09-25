@@ -2098,6 +2098,19 @@ def send_flink_export_refresh_sequence(client: JablotronUSBClient, *, verbose: b
     send_report(client, REPORT_520102, verbose=verbose)
     send_report(client, REPORT_80010F, verbose=verbose)
     send_report(client, REPORT_520102, verbose=verbose)
+    send_config_reload_sequence(client, verbose=verbose)
+
+
+def send_config_reload_sequence(client: JablotronUSBClient, *, verbose: bool) -> None:
+    """Ask the panel to rebuild its configuration export and wait for it.
+
+    This is what F-Link does right after "Setting mode entered" and before
+    any write to IMPORT.CFG. The 2026-09-25 capture of an F-Link session
+    shows the panel refusing a mass-storage write before this step and
+    accepting the same write after it, which is why ``apply_import_sector``
+    can run it before staging.
+    """
+
     send_report(client, REPORT_520213059A00, verbose=verbose)
     for report in build_flink_info_log_reports():
         send_report(client, report, verbose=verbose)
@@ -2613,6 +2626,7 @@ def apply_import_sector(
     write_cleanup_mode: str,
     verbose: bool,
     verify_output: Path | None = None,
+    reload_before_stage: bool = False,
 ) -> ExportSnapshot | None:
     resolved_device = resolve_flexi_cfg_device(device)
     mountpoint = import_path.parent
@@ -2638,6 +2652,10 @@ def apply_import_sector(
             time.sleep(0.7)
             pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=verbose)
             enter_setup_mode(client, verbose=verbose, initial_packets=pre_packets)
+            if reload_before_stage:
+                send_config_reload_sequence(client, verbose=verbose)
+                if verbose:
+                    print("reload_before_stage", "complete")
             if stage_mode == "filesystem":
                 ensure_import_path_available(import_path=import_path, device=resolved_device, mount_tool=mount_tool)
                 stage_import(import_path, sector_path)

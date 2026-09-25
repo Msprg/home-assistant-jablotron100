@@ -506,6 +506,11 @@ def add_live_apply_arguments(parser: argparse.ArgumentParser) -> None:
         default="auto",
         help="How to close the write session after apply when the inline exit does not fully reach 0x90 (default: auto).",
     )
+    parser.add_argument(
+        "--reload-before-stage",
+        action="store_true",
+        help="After entering setup mode, run the configuration reload F-Link runs before its first write, then stage.",
+    )
     parser.add_argument("--verify-output", help="If set, verify against this export path. Defaults to /tmp.")
     parser.add_argument("--no-apply", action="store_true", help="Only build the sector and do not touch the panel.")
     add_verbose_argument(parser)
@@ -607,6 +612,7 @@ def cmd_add(args: argparse.Namespace) -> None:
             write_cleanup_mode=args.write_cleanup_mode,
             verbose=args.verbose,
             verify_output=verify_output,
+            reload_before_stage=args.reload_before_stage,
         )
         if inline_snapshot is None:
             return
@@ -654,6 +660,7 @@ def cmd_edit(args: argparse.Namespace) -> None:
             write_cleanup_mode=args.write_cleanup_mode,
             verbose=args.verbose,
             verify_output=verify_output,
+            reload_before_stage=args.reload_before_stage,
         )
         if inline_snapshot is None:
             return
@@ -694,6 +701,7 @@ def cmd_delete(args: argparse.Namespace) -> None:
             write_cleanup_mode=args.write_cleanup_mode,
             verbose=args.verbose,
             verify_output=verify_output,
+            reload_before_stage=args.reload_before_stage,
         )
         if inline_snapshot is None:
             return
