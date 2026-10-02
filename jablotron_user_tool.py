@@ -31,7 +31,7 @@ from jablotron_re_tools import (
     ExportSnapshot,
     UserRecord,
     add_flexi_cfg_device_argument,
-    apply_import_sector,
+    apply_sector,
     default_export_output,
     default_sector_output,
     emit_user_records,
@@ -511,6 +511,16 @@ def add_live_apply_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="After entering setup mode, run the configuration reload F-Link runs before its first write, then stage.",
     )
+    parser.add_argument(
+        "--write-transport",
+        choices=("auto", "hid", "storage"),
+        default="auto",
+        help=(
+            "How the record reaches the panel: 'hid' sends it as a 0x1D HID packet (F-Link's path for a "
+            "master-rights login), 'storage' stages IMPORT.CFG (service/ARC rights). 'auto' logs in once to read "
+            "the rights and picks (default)."
+        ),
+    )
     parser.add_argument("--verify-output", help="If set, verify against this export path. Defaults to /tmp.")
     parser.add_argument("--no-apply", action="store_true", help="Only build the sector and do not touch the panel.")
     add_verbose_argument(parser)
@@ -600,7 +610,8 @@ def cmd_add(args: argparse.Namespace) -> None:
             return
 
         verify_output = Path(args.verify_output) if args.verify_output else default_export_output(f"post-add-user{args.user_id}")
-        inline_snapshot = apply_import_sector(
+        inline_snapshot = apply_sector(
+            transport=args.write_transport,
             sector_path=sector_path,
             import_path=Path(args.import_path),
             device=args.device,
@@ -648,7 +659,8 @@ def cmd_edit(args: argparse.Namespace) -> None:
             return
 
         verify_output = Path(args.verify_output) if args.verify_output else default_export_output(f"post-edit-user{args.user_id}")
-        inline_snapshot = apply_import_sector(
+        inline_snapshot = apply_sector(
+            transport=args.write_transport,
             sector_path=sector_path,
             import_path=Path(args.import_path),
             device=args.device,
@@ -689,7 +701,8 @@ def cmd_delete(args: argparse.Namespace) -> None:
             return
 
         verify_output = Path(args.verify_output) if args.verify_output else default_export_output(f"post-delete-user{args.user_id}")
-        inline_snapshot = apply_import_sector(
+        inline_snapshot = apply_sector(
+            transport=args.write_transport,
             sector_path=sector_path,
             import_path=Path(args.import_path),
             device=args.device,
