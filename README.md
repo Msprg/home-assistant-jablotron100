@@ -126,12 +126,16 @@ The reference client covers the full `/v1` API surface, including `users list|ge
 section/PG control, and WebSocket subscriptions.
 
 6. Switch `JABLOTRON_API_RUNTIME_MODE=live` and provide the panel USB/block devices to start validating the real hardware path.
-   User create/edit/delete needs the panel's service code: the panel accepts the
-   user-table write (`IMPORT.CFG`) only from a session logged in with it, and
-   refuses it from any other code (the API then answers `409`). If
-   `JABLOTRON_PANEL_AUTH_CODE` is not the service code, set
-   `JABLOTRON_PANEL_WRITE_AUTH_CODE` to the service code; it is used only for user
-   writes, and every other session keeps using `JABLOTRON_PANEL_AUTH_CODE`.
+   User create/edit/delete follows the rights the panel grants the login code,
+   the same way F-Link does. A code with *master* rights (the usual
+   administrator code) writes the user record over HID; a code with *service*
+   or *ARC* rights writes it through the panel's `IMPORT.CFG` volume, which
+   needs the FLEXI block device and a mount. The server logs in once before
+   each write to read the rights and picks the path (`JABLOTRON_PANEL_WRITE_TRANSPORT=auto`,
+   the default); set it to `hid` or `storage` to skip the probe and force one.
+   `JABLOTRON_PANEL_WRITE_AUTH_CODE` is optional: when set, user writes log in
+   with it instead of `JABLOTRON_PANEL_AUTH_CODE`, and every other session keeps
+   using `JABLOTRON_PANEL_AUTH_CODE`. A write the panel refuses answers `409`.
 
 ### Home Assistant alpha path
 

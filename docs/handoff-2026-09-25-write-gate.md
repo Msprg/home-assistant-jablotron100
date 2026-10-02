@@ -369,6 +369,28 @@ format" reading in "Confirmed" above.
   ARC-rights session may also use `1D`. The captures only show master
   rights using it and ARC rights using storage.
 
+### Implemented (2026-10-03, same day)
+
+- `jablotron_re_tools.py`: `parse_login_rights` (from `80 1A 0C`),
+  `enter_setup_mode` returns them; `read_config_revision` /
+  `verify_config_revision_advanced` (`52 03 1A 01 00`); the import-accept
+  sequence is now reply-driven (`52 01 24` waits for `52 04 83 01 24 01`
+  with progress extending the wait, `52 01 0C` requires `52 03 83 01 02`,
+  then `80 01 14` awaits `80 01 17`); `write_config_over_hid` /
+  `apply_config_payload_over_hid` (the `0x1D` transport);
+  `probe_login_rights`; `apply_sector(transport=...)`. A storage write from a
+  master-rights login now fails before the volume is touched, with a
+  message naming the transport setting.
+- API: `JABLOTRON_PANEL_WRITE_TRANSPORT=auto|hid|storage` (PanelSettings,
+  PanelRuntimeConfig, UserManagerConfig). `auto` logs in once before each
+  write to read the rights and uses `hid` for master, `storage` for
+  service/ARC. CLI: `jablotron_user_tool.py add|edit|delete --write-transport`.
+- Tests: `tests/test_hid_config_write.py` rebuilds the captured save and
+  delete packets byte for byte from the sector builders and scripts the
+  captured replies through the whole session.
+- Not yet live-tested: the API container was still running the previous
+  image with the panel attached when this was written.
+
 ### What this changes for the API
 
 Choice 2 above is no longer a reverse-engineering project. A user write
