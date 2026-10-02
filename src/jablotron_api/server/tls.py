@@ -7,7 +7,7 @@ import hashlib
 from typing import Any
 
 from uvicorn.protocols.http.h11_impl import H11Protocol
-from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
+from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
 
 
 TLS_EXTENSION_KEY = "jablotron_api.tls"
@@ -49,11 +49,17 @@ class TLSAwareH11Protocol(H11Protocol):
             apply_tls_extension(self.scope, self.transport)
 
 
-class TLSAwareWebSocketProtocol(WebSocketProtocol):
-    """Inject client-cert fingerprint metadata into WebSocket ASGI scopes."""
+class TLSAwareWebSocketProtocol(WebSocketsSansIOProtocol):
+    """Inject client-cert fingerprint metadata into WebSocket ASGI scopes.
 
-    async def process_request(self, path: str, request_headers):  # type: ignore[override]
-        response = await super().process_request(path, request_headers)
-        if self.scope is not None:
-            apply_tls_extension(self.scope, self.transport)
-        return response
+    Built on uvicorn's ``websockets-sansio`` protocol: the legacy
+    ``websockets`` protocol is deprecated and warns on import. The sansio
+    protocol builds the ASGI scope inside ``handle_connect`` and only when
+    the handshake is accepted, so the extension is applied right after it.
+    """
+
+    def handle_connect(self, event) -> None:  # type: ignore[override]
+        super().handle_connect(event)
+        scope = getattr(self, "scope", None)
+        if scope is not None:
+            apply_tls_extension(scope, self.transport)

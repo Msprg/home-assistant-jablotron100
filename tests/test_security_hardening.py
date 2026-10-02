@@ -143,3 +143,65 @@ def test_bounds_check_rejects_negative_or_overflow_ids():
         ensure_id_in_range(fake, kind="Section", attr="sections", value=-1)
     with pytest.raises(ValueError, match="supported range"):
         ensure_id_in_range(fake, kind="Section", attr="sections", value=2_147_483_647)
+
+
+# ---------------------------------------------------------------------------
+# mTLS fingerprint on the WebSocket scope (sansio protocol port)
+# ---------------------------------------------------------------------------
+
+
+def _websocket_handshake_request() -> bytes:
+    return (
+        b"GET /v1/ws?token=secret HTTP/1.1\r\n"
+        b"Host: panel.local\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n"
+        b"\r\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tls_aware_websocket_protocol_puts_the_client_cert_fingerprint_on_the_scope():
+    """The WebSocket protocol subclass moved from uvicorn's deprecated
+    ``websockets`` implementation to ``websockets-sansio``. The sansio
+    protocol builds the ASGI scope in ``handle_connect`` rather than
+    ``process_request``, so the fingerprint hook must still land there."""
+    import hashlib
+    from unittest.mock import MagicMock
+
+    from uvicorn.config import Config
+    from uvicorn.server import ServerState
+
+    from jablotron_api.server.tls import TLS_EXTENSION_KEY, TLSAwareWebSocketProtocol
+
+    async def app(scope, receive, send):  # pragma: no cover - never awaited here
+        pass
+
+    config = Config(app=app, ws=TLSAwareWebSocketProtocol)
+    config.load()
+    protocol = TLSAwareWebSocketProtocol(config=config, server_state=ServerState(), app_state={})
+
+    peer_cert = b"client-cert-der-bytes"
+    ssl_object = MagicMock()
+    ssl_object.getpeercert.return_value = peer_cert
+    extra_info = {
+        "ssl_object": ssl_object,
+        "sockname": ("127.0.0.1", 8443),
+        "peername": ("127.0.0.1", 50000),
+        "sslcontext": object(),
+    }
+    transport = MagicMock()
+    transport.get_extra_info.side_effect = lambda name, default=None: extra_info.get(name, default)
+    transport.is_closing.return_value = False
+
+    protocol.connection_made(transport)
+    protocol.data_received(_websocket_handshake_request())
+
+    assert protocol.scope["type"] == "websocket"
+    assert protocol.scope["extensions"][TLS_EXTENSION_KEY] == {
+        "client_cert_fingerprint_sha256": hashlib.sha256(peer_cert).hexdigest()
+    }
+    for task in list(protocol.tasks):
+        task.cancel()
