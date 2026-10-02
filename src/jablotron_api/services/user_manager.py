@@ -26,8 +26,11 @@ from types import SimpleNamespace
 
 from jablotron_re_tools import (
     UserRecord,
+    apply_config_payload_over_hid,
     apply_import_sector,
     default_export_output,
+    probe_login_rights,
+    sector_payload_bytes as _sector_payload_bytes,
 )
 from jablotron_user_tool import build_delete_sector, build_upsert_sector
 
@@ -45,6 +48,8 @@ from jablotron_api.domain.user_validation import (
 
 LOGGER = logging.getLogger(__name__)
 
+WRITE_TRANSPORTS = ("auto", "hid", "storage")
+
 
 @dataclass
 class UserManagerConfig:
@@ -58,6 +63,92 @@ class UserManagerConfig:
     stage_mode: str
     write_cleanup_mode: str
     read_cleanup_mode: str
+    # How the user record reaches the panel. "storage" stages the msgpack
+    # sector in IMPORT.CFG (needs the block device and a service- or
+    # ARC-rights login); "hid" sends the same msgpack as a 0x1D HID packet
+    # (what F-Link does for a master-rights login; no block device for the
+    # write). "auto" does what F-Link does: logs in once to read the rights
+    # the panel grants the write code, then uses hid for master rights and
+    # storage for service or ARC rights.
+    write_transport: str = "auto"
+
+
+def resolve_write_transport(config: UserManagerConfig) -> str:
+    """Normalise the configured transport; ``"auto"`` is resolved per write."""
+
+    transport = (config.write_transport or "auto").lower()
+    if transport not in WRITE_TRANSPORTS:
+        raise RuntimeError(
+            f"Unsupported user write transport {config.write_transport!r}; expected one of {', '.join(WRITE_TRANSPORTS)}."
+        )
+    return transport
+
+
+def select_write_transport(config: UserManagerConfig) -> str:
+    """Pick hid or storage for this write, probing the panel when configured "auto"."""
+
+    transport = resolve_write_transport(config)
+    if transport != "auto":
+        return transport
+    rights = probe_login_rights(
+        port=config.port,
+        code=config.write_auth_code or config.auth_code,
+        reset=config.reset,
+        verbose=False,
+    )
+    if rights is None:
+        LOGGER.warning("The panel did not report login rights; using the storage transport for this write.")
+        return "storage"
+    chosen = "hid" if rights.is_master else "storage"
+    LOGGER.info(
+        "Write code logged in with %s rights (position %d); using the %s transport.",
+        rights.rights,
+        rights.position,
+        chosen,
+    )
+    return chosen
+
+
+def sector_payload_bytes(sector_path: Path) -> bytes:
+    """The msgpack command inside an encoded IMPORT.CFG sector.
+
+    The sector builders already produce exactly the bytes F-Link sends over
+    HID (XOR-decoded, without the `C1 C1 C1 C1` trailer and the fill), so the
+    HID transport reuses them instead of a second encoder.
+    """
+
+    return _sector_payload_bytes(sector_path.read_bytes())
+
+
+def write_sector_to_panel(config: UserManagerConfig, *, sector_path: Path, verify_prefix: str) -> None:
+    transport = select_write_transport(config)
+    verify_output = default_export_output(verify_prefix)
+    code = config.write_auth_code or config.auth_code
+    if transport == "hid":
+        apply_config_payload_over_hid(
+            payload=sector_payload_bytes(sector_path),
+            device=config.flexi_cfg_device,
+            port=config.port,
+            code=code,
+            reset=config.reset,
+            write_cleanup_mode=config.write_cleanup_mode,
+            verbose=False,
+            verify_output=verify_output,
+        )
+        return
+    apply_import_sector(
+        sector_path=sector_path,
+        import_path=config.import_path,
+        device=config.flexi_cfg_device,
+        port=config.port,
+        code=code,
+        reset=config.reset,
+        mount_tool=config.mount_tool,
+        stage_mode=config.stage_mode,
+        write_cleanup_mode=config.write_cleanup_mode,
+        verbose=False,
+        verify_output=verify_output,
+    )
 
 
 @dataclass(frozen=True)
@@ -287,20 +378,7 @@ def apply_upsert(
         for message in warnings:
             LOGGER.warning("User %s write preflight warning: %s", user_id, message)
 
-        verify_output = default_export_output(verify_prefix)
-        apply_import_sector(
-            sector_path=sector_path,
-            import_path=config.import_path,
-            device=config.flexi_cfg_device,
-            port=config.port,
-            code=config.write_auth_code or config.auth_code,
-            reset=config.reset,
-            mount_tool=config.mount_tool,
-            stage_mode=config.stage_mode,
-            write_cleanup_mode=config.write_cleanup_mode,
-            verbose=False,
-            verify_output=verify_output,
-        )
+        write_sector_to_panel(config, sector_path=sector_path, verify_prefix=verify_prefix)
     finally:
         if cleanup_sector and sector_path.exists():
             sector_path.unlink()
@@ -315,20 +393,7 @@ def apply_delete(
     args = build_user_args(config, command="delete", user_id=user_id)
     sector_path, _, cleanup_sector = build_delete_sector(args)
     try:
-        verify_output = default_export_output(verify_prefix)
-        apply_import_sector(
-            sector_path=sector_path,
-            import_path=config.import_path,
-            device=config.flexi_cfg_device,
-            port=config.port,
-            code=config.write_auth_code or config.auth_code,
-            reset=config.reset,
-            mount_tool=config.mount_tool,
-            stage_mode=config.stage_mode,
-            write_cleanup_mode=config.write_cleanup_mode,
-            verbose=False,
-            verify_output=verify_output,
-        )
+        write_sector_to_panel(config, sector_path=sector_path, verify_prefix=verify_prefix)
     finally:
         if cleanup_sector and sector_path.exists():
             sector_path.unlink()

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import jablotron_re_tools as re_tools
 from jablotron_api.domain.models import (
     ExportCatalogModel,
     InitialSetupModel,
@@ -391,6 +392,7 @@ def _write_harness(monkeypatch, tmp_path, *, cached_users, fresh_users):
 
     monkeypatch.setattr(user_manager, "build_upsert_sector", fake_build)
     monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: applied.append(kw))
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: re_tools.LoginRights(0x2A, 7))
     h.runtime._catalog = _model(cached_users)
     h.runtime._catalog_snapshot = _snapshot(cached_users)
     h.runtime._catalog_completed_monotonic = time.monotonic()

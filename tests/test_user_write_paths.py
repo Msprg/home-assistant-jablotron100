@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+import jablotron_re_tools as re_tools
 import jablotron_user_tool
 from jablotron_api.domain.codes import CodeFormat
 from jablotron_api.domain.models import (
@@ -90,6 +91,13 @@ def _stub_sector(monkeypatch, tmp_path: Path, summary: dict) -> list:
         user_manager,
         "apply_import_sector",
         lambda **kwargs: writes.append(kwargs),
+    )
+    # The "auto" transport asks the panel which rights the write code has;
+    # answer "ARC" so these tests keep exercising the storage path.
+    monkeypatch.setattr(
+        user_manager,
+        "probe_login_rights",
+        lambda **kwargs: re_tools.LoginRights(rights_raw=re_tools.LOGIN_RIGHTS_ARC, position=7),
     )
     return writes
 

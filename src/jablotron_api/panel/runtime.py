@@ -65,6 +65,7 @@ from jablotron_api.services.user_manager import (
     UserWritePreflight,
     apply_delete as _apply_delete_user,
     apply_upsert as _apply_upsert_user,
+    resolve_write_transport,
     user_to_record,
     verify_added_user as _verify_added_user_fn,
     verify_edited_user as _verify_edited_user_fn,
@@ -88,8 +89,9 @@ __all__ = [
 
 
 _WRITE_CODE_HINT = (
-    " The panel refuses IMPORT.CFG writes from sessions that are not logged in"
-    " with its service code; set JABLOTRON_PANEL_WRITE_AUTH_CODE to the service code."
+    " The panel takes IMPORT.CFG writes only from a service- or ARC-rights login; set"
+    " JABLOTRON_PANEL_WRITE_AUTH_CODE to such a code, or let a master-rights code write"
+    " over HID with JABLOTRON_PANEL_WRITE_TRANSPORT=hid."
 )
 
 
@@ -121,11 +123,14 @@ class PanelRuntimeConfig:
     # provided explicitly. ServerSettings reads it from
     # JABLOTRON_PANEL_AUTH_CODE; tests pass it directly.
     auth_code: str = field(default="", repr=False)
-    # Optional: the service code for user writes only
-    # (JABLOTRON_PANEL_WRITE_AUTH_CODE). The panel refuses IMPORT.CFG writes
-    # from sessions logged in with any other code, even though they reach
-    # setup mode and read exports. Empty means writes use auth_code.
+    # Optional: a second code for user writes only
+    # (JABLOTRON_PANEL_WRITE_AUTH_CODE). IMPORT.CFG writes need a service- or
+    # ARC-rights login; a master-rights login writes over HID instead. Empty
+    # means writes use auth_code.
     write_auth_code: str = field(default="", repr=False)
+    # "auto" | "hid" | "storage" (JABLOTRON_PANEL_WRITE_TRANSPORT); see
+    # services.user_manager.UserManagerConfig.write_transport.
+    write_transport: str = "auto"
     flexi_cfg_device: str = "auto"
     flexi_log_device: str = "auto"
     import_path: Path = DEFAULT_IMPORT_PATH
@@ -196,9 +201,14 @@ class PanelRuntime:
         )
 
     def _write_failure_hint(self) -> str | None:
-        """Hint appended to a refused user write when no write code is set."""
+        """Hint appended to a refused storage write when no write code is set."""
 
-        return None if self._config.write_auth_code else _WRITE_CODE_HINT
+        if self._config.write_auth_code or self._write_transport() == "hid":
+            return None
+        return _WRITE_CODE_HINT
+
+    def _write_transport(self) -> str:
+        return resolve_write_transport(self._user_manager_config())
 
     def _user_manager_config(self) -> UserManagerConfig:
         return UserManagerConfig(
@@ -212,6 +222,7 @@ class PanelRuntime:
             stage_mode=self._config.stage_mode,
             write_cleanup_mode=self._config.write_cleanup_mode,
             read_cleanup_mode=self._config.read_cleanup_mode,
+            write_transport=getattr(self._config, "write_transport", "auto"),
         )
 
     def _event_reader_config(self) -> EventReaderConfig:
@@ -260,7 +271,8 @@ class PanelRuntime:
         await self.refresh_all()
         self._poller_task = asyncio.create_task(self._poll_loop(), name="jablotron-panel-poller")
         LOGGER.info(
-            "Panel runtime started: user writes log in with %s",
+            "Panel runtime started: user writes use the %s transport and log in with %s",
+            self._write_transport(),
             "the separate write code" if self._config.write_auth_code else "the session code",
         )
 

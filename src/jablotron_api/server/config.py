@@ -13,12 +13,17 @@ class PanelSettings:
     # raises a clear error at startup in live mode if this is empty. It is
     # the code every session logs in with (status, control, reads).
     auth_code: str = field(default="", repr=False)
-    # Optional: the panel's service code, used only for user writes. The
-    # panel takes IMPORT.CFG writes only from a session logged in with the
-    # service code; with any other code it refuses the storage write (F-Link
-    # then uses a HID configuration protocol this server does not speak).
-    # Empty means user writes log in with auth_code.
+    # Optional: a second code used only for user writes. The panel takes
+    # IMPORT.CFG writes only from a session logged in with service or ARC
+    # rights; a master-rights login writes over HID instead (see
+    # write_transport). Empty means user writes log in with auth_code.
     write_auth_code: str = field(default="", repr=False)
+    # "auto" | "hid" | "storage". How user records reach the panel: "hid"
+    # sends the msgpack record as a 0x1D HID packet (F-Link's path for a
+    # master-rights login; no block device needed for the write), "storage"
+    # stages it in IMPORT.CFG (F-Link's path for service/ARC rights). "auto"
+    # picks storage when write_auth_code is set, else hid.
+    write_transport: str = "auto"
     flexi_cfg_device: str = "auto"
     flexi_log_device: str = "auto"
     import_path: Path = Path("/mnt/flexi_cfg/IMPORT.CFG")
@@ -57,6 +62,7 @@ class ServerSettings:
             port=os.getenv("JABLOTRON_PANEL_PORT", "auto"),
             auth_code=os.getenv("JABLOTRON_PANEL_AUTH_CODE", ""),
             write_auth_code=os.getenv("JABLOTRON_PANEL_WRITE_AUTH_CODE", ""),
+            write_transport=os.getenv("JABLOTRON_PANEL_WRITE_TRANSPORT", "auto"),
             flexi_cfg_device=os.getenv("JABLOTRON_PANEL_FLEXI_CFG_DEVICE", "auto"),
             flexi_log_device=os.getenv("JABLOTRON_PANEL_FLEXI_LOG_DEVICE", "auto"),
             import_path=Path(os.getenv("JABLOTRON_PANEL_IMPORT_PATH", "/mnt/flexi_cfg/IMPORT.CFG")),

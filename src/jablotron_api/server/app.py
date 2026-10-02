@@ -200,6 +200,11 @@ def create_app(
                     "Set the env var to the installation's panel service code, "
                     "or run with JABLOTRON_API_RUNTIME_MODE=demo for a smoke test."
                 )
+            if settings.panel.write_transport.lower() not in {"auto", "hid", "storage"}:
+                raise RuntimeError(
+                    "JABLOTRON_PANEL_WRITE_TRANSPORT must be one of auto, hid or storage, "
+                    f"not {settings.panel.write_transport!r}."
+                )
             from jablotron_api.panel.runtime import PanelRuntime
 
             runtime = PanelRuntime(settings.panel)
