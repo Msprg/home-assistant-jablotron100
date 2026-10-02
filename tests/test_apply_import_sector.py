@@ -58,6 +58,12 @@ def _stub_session(monkeypatch: pytest.MonkeyPatch, calls: list, *, mounted: bool
     monkeypatch.setattr(
         tools, "perform_import_accept_sequence", lambda client, **k: calls.append(("accept",))
     )
+    monkeypatch.setattr(tools, "read_config_revision", lambda client, **k: None)
+    monkeypatch.setattr(
+        tools,
+        "verify_config_revision_advanced",
+        lambda client, **k: calls.append(("revision_check",)),
+    )
     monkeypatch.setattr(tools, "graceful_exit_session", lambda client, **k: [])
     monkeypatch.setattr(
         tools,

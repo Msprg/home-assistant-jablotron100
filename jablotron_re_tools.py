@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -61,6 +62,92 @@ CONFIGURATION_SECTIONS_MODE = 0x94
 SETUP_MODE_NUDGE_DELAY = 0.35
 SETUP_MODE_FIRST_KEEPALIVE_DELAY = 0.7
 SETUP_MODE_KEEPALIVE_INTERVAL = 1.0
+
+LOGGER = logging.getLogger(__name__)
+
+# Login reply `80 1A 0C <25 bytes>`: data byte 8 names the rights the code
+# logged in with, data byte 10 the logged position (F-Link's comm log prints
+# both as "Code accepted with <x> rights" / "LoggedPosition: n"). Decoded from
+# the 2026-09-25 captures; see docs/handoff-2026-09-25-write-gate.md "Decoded".
+LOGIN_RIGHTS_MASTER = 0x28
+LOGIN_RIGHTS_SERVICE = 0x29
+LOGIN_RIGHTS_ARC = 0x2A
+LOGIN_RIGHTS_NAMES = {
+    LOGIN_RIGHTS_MASTER: "master",
+    LOGIN_RIGHTS_SERVICE: "service",
+    LOGIN_RIGHTS_ARC: "arc",
+}
+
+# `52 03 1A 01 00` asks for the configuration revision; the panel answers
+# `52 07 1B 01 00 <u16 LE revision> 01 00`. Every accepted configuration write
+# in the captures (IMPORT.CFG and HID alike) advanced it by one.
+CONFIG_REVISION_QUERY_PACKET = bytes.fromhex("52031a0100")
+CONFIG_REVISION_REPLY_PREFIX = "52071b0100"
+
+# HID configuration write (F-Link talker JA100_WRITE_CFG, seen with a
+# master-rights login): one TLV packet of type 0x1D carrying `09 00` and the
+# same msgpack command the storage path puts into the IMPORT.CFG sector. The
+# panel acknowledges with `1D 03 44 00 00`, then the usual `52 01 0C` accept.
+HID_CONFIG_WRITE_TYPE = b"\x1d"
+HID_CONFIG_WRITE_PREFIX = b"\x09\x00"
+HID_CONFIG_WRITE_ACK = "1d03440000"
+HID_CONFIG_WRITE_MAX_PAYLOAD = 64 - 2 - len(HID_CONFIG_WRITE_PREFIX)
+
+IMPORT_PROGRESS_PREFIX = "5204830b24"
+IMPORT_COMPLETE_PREFIX = "520483012401"
+ACCEPT_CONFIRMED_PREFIX = "5203830102"
+CONFIGURATION_ESCAPED_PREFIX = "800117"
+
+
+@dataclass(frozen=True)
+class LoginRights:
+    rights_raw: int
+    position: int
+
+    @property
+    def rights(self) -> str:
+        return LOGIN_RIGHTS_NAMES.get(self.rights_raw, f"0x{self.rights_raw:02x}")
+
+    @property
+    def is_master(self) -> bool:
+        return self.rights_raw == LOGIN_RIGHTS_MASTER
+
+
+def parse_login_rights(packet: bytes) -> LoginRights | None:
+    """Decode the rights and logged position from a `80 1A 0C` login reply."""
+
+    if not packet.startswith(bytes.fromhex("801a0c")):
+        return None
+    data = packet[3:]
+    if len(data) < 11:
+        return None
+    return LoginRights(rights_raw=data[8], position=data[10])
+
+
+def parse_config_revision(packet: bytes) -> int | None:
+    if not packet.startswith(bytes.fromhex(CONFIG_REVISION_REPLY_PREFIX)) or len(packet) < 7:
+        return None
+    return int.from_bytes(packet[5:7], "little")
+
+
+def build_hid_config_write_packet(payload: bytes) -> bytes:
+    """Wrap a msgpack configuration command the way F-Link sends it over HID."""
+
+    if len(payload) > HID_CONFIG_WRITE_MAX_PAYLOAD:
+        raise SystemExit(
+            f"Configuration payload of {len(payload)} bytes does not fit one HID report "
+            f"(at most {HID_CONFIG_WRITE_MAX_PAYLOAD}); how F-Link splits larger records is not captured yet."
+        )
+    return Jablotron.create_packet(HID_CONFIG_WRITE_TYPE, HID_CONFIG_WRITE_PREFIX + payload)
+
+
+def master_rights_storage_refusal_message(rights: LoginRights) -> str:
+    return (
+        f"The session logged in with {rights.rights} rights (position {rights.position}); the panel takes "
+        "IMPORT.CFG writes only from service or ARC rights and refuses them from a master session. "
+        "Use the HID write transport (JABLOTRON_PANEL_WRITE_TRANSPORT=hid) for this code, or set "
+        "JABLOTRON_PANEL_WRITE_AUTH_CODE to a service code."
+    )
 
 ARC_PROTOCOL_NAMES = {
     0: "ARC_PROTO_NONE",
@@ -2440,9 +2527,19 @@ def send_packets(client: JablotronUSBClient, packets: Iterable[bytes], *, verbos
             print("tx", Jablotron.format_packet_to_string(packet))
 
 
-def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packets: list[bytes] | None = None) -> None:
+def enter_setup_mode(
+    client: JablotronUSBClient, *, verbose: bool, initial_packets: list[bytes] | None = None
+) -> LoginRights | None:
+    """Bring a logged-in session into configuration mode.
+
+    Returns the rights the panel reported for the login (from the `80 1A 0C`
+    reply) when that reply was seen, else ``None``. Raises ``SystemExit`` when
+    the panel does not report "Setting mode entered" (`80 01 12`).
+    """
+
     service_rights = False
     service_rights_at: float | None = None
+    login_rights: LoginRights | None = None
     nudged_0f = False
     saw_1a0a = False
     saw_1a0a_at: float | None = None
@@ -2467,6 +2564,7 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
             if packet_startswith(packet, "801a0c") and not service_rights:
                 service_rights = True
                 service_rights_at = now
+                login_rights = parse_login_rights(packet)
             elif packet_startswith(packet, "80021a0a") and not saw_1a0a:
                 saw_1a0a = True
                 saw_1a0a_at = now
@@ -2523,6 +2621,7 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
                 "last_keepalive_at": last_keepalive_at,
                 "next_keepalive_at": next_keepalive_at,
                 "entered_setup": entered_setup,
+                "login_rights": login_rights,
             },
         )
 
@@ -2530,51 +2629,130 @@ def enter_setup_mode(client: JablotronUSBClient, *, verbose: bool, initial_packe
         if saw_config_channels_in_use or (saw_preexisting_configuration_state and not saw_1a0a):
             raise SystemExit(configuration_in_use_message())
         raise SystemExit("Did not enter setup mode.")
+    return login_rights
+
+
+def wait_for_reply(
+    client: JablotronUSBClient,
+    *,
+    prefix_hex: str,
+    timeout: float,
+    verbose: bool,
+    label: str,
+    progress_prefix_hex: str | None = None,
+) -> bytes | None:
+    """Read until a packet starting with ``prefix_hex`` arrives or ``timeout`` passes.
+
+    A packet matching ``progress_prefix_hex`` restarts the clock: the panel
+    reports import and export progress once a second and the final reply
+    only after the last step.
+    """
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for packet in wait_for_packets(client, deadline=deadline, timeout=0.5, prefix=label, verbose=verbose):
+            if packet_startswith(packet, prefix_hex):
+                return packet
+            if progress_prefix_hex is not None and packet_startswith(packet, progress_prefix_hex):
+                deadline = time.time() + timeout
+    return None
+
+
+def read_config_revision(client: JablotronUSBClient, *, verbose: bool, timeout: float = 2.0) -> int | None:
+    """Ask the panel for its configuration revision counter (`52 03 1A 01 00`)."""
+
+    send_packet(client, CONFIG_REVISION_QUERY_PACKET, verbose=verbose)
+    reply = wait_for_reply(
+        client, prefix_hex=CONFIG_REVISION_REPLY_PREFIX, timeout=timeout, verbose=verbose, label="revision"
+    )
+    return None if reply is None else parse_config_revision(reply)
+
+
+def verify_config_revision_advanced(client: JablotronUSBClient, *, before: int | None, verbose: bool) -> int | None:
+    """Fail when the panel's configuration revision did not move after a write."""
+
+    after = read_config_revision(client, verbose=verbose)
+    if before is None or after is None:
+        LOGGER.warning(
+            "Configuration revision check skipped (before=%s, after=%s); the export read-back is the only verification.",
+            before,
+            after,
+        )
+        return after
+    if after == before:
+        raise SystemExit(
+            f"The panel's configuration revision stayed at 0x{before:04x} after the write; the change was not applied."
+        )
+    if verbose:
+        print("config_revision", {"before": before, "after": after})
+    return after
+
+
+def perform_accept_configuration(client: JablotronUSBClient, *, verbose: bool) -> None:
+    """Commit a staged configuration change the way F-Link does after a write.
+
+    `52 01 0C` (talker JA100_ACCEPT_CFG) is answered by `52 03 83 01 02` once
+    the panel has applied the change; `80 01 14` then leaves configuration
+    mode and is answered by `80 01 17`. F-Link re-enters configuration mode
+    after that because it stays connected; this session exits instead.
+    """
+
+    send_report(client, REPORT_52010C, verbose=verbose)
+    accepted = wait_for_reply(
+        client, prefix_hex=ACCEPT_CONFIRMED_PREFIX, timeout=5.0, verbose=verbose, label="accept"
+    )
+    if accepted is None:
+        raise SystemExit("The panel did not confirm the configuration accept (no 52 03 83 01 02 after 52 01 0C).")
+
+    send_report(client, REPORT_800114, verbose=verbose)
+    escaped = wait_for_reply(
+        client, prefix_hex=CONFIGURATION_ESCAPED_PREFIX, timeout=3.0, verbose=verbose, label="escape"
+    )
+    if escaped is None:
+        LOGGER.warning("The panel did not acknowledge leaving configuration mode (no 80 01 17 after 80 01 14).")
 
 
 def perform_import_accept_sequence(client: JablotronUSBClient, *, verbose: bool) -> None:
+    """Make the panel consume a staged IMPORT.CFG sector, then accept it.
+
+    `52 01 24` (talker JA107_IMPORT_CFG) is answered by `52 04 83 0B 24 <pct>`
+    progress reports and `52 04 83 01 24 01` when the import is read. The
+    accept and the exit from configuration mode are shared with the HID
+    transport (`perform_accept_configuration`).
+    """
+
     send_report(client, REPORT_520102, verbose=verbose)
-    time.sleep(0.2)
-    drain_packets(client, timeout=1.0, prefix="p1", verbose=verbose)
+    drain_packets(client, timeout=0.3, prefix="p1", verbose=verbose)
 
     send_report(client, REPORT_520124, verbose=verbose)
-    time.sleep(0.2)
-    drain_packets(client, timeout=1.2, prefix="p2", verbose=verbose)
+    imported = wait_for_reply(
+        client,
+        prefix_hex=IMPORT_COMPLETE_PREFIX,
+        progress_prefix_hex=IMPORT_PROGRESS_PREFIX,
+        timeout=5.0,
+        verbose=verbose,
+        label="import",
+    )
+    if imported is None:
+        # The 2026-09-25 host captures include an accepted delete whose
+        # `52 01 24` drew no progress reports at all, so this is not fatal;
+        # the accept confirmation and the revision counter decide.
+        LOGGER.warning("The panel did not report the IMPORT.CFG import as complete (no 52 04 83 01 24 01); continuing.")
 
     send_report(client, REPORT_520102, verbose=verbose)
-    time.sleep(0.05)
-    send_report(client, REPORT_52010C, verbose=verbose)
+    perform_accept_configuration(client, verbose=verbose)
 
-    sent_800114 = False
-    sent_80010f = False
-    sent_post_520102 = False
-    deadline = time.time() + 12.0
-    while time.time() < deadline:
-        packets = drain_packets(client, timeout=0.5, prefix="p3", verbose=verbose)
-        if not packets:
-            time.sleep(0.05)
-            continue
 
-        for packet in packets:
-            if packet.startswith(bytes.fromhex("800117")) and not sent_800114:
-                send_report(client, REPORT_800114, verbose=verbose)
-                sent_800114 = True
-            elif packet.startswith(bytes.fromhex("80021a0a")) and not sent_80010f:
-                send_report(client, REPORT_80010F, verbose=verbose)
-                sent_80010f = True
-                time.sleep(0.8)
-                send_report(client, REPORT_520102, verbose=verbose)
-                sent_post_520102 = True
+def write_config_over_hid(client: JablotronUSBClient, payload: bytes, *, verbose: bool, timeout: float = 5.0) -> bytes:
+    """Send one msgpack configuration command as a `0x1D` HID packet and await the ack."""
 
-    if verbose:
-        print(
-            "accept_flags",
-            {
-                "sent_800114": sent_800114,
-                "sent_80010f": sent_80010f,
-                "sent_post_520102": sent_post_520102,
-            },
-        )
+    send_packet(client, build_hid_config_write_packet(payload), verbose=verbose)
+    reply = wait_for_reply(client, prefix_hex="1d", timeout=timeout, verbose=verbose, label="hid-write")
+    if reply is None:
+        raise SystemExit(f"The panel did not answer the HID configuration write within {timeout:.0f} s.")
+    if not packet_startswith(reply, HID_CONFIG_WRITE_ACK):
+        raise SystemExit(f"The panel rejected the HID configuration write: {reply.hex()}")
+    return reply
 
 
 def graceful_exit_session(client: JablotronUSBClient, *, verbose: bool) -> list[bytes]:
@@ -2693,7 +2871,14 @@ def apply_import_sector(
             perform_login(client, code, reset=reset)
             time.sleep(0.7)
             pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=verbose)
-            enter_setup_mode(client, verbose=verbose, initial_packets=pre_packets)
+            login_rights = enter_setup_mode(client, verbose=verbose, initial_packets=pre_packets)
+            if login_rights is not None and login_rights.is_master:
+                # Known refusal (2026-09-25): the panel answers the storage
+                # write from a master session with a SCSI error and the
+                # change never lands. Leave configuration mode and say why.
+                exit_write_session(client, verbose=verbose)
+                raise SystemExit(master_rights_storage_refusal_message(login_rights))
+            revision_before = read_config_revision(client, verbose=verbose)
             if reload_before_stage:
                 send_config_reload_sequence(client, verbose=verbose)
                 if verbose:
@@ -2715,53 +2900,236 @@ def apply_import_sector(
                 if verbose:
                     print("import_sector_lba", resolve_import_sector_lba(resolved_device))
             perform_import_accept_sequence(client, verbose=verbose)
-            exit_packets = graceful_exit_session(client, verbose=verbose)
-            post_exit_packets = drain_packets(client, timeout=0.5, prefix="exit-post", verbose=verbose)
-            observed_modes = [
-                mode
-                for mode in (
-                    extract_sections_state_mode(packet)
-                    for packet in [*exit_packets, *post_exit_packets]
-                )
-                if mode is not None
-            ]
-            write_exit_mode = observed_modes[-1] if observed_modes else None
-            if verbose:
-                print("write_exit_mode", write_exit_mode)
+            verify_config_revision_advanced(client, before=revision_before, verbose=verbose)
+            write_exit_mode = exit_write_session(client, verbose=verbose)
         finally:
             client.close()
 
-        if write_cleanup_mode != "none" and write_exit_mode != EXITED_SECTIONS_MODE:
-            cleanup_mode = cleanup_read_session(port=port, code=code, cleanup_mode=write_cleanup_mode, verbose=verbose)
-            if verbose:
-                print("write_cleanup_mode", cleanup_mode)
-
-        if verify_output is None:
-            return None
-        last_error: SystemExit | None = None
-        for attempt in range(1, 4):
-            try:
-                return pull_live_export_snapshot(
-                    output=verify_output,
-                    device=resolved_device,
-                    port=port,
-                    code=code,
-                    reset=reset,
-                )
-            except SystemExit as exc:
-                if "reload-complete state" not in str(exc):
-                    raise
-                last_error = exc
-                if attempt == 3:
-                    raise
-                print(
-                    "warning: embedded verification export did not reach the reload-complete state; "
-                    f"retrying ({attempt}/3)"
-                )
-                time.sleep(2.0)
-        if last_error is not None:
-            raise last_error
-        return None
+        cleanup_write_session(
+            port=port, code=code, write_cleanup_mode=write_cleanup_mode, exit_mode=write_exit_mode, verbose=verbose
+        )
+        return pull_verification_export(
+            verify_output=verify_output, device=resolved_device, port=port, code=code, reset=reset
+        )
     finally:
         if remount_after:
             mount_device(resolved_device, mountpoint, mount_tool=mount_tool, expected_path=import_path)
+
+
+def exit_write_session(client: JablotronUSBClient, *, verbose: bool) -> int | None:
+    """Run the F-Link exit sequence and report the last observed sections mode."""
+
+    exit_packets = graceful_exit_session(client, verbose=verbose)
+    post_exit_packets = drain_packets(client, timeout=0.5, prefix="exit-post", verbose=verbose)
+    observed_modes = [
+        mode
+        for mode in (extract_sections_state_mode(packet) for packet in [*exit_packets, *post_exit_packets])
+        if mode is not None
+    ]
+    write_exit_mode = observed_modes[-1] if observed_modes else None
+    if verbose:
+        print("write_exit_mode", write_exit_mode)
+    return write_exit_mode
+
+
+def cleanup_write_session(
+    *, port: str, code: str, write_cleanup_mode: str, exit_mode: int | None, verbose: bool
+) -> None:
+    if write_cleanup_mode != "none" and exit_mode != EXITED_SECTIONS_MODE:
+        cleanup_mode = cleanup_read_session(port=port, code=code, cleanup_mode=write_cleanup_mode, verbose=verbose)
+        if verbose:
+            print("write_cleanup_mode", cleanup_mode)
+
+
+def pull_verification_export(
+    *, verify_output: Path | None, device: str, port: str, code: str, reset: bool
+) -> ExportSnapshot | None:
+    """Pull a fresh export after a write; retried when the panel is still rebuilding it."""
+
+    if verify_output is None:
+        return None
+    last_error: SystemExit | None = None
+    for attempt in range(1, 4):
+        try:
+            return pull_live_export_snapshot(
+                output=verify_output,
+                device=device,
+                port=port,
+                code=code,
+                reset=reset,
+            )
+        except SystemExit as exc:
+            if "reload-complete state" not in str(exc):
+                raise
+            last_error = exc
+            if attempt == 3:
+                raise
+            print(
+                "warning: embedded verification export did not reach the reload-complete state; "
+                f"retrying ({attempt}/3)"
+            )
+            time.sleep(2.0)
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+WRITE_TRANSPORTS = ("auto", "hid", "storage")
+
+
+def sector_payload_bytes(sector: bytes) -> bytes:
+    """The msgpack command inside an encoded IMPORT.CFG sector (XOR-decoded, no trailer or fill)."""
+
+    decoded = bytes(byte ^ 0xFF for byte in sector[:SECTOR_SIZE])
+    unpacker = msgpack.Unpacker(strict_map_key=False)
+    unpacker.feed(decoded)
+    try:
+        next(unpacker)
+    except StopIteration as exc:
+        raise SystemExit("The sector does not contain a msgpack command.") from exc
+    return decoded[: unpacker.tell()]
+
+
+def choose_write_transport(transport: str, *, port: str, code: str, reset: bool, verbose: bool) -> str:
+    """Resolve ``auto`` to ``hid`` or ``storage`` from the rights the panel grants ``code``."""
+
+    transport = (transport or "auto").lower()
+    if transport not in WRITE_TRANSPORTS:
+        raise SystemExit(f"Unsupported write transport {transport!r}; expected one of {', '.join(WRITE_TRANSPORTS)}.")
+    if transport != "auto":
+        return transport
+    rights = probe_login_rights(port=port, code=code, reset=reset, verbose=verbose)
+    if rights is None:
+        LOGGER.warning("The panel did not report login rights; using the storage transport.")
+        return "storage"
+    chosen = "hid" if rights.is_master else "storage"
+    if verbose:
+        print("write_transport", {"rights": rights.rights, "position": rights.position, "transport": chosen})
+    return chosen
+
+
+def apply_sector(
+    *,
+    transport: str,
+    sector_path: Path,
+    import_path: Path,
+    device: str,
+    port: str,
+    code: str,
+    reset: bool,
+    mount_tool: str,
+    stage_mode: str,
+    write_cleanup_mode: str,
+    verbose: bool,
+    verify_output: Path | None = None,
+    reload_before_stage: bool = False,
+) -> ExportSnapshot | None:
+    """Write an encoded IMPORT.CFG sector to the panel over the chosen transport."""
+
+    chosen = choose_write_transport(transport, port=port, code=code, reset=reset, verbose=verbose)
+    if chosen == "hid":
+        return apply_config_payload_over_hid(
+            payload=sector_payload_bytes(sector_path.read_bytes()),
+            device=device,
+            port=port,
+            code=code,
+            reset=reset,
+            write_cleanup_mode=write_cleanup_mode,
+            verbose=verbose,
+            verify_output=verify_output,
+        )
+    return apply_import_sector(
+        sector_path=sector_path,
+        import_path=import_path,
+        device=device,
+        port=port,
+        code=code,
+        reset=reset,
+        mount_tool=mount_tool,
+        stage_mode=stage_mode,
+        write_cleanup_mode=write_cleanup_mode,
+        verbose=verbose,
+        verify_output=verify_output,
+        reload_before_stage=reload_before_stage,
+    )
+
+
+def probe_login_rights(*, port: str, code: str, reset: bool, verbose: bool) -> LoginRights | None:
+    """Log in, read the panel's `80 1A 0C` rights reply and log out again.
+
+    Used to pick the write transport before a write session starts, so each
+    transport keeps the exact session shape it was validated with. Returns
+    ``None`` when the panel did not report rights within the window.
+    """
+
+    serial_port = ensure_serial_port(port)
+    client = JablotronUSBClient(serial_port)
+    try:
+        perform_login(client, code, reset=reset)
+        time.sleep(0.7)
+        rights: LoginRights | None = None
+        for packet in drain_packets(client, timeout=1.5, prefix="probe", verbose=verbose):
+            if Jablotron._is_login_error_packet(packet):
+                raise SystemExit("The panel refused the login code (80 02 1B 03).")
+            parsed = parse_login_rights(packet)
+            if parsed is not None:
+                rights = parsed
+                break
+        send_packets(
+            client,
+            [Jablotron.create_packet_ui_control(b"\x01"), Jablotron.create_packet_command(b"\x0e")],
+            verbose=verbose,
+        )
+        drain_packets(client, timeout=0.3, prefix="probe-exit", verbose=verbose)
+        return rights
+    finally:
+        client.close()
+
+
+def apply_config_payload_over_hid(
+    *,
+    payload: bytes,
+    device: str,
+    port: str,
+    code: str,
+    reset: bool,
+    write_cleanup_mode: str,
+    verbose: bool,
+    verify_output: Path | None = None,
+) -> ExportSnapshot | None:
+    """Write one msgpack configuration command over HID, as F-Link does for a master login.
+
+    No block device is touched for the write itself: the session logs in,
+    enters configuration mode, sends the `0x1D` packet, waits for the panel's
+    ack, commits with `52 01 0C` / `80 01 14`, checks the configuration
+    revision moved, and exits. ``device`` is only needed for the verification
+    export read-back.
+    """
+
+    write_exit_mode: int | None = None
+    serial_port = ensure_serial_port(port)
+    client = JablotronUSBClient(serial_port)
+    try:
+        perform_login(client, code, reset=reset)
+        time.sleep(0.7)
+        pre_packets = drain_packets(client, timeout=1.0, prefix="pre", verbose=verbose)
+        login_rights = enter_setup_mode(client, verbose=verbose, initial_packets=pre_packets)
+        if login_rights is not None and not login_rights.is_master:
+            LOGGER.warning(
+                "Logged in with %s rights (position %d); the HID configuration write has only been "
+                "captured from master-rights sessions.",
+                login_rights.rights,
+                login_rights.position,
+            )
+        revision_before = read_config_revision(client, verbose=verbose)
+        write_config_over_hid(client, payload, verbose=verbose)
+        perform_accept_configuration(client, verbose=verbose)
+        verify_config_revision_advanced(client, before=revision_before, verbose=verbose)
+        write_exit_mode = exit_write_session(client, verbose=verbose)
+    finally:
+        client.close()
+
+    cleanup_write_session(
+        port=port, code=code, write_cleanup_mode=write_cleanup_mode, exit_mode=write_exit_mode, verbose=verbose
+    )
+    return pull_verification_export(verify_output=verify_output, device=device, port=port, code=code, reset=reset)
