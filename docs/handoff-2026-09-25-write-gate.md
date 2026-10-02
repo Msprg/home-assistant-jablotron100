@@ -299,3 +299,91 @@ Choices, in order of cost:
    the handshake around the burst. The two captures give one save and one
    delete of a known record, which is a good start but not enough to
    generalise to every field.
+
+## Decoded (2026-10-03): one msgpack command, two transports
+
+A second pass over the same two captures, this time with a merged
+host-and-panel HID timeline (`hid_flow_tool.py`, added for this) and
+F-Link's own comm logs beside it. This corrects the "different record
+format" reading in "Confirmed" above.
+
+### The login rights select the path, not the code as such
+
+- F-Link's comm log for session A says `Code accepted with ARC rights`,
+  `LoggedPosition: 7`. For session B it says `Code accepted with master
+  rights`, `LoggedPosition: 100`. The March 2026 comm logs for the same
+  position-7 code say `Code accepted with service rights`, so that user's
+  authority was changed from Service to ARC between March and September.
+  The tooling and the status log still call it "the service code"; the
+  panel no longer does.
+- The panel states this in its login reply `80 1A 0C <25 bytes>`, which
+  every accepted login gets (not only service logins, as the March note
+  assumed). Byte 8 is `0x28 + rights` (`0x28` master, `0x29` service,
+  `0x2A` ARC); byte 10 is the logged position (`0x07`, `0x64`). Bytes 0-3
+  look like a section mask (`FF FF 0F 00` now, `FF FF 00 00` in March);
+  `3F 00 3F 00` at bytes 4-7 and `27` at byte 12 were constant across all
+  captures. The rest is zero.
+
+### Both transports carry the same bytes
+
+- **Storage transport (ARC and service rights).** F-Link talker
+  `JA107_IMPORT_CFG`: SCSI Write(10) of the IMPORT.CFG sector (LBA 2083,
+  msgpack XOR `0xFF` on the medium, `C1 C1 C1 C1` trailer) and the
+  directory sector (LBA 27), then `52 01 24`. The panel answers
+  `52 04 83 0B 24 <progress>` from `00` to `64` and finishes with
+  `52 04 83 01 24 01`.
+- **HID transport (master rights).** F-Link talker `JA100_WRITE_CFG`: one
+  SET_REPORT carrying TLV type `0x1D`: `1D <len> 09 00 <msgpack>`. The
+  panel answers `1D 03 44 00 00`. The save was
+  `1D 3B 09 00 81 07 81 60 8C 00 00 01 00 02 00 03 94 00 00 00 00 04 A6
+  "Test96" 05 A0 06 A0 07 92 81 00 A0 81 00 A0 08 00 09 00 0A AC
+  "handoff-test" 0B FF`, which msgpack-decodes to
+  `9, 0, {7: {96: {0: 0, 1: 0, 2: 0, 3: [0, 0, 0, 0], 4: "Test96", 5: "",
+  6: "", 7: [{0: ""}, {0: ""}], 8: 0, 9: 0, 10: "handoff-test", 11: -1}}}`.
+  The delete was `1D 07 09 00 81 07 81 60 C0` = `9, 0, {7: {96: nil}}`.
+- The msgpack after the `09 00` prefix is byte-identical to the XOR-decoded
+  IMPORT.CFG sector body of session A, for the save and for the delete. It
+  is the same command on a different transport. The "0 of 61 windows"
+  comparison in "Confirmed" failed only because it compared against the
+  XOR-encoded sector. `import_cfg_tool.py build-user-upsert` and
+  `build-user-delete` already produce exactly this payload.
+- The 118- and 128-report "bursts" were almost entirely F-Link's periphery
+  diagnostics loop (`94 02 nn 01` / `96 03 nn 09 00` / `52 02 28 nn` and
+  the `90` / `52 A8` replies), which runs while the Devices tab is open.
+  The write itself is one report each way.
+- The commit after either transport is the same: `52 01 0C`
+  (`JA100_ACCEPT_CFG`) answered by `52 03 83 01 02`; `80 01 14` answered
+  by `80 01 17`; `80 01 0F` answered by `80 02 1A 0A`; `80 01 12`;
+  `52 03 1A 01 00` answered by `52 07 1B 01 00 ...`. Both sessions were in
+  configuration mode after login (0x51 trailer `0x94`), and both wrote
+  from that state.
+
+### Still unknown
+
+- The `09 00` prefix in front of the msgpack: constant in both writes;
+  object class, sequence number or pass index are all plausible.
+- The reply `44 00 00`: identical for save and delete; there is no failure
+  sample yet, so the error shape is unknown.
+- Whether `1D` accepts other configuration roots (`{5: ...}` for
+  communications, as the storage path does) and whether a service- or
+  ARC-rights session may also use `1D`. The captures only show master
+  rights using it and ARC rights using storage.
+
+### What this changes for the API
+
+Choice 2 above is no longer a reverse-engineering project. A user write
+over HID is: log in with a master-rights code, reach configuration mode
+as the storage path already does, send `1D` + `09 00` + the
+`import_cfg_tool` payload, wait for `1D 03 44 00 00`, run the existing
+commit sequence, verify with a fresh export. No FAT mount, no block
+device, no `CAP_SYS_ADMIN`, and no second code in the API. The first live
+test should be the same slot-96 create and delete with the container's own
+code, raw over HID, with a fresh export before and after.
+
+Reproduce the decode offline (the capture folder stays private):
+
+```bash
+python3 hid_flow_tool.py .git/claude-scratch/flink-logincode/capture-code9146.pcapng -o /tmp/flow-9146.txt --histogram
+grep -n '1d:' /tmp/flow-9146.txt
+python3 -c "import msgpack;u=msgpack.Unpacker(strict_map_key=False);u.feed(bytes.fromhex('0900810781608c00000100020003940000000004a654657374393605a006a007928100a08100a0080009000aac68616e646f66662d746573740bff'));print(list(u))"
+```
