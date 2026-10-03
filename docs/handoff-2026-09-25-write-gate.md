@@ -388,8 +388,12 @@ format" reading in "Confirmed" above.
 - Tests: `tests/test_hid_config_write.py` rebuilds the captured save and
   delete packets byte for byte from the sector builders and scripts the
   captured replies through the whole session.
-- Not yet live-tested: the API container was still running the previous
-  image with the panel attached when this was written.
+- Live-proven 2026-10-03 01:54-01:58 local from the host CLI with the
+  container stopped: `add 96` and `delete 96` with the master-rights code,
+  `--write-transport auto` chose `hid`, the panel acked `1D 03 44 00 00`,
+  confirmed the accept, the configuration revision advanced by one per
+  write (8301 → 8302 → 8303), and the authoritative export showed the user
+  present, then absent. Details in the status log entry for 2026-10-03.
 
 ### What this changes for the API
 
