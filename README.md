@@ -130,12 +130,35 @@ section/PG control, and WebSocket subscriptions.
    the same way F-Link does. A code with *master* rights (the usual
    administrator code) writes the user record over HID; a code with *service*
    or *ARC* rights writes it through the panel's `IMPORT.CFG` volume, which
-   needs the FLEXI block device and a mount. The server logs in once before
-   each write to read the rights and picks the path (`JABLOTRON_PANEL_WRITE_TRANSPORT=auto`,
-   the default); set it to `hid` or `storage` to skip the probe and force one.
+   needs the FLEXI block device and a mount. With `JABLOTRON_PANEL_WRITE_TRANSPORT=auto`
+   (the default) the server reads the rights from the reply to its own
+   status-session login, so it no longer logs in a second time before each
+   write; set it to `hid` or `storage` to force one path.
+   HID user writes and catalog reads run inside the server's persistent
+   status session, so motion and other device-state changes keep publishing
+   while they run. The session reconnects after every failed write and after
+   a catalog read that leaves the panel in configuration mode, and before a
+   write whose rights are not on record (for example after an arm, disarm or
+   PG control with another code). Each reconnect leaves a short gap of about
+   1 to 1.5 s, the re-login, during which an edge can be missed until the
+   next status poll reconciles it.
    `JABLOTRON_PANEL_WRITE_AUTH_CODE` is optional: when set, user writes log in
    with it instead of `JABLOTRON_PANEL_AUTH_CODE`, and every other session keeps
-   using `JABLOTRON_PANEL_AUTH_CODE`. A write the panel refuses answers `409`.
+   using `JABLOTRON_PANEL_AUTH_CODE`. Setting it to a code different from
+   `JABLOTRON_PANEL_AUTH_CODE` forces the old separate-client path for writes:
+   the status session is closed, a separate login reads the rights and writes,
+   and device-state streaming pauses until the next poll logs in again.
+   A write the panel refuses answers `409`.
+   Before a write the server validates the record against the user table it
+   last read. `JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS` (default 60)
+   is how old that table may be, counted from when its pull started; older
+   than that, or `0`, and the write pulls the table first. A failed write
+   marks the table as possibly behind the panel, so the next write pulls
+   whatever its age. Each write is followed by one catalog read, which also
+   answers the lookup the API returns.
+   `JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS` (default `true`) can be set to
+   `false` to roll back to the previous behaviour: writes and catalog reads
+   close the status session and use separate logins.
    Records longer than one 64-byte HID report go out in the panel's chunk
    framing, as F-Link sends them; the size limit per write is 1024 bytes.
 

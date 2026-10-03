@@ -600,12 +600,15 @@ def test_accept_reports_whether_the_panel_left_configuration_mode(monkeypatch) -
 class FakeSession:
     """The status session as write_sector_to_panel sees it."""
 
-    def __init__(self) -> None:
+    def __init__(self, rights=None) -> None:
         self.writes: list[tuple[bytes, str | None]] = []
         self.closes = 0
+        self.rights = rights
+        self.rights_requests: list[str] = []
 
     def login_rights_for_code(self, code: str):
-        return None
+        self.rights_requests.append(code)
+        return self.rights
 
     def write_configuration(self, payload: bytes, *, code: str | None = None) -> int | None:
         self.writes.append((payload, code))
@@ -672,7 +675,7 @@ def test_storage_transport_closes_the_session_and_skips_the_verification_export(
     assert len(staged) == 1 and staged[0]["verify_output"] is None
 
 
-def test_auto_transport_closes_the_session_before_the_probe_then_writes_in_session(monkeypatch, tmp_path: Path) -> None:
+def test_write_sector_to_panel_probes_when_the_session_has_no_rights(monkeypatch, tmp_path: Path) -> None:
     """Without rights from the session the probe logs in with its own client,
     so the session is closed first; a master result still writes in-session
     (the session logs in again on first use)."""
@@ -686,6 +689,7 @@ def test_auto_transport_closes_the_session_before_the_probe_then_writes_in_sessi
     user_manager.write_sector_to_panel(_config(tmp_path), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session)
 
     assert order == ["probe:1"], "the session was closed before the probe logged in"
+    assert session.rights_requests == ["9146"]
     assert session.writes == [(HID_DELETE_PACKET[4:], "9146")]
 
 
@@ -696,3 +700,89 @@ def test_write_sector_to_panel_without_a_session_keeps_the_separate_client_path(
     user_manager.write_sector_to_panel(_config(tmp_path, write_transport="hid"), sector_path=_delete_sector(tmp_path), verify_prefix="t")
 
     assert len(sent) == 1 and sent[0]["verify_output"] is None
+
+
+# ------------------------------------------- rights from the status session
+
+
+def test_auto_transport_uses_the_session_rights_without_probing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: pytest.fail("probed"))
+
+    assert user_manager.select_write_transport(_config(tmp_path), session_rights=tools.LoginRights(0x28, 100)) == "hid"
+    assert user_manager.select_write_transport(_config(tmp_path), session_rights=tools.LoginRights(0x2A, 7)) == "storage"
+    # The same write code configured explicitly still counts as the session code.
+    assert (
+        user_manager.select_write_transport(
+            _config(tmp_path, write_auth_code="9146"), session_rights=tools.LoginRights(0x28, 100)
+        )
+        == "hid"
+    )
+
+
+def test_auto_transport_ignores_session_rights_when_the_write_code_differs(monkeypatch, tmp_path: Path) -> None:
+    probes: list = []
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: probes.append(kw["code"]) or tools.LoginRights(0x2A, 7))
+
+    chosen = user_manager.select_write_transport(
+        _config(tmp_path, write_auth_code="1812"), session_rights=tools.LoginRights(0x28, 100)
+    )
+
+    assert chosen == "storage", "the probe's answer for the write code decides, not the session's rights"
+    assert probes == ["1812"]
+
+
+def test_explicit_transports_ignore_session_rights(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: pytest.fail("probed"))
+    assert (
+        user_manager.select_write_transport(
+            _config(tmp_path, write_transport="storage"), session_rights=tools.LoginRights(0x28, 100)
+        )
+        == "storage"
+    )
+
+
+def test_write_sector_to_panel_auto_writes_in_session_for_master_rights(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: pytest.fail("probed"))
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("separate client used"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
+    session = FakeSession(rights=tools.LoginRights(0x28, 100))
+
+    user_manager.write_sector_to_panel(_config(tmp_path), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session)
+
+    assert session.rights_requests == ["9146"]
+    assert session.writes == [(HID_DELETE_PACKET[4:], "9146")]
+    assert session.closes == 0
+
+
+def test_write_sector_to_panel_auto_closes_the_session_for_arc_rights(monkeypatch, tmp_path: Path) -> None:
+    order: list[str] = []
+    session = FakeSession(rights=tools.LoginRights(0x2A, 7))
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: pytest.fail("probed"))
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("hid path used"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: order.append((f"stage:{session.closes}", kw)))
+
+    user_manager.write_sector_to_panel(_config(tmp_path), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session)
+
+    assert session.writes == []
+    assert session.closes == 1
+    assert [step for step, _ in order] == ["stage:1"], "the session was closed before the storage write logged in"
+    assert order[0][1]["verify_output"] is None
+    assert order[0][1]["code"] == "9146"
+
+
+def test_write_sector_to_panel_does_not_ask_the_session_when_the_write_code_differs(monkeypatch, tmp_path: Path) -> None:
+    order: list[str] = []
+    session = FakeSession(rights=tools.LoginRights(0x28, 100))
+    monkeypatch.setattr(
+        user_manager, "probe_login_rights", lambda **kw: order.append(f"probe:{session.closes}:{kw['code']}") or tools.LoginRights(0x28, 100)
+    )
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: order.append(f"hid:{kw['code']}"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
+
+    user_manager.write_sector_to_panel(
+        _config(tmp_path, write_auth_code="1812"), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session
+    )
+
+    assert session.rights_requests == [], "the session is logged in with another code"
+    assert order == ["probe:1:1812", "hid:1812"]
+    assert session.writes == []

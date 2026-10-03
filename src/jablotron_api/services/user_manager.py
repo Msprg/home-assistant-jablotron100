@@ -68,9 +68,11 @@ class UserManagerConfig:
     # sector in IMPORT.CFG (needs the block device and a service- or
     # ARC-rights login); "hid" sends the same msgpack as a 0x1D HID packet
     # (what F-Link does for a master-rights login; no block device for the
-    # write). "auto" does what F-Link does: logs in once to read the rights
-    # the panel grants the write code, then uses hid for master rights and
-    # storage for service or ARC rights.
+    # write). "auto" does what F-Link does: reads the rights the panel
+    # grants the write code from its login reply, then uses hid for master
+    # rights and storage for service or ARC rights. In the server the reply
+    # comes from the status session's own login; a separate probe login runs
+    # only when the write code differs or the session reported nothing.
     write_transport: str = "auto"
 
 
@@ -103,12 +105,27 @@ def resolve_write_transport(config: UserManagerConfig) -> str:
     return transport
 
 
-def select_write_transport(config: UserManagerConfig) -> str:
-    """Pick hid or storage for this write, probing the panel when configured "auto"."""
+def select_write_transport(config: UserManagerConfig, *, session_rights: LoginRights | None = None) -> str:
+    """Pick hid or storage for this write when configured "auto".
+
+    ``session_rights`` are the rights the status session's own login reply
+    reported for the write code; they decide without a second login, but
+    only when the write code is the session code. Otherwise the panel is
+    probed with a separate login, as before.
+    """
 
     transport = resolve_write_transport(config)
     if transport != "auto":
         return transport
+    if session_rights is not None and session_code_matches(config):
+        chosen = "hid" if session_rights.is_master else "storage"
+        LOGGER.info(
+            "Status session is logged in with %s rights (position %d); using the %s transport.",
+            session_rights.rights,
+            session_rights.position,
+            chosen,
+        )
+        return chosen
     rights = probe_login_rights(
         port=config.port,
         code=config.write_auth_code or config.auth_code,
@@ -150,7 +167,11 @@ def write_sector_to_panel(
 
     With a status ``session`` and a write code equal to the session code, the
     HID transport runs inside that session (device-state streaming keeps
-    publishing). Every separate-client path closes the session first: the
+    publishing). With the "auto" transport the rights come from the session's
+    own login reply for the write code, so no second login runs; only when
+    the session cannot report them (or the write code differs) is the
+    session closed and the panel probed. Every separate-client path closes
+    the session first: the
     probe and the standalone write sessions need the bus to themselves, and
     the runtime's next poll reopens the session. No verification export runs
     in the server path; the runtime's post-write catalog refresh is the
@@ -161,14 +182,14 @@ def write_sector_to_panel(
     in_session_allowed = session is not None and session_code_matches(config)
     transport = resolve_write_transport(config)
     if transport == "auto":
-        # The rights come from a separate probe login for now; the session's
-        # own login reply takes over once the session reports it.
-        rights = None
+        # The session's own login reply names the rights; the separate probe
+        # login only runs when the session cannot answer for this code.
+        rights = session.login_rights_for_code(code) if in_session_allowed else None
         if rights is None and session is not None:
             # The probe logs in with its own client; two sessions on the
             # device split the replies.
             session.close()
-        transport = select_write_transport(config)
+        transport = select_write_transport(config, session_rights=rights)
     if transport == "hid" and in_session_allowed:
         LOGGER.info("User write %s goes over HID inside the status session.", verify_prefix)
         session.write_configuration(sector_payload_bytes(sector_path), code=code)
@@ -206,9 +227,11 @@ def write_sector_to_panel(
 class UserWritePreflight:
     """The panel state a user write is validated against.
 
-    Built by the runtime from a *fresh* read of the panel's user table,
-    taken under the panel lock immediately before the write. Passing a
-    cached view here would decide against a table that no longer exists.
+    Built by the runtime from the panel's user table as read under the
+    panel lock: a fresh pull, or the cached export while its pull started
+    within ``write_preflight_max_age_seconds`` and no write has dirtied it
+    (the runtime's guard enforces this). Any other cached view would decide
+    against a table the panel may no longer hold.
     """
 
     existing: tuple[UserTableEntry, ...] = ()

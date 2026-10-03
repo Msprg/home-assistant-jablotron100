@@ -6,8 +6,9 @@ device-state parser (motion keeps publishing while the write holds the bus),
 and that the session's channel ends every write in a known state: kept and
 re-armed after a fully confirmed write, reset (graceful exit + re-login) on
 every failure path and whenever the panel did not acknowledge leaving
-configuration mode. No test opens hardware: the USB client, the port lookup
-and the login helpers are replaced.
+configuration mode. The export trigger and the login-rights lookup the
+``auto`` transport relies on run through the same session. No test opens
+hardware: the USB client, the port lookup and the login helpers are replaced.
 """
 
 from __future__ import annotations
@@ -27,17 +28,22 @@ from jablotron_api.protocol.legacy import (
     ConfigWriteError,
     ExportRefreshIncomplete,
     PersistentSnapshotSession,
+    WrongCodeError,
     _SessionTeeClient,
 )
+from jablotron_api.services import user_manager
 from jablotron_usb_debug import Jablotron, JablotronUSBStreamError, build_logon_info_reports, perform_sections_query
 from test_hid_config_write import (
     ACCEPT_CONFIRMED,
     CONFIG_ESCAPED,
     HID_ACK,
     HID_DELETE_PACKET,
+    LOGIN_MASTER_POSITION_100,
     REVISION_0X204F,
     REVISION_0X2050,
     _clock,
+    _config,
+    _delete_sector,
 )
 
 # Panel replies.
@@ -76,13 +82,16 @@ SECTIONS_CONFIG_ACTIVE = b"\x51\x02" + bytes(2) + bytes([tools.CONFIGURATION_SEC
 class ScriptedClient:
     """Answers reads from a positional script and, optionally, queues a reply
     batch when a given packet or raw report goes out. Records everything sent;
-    raw reports arrive through ``_write`` and are stored without padding."""
+    raw reports arrive through ``_write`` and are stored without padding.
+    ``reads_at_send[i]`` is the read count when ``sent[i]`` went out, so a test
+    can tell whether the channel was polled between two packets."""
 
     def __init__(self, reads=None, *, replies=None) -> None:
         self.reads = list(reads or [])
         self.replies = {key: list(batches) for key, batches in (replies or {}).items()}
         self.sent: list[bytes] = []
         self.read_calls = 0
+        self.reads_at_send: list[int] = []
         self.closed = False
 
     def read_packets(self, *, timeout=None):
@@ -101,6 +110,7 @@ class ScriptedClient:
 
     def send_packet(self, packet: bytes) -> None:
         self.sent.append(packet)
+        self.reads_at_send.append(self.read_calls)
         self._queue_reply(packet)
 
     def send_packets(self, packets) -> None:
@@ -110,6 +120,7 @@ class ScriptedClient:
     def _write(self, report: bytes) -> None:
         stripped = report.rstrip(b"\x00")
         self.sent.append(stripped)
+        self.reads_at_send.append(self.read_calls)
         self._queue_reply(stripped)
 
     def close(self) -> None:
@@ -795,6 +806,174 @@ def test_finish_export_leaves_the_retry_to_the_next_poll_when_the_reopen_fails(m
     assert h.session._client is None
     assert h.session._reopen_failures == 1, "the failed reopen feeds the normal backoff"
     assert any("could not be reopened" in record.message for record in caplog.records)
+
+
+# ------------------------------------------------- login rights (Phase 4)
+
+
+AUTH_END = Jablotron.create_packet_ui_control(b"\x01")
+
+
+def test_login_rights_are_captured_from_the_login_drain(monkeypatch) -> None:
+    client = ScriptedClient([[LOGIN_MASTER_POSITION_100], []])
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client])
+    h.session._client = None
+    h.session._authorized_code = None
+
+    assert h.session.login_rights_for_code("1812") == tools.LoginRights(0x28, 100)
+
+    assert h.constructed == [client]
+    assert h.logins == [(client, "1812", True)]
+    assert client.sent == [ENABLE_DEVICE_STATES], "no re-authorisation, no channel reset"
+
+    # Asked again on the same channel, the captured reply answers without any I/O.
+    reads_before = client.read_calls
+    assert h.session.login_rights_for_code("1812") == tools.LoginRights(0x28, 100)
+    assert client.read_calls == reads_before
+    assert client.sent == [ENABLE_DEVICE_STATES]
+
+
+def test_login_rights_capture_also_works_from_the_stream_loop_read(monkeypatch) -> None:
+    client = ScriptedClient([[LOGIN_MASTER_POSITION_100]])
+    h = _harness(monkeypatch, client)
+    waits = {"n": 0}
+
+    def fake_wait(timeout):
+        waits["n"] += 1
+        return waits["n"] > 1  # one loop body, then exit
+
+    monkeypatch.setattr(h.session._stop_event, "wait", fake_wait)
+    h.session._stream_loop()
+
+    assert h.session._login_rights is not None
+    assert h.session._login_rights.position == 100
+    assert h.session._login_rights_code == "1812"
+
+
+def test_login_rights_are_reset_when_another_code_is_authorised(monkeypatch) -> None:
+    client = ScriptedClient()
+    client2 = ScriptedClient([[LOGIN_MASTER_POSITION_100], []])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(legacy, "_await_login_success", lambda tee: None)
+    h.session._login_rights = tools.LoginRights(0x28, 100)
+    h.session._login_rights_code = "1812"
+
+    # A control operation authorises another code on the same channel.
+    with h.session._io_lock:
+        h.session._ensure_authorized_code_locked(client, "4458")
+    assert h.session._login_rights is None
+    assert h.session._login_rights_code is None
+    sent_before = len(client.sent)
+
+    # Nothing answers the re-authorisation within the wait, so the session
+    # falls back to one fresh login, whose drain carries the rights.
+    monkeypatch.setattr(legacy.time, "monotonic", _clock(step=0.5))
+    assert h.session.login_rights_for_code("1812") == tools.LoginRights(0x28, 100)
+
+    assert client.sent[sent_before:] == [
+        AUTH_END,
+        Jablotron.create_packet_authorisation_code("1812"),
+        *EXIT_SEQUENCE,
+    ]
+    # The graceful exit drains the channel too, so the read count alone cannot
+    # show the wait. Count only the reads made between the re-authorisation and
+    # the first exit packet: the login-success wait is stubbed out, so these
+    # come from the rights wait alone.
+    auth_index = len(client.sent) - 1 - client.sent[::-1].index(Jablotron.create_packet_authorisation_code("1812"))
+    exit_index = client.sent.index(EXIT_SEQUENCE[0])
+    assert client.reads_at_send[exit_index] > client.reads_at_send[auth_index], (
+        "the reply window was polled before the reset"
+    )
+    assert client.closed
+    assert h.logins == [(client2, "1812", True)]
+    assert h.session._client is client2
+
+
+def test_login_rights_for_code_returns_none_when_the_panel_never_reports_them(monkeypatch) -> None:
+    client = ScriptedClient()
+    client2 = ScriptedClient()
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client, client2])
+    h.session._client = None
+    h.session._authorized_code = None
+    monkeypatch.setattr(legacy.time, "monotonic", _clock(step=0.5))
+
+    assert h.session.login_rights_for_code("1812") is None
+
+    assert h.constructed == [client, client2]
+    assert client.sent == [ENABLE_DEVICE_STATES, *EXIT_SEQUENCE], "exactly one channel reset"
+    assert EXIT_SEQUENCE[0] not in client2.sent
+    assert client2.read_calls >= 1, "the fresh login's channel was polled for the reply too"
+    assert h.session._client is client2
+
+
+def test_login_rights_for_code_wraps_a_wrong_code_as_a_config_error(monkeypatch) -> None:
+    client = ScriptedClient()
+    h = _harness(monkeypatch, client)
+    h.session._authorized_code = "4458"
+
+    def refuse(tee):
+        raise WrongCodeError("Wrong code.")
+
+    monkeypatch.setattr(legacy, "_await_login_success", refuse)
+
+    with pytest.raises(ConfigWriteError, match="refused the write code"):
+        h.session.login_rights_for_code("1812")
+
+    assert h.session._client is None
+    assert h.constructed == []
+
+
+def test_login_rights_for_code_wraps_a_dead_link_as_a_config_error(monkeypatch) -> None:
+    h = _harness(monkeypatch, ScriptedClient())
+    h.session._client = None
+    h.session._authorized_code = None
+    h.session._reopen_failures = 1
+    h.session._next_reopen_allowed_at = legacy.time.monotonic() + 60.0
+
+    with pytest.raises(ConfigWriteError, match="USB link failed while reading login rights"):
+        h.session.login_rights_for_code("1812")
+
+    assert h.session._client is None
+    assert h.constructed == []
+
+
+def test_an_auto_write_in_session_logs_in_once_and_never_probes(monkeypatch, tmp_path) -> None:
+    """Phase 4 acceptance: with the auto transport the rights come from the
+    session's own login reply, so the write follows that one login directly
+    (80 01 0F first, no re-authorisation, no separate probe client)."""
+
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: pytest.fail("probed"))
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("separate client used"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
+    client = ScriptedClient([[LOGIN_MASTER_POSITION_100], []], replies=_success_replies())
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client])
+    h.session._client = None
+    h.session._authorized_code = None
+
+    user_manager.write_sector_to_panel(
+        _config(tmp_path, auth_code="1812"),
+        sector_path=_delete_sector(tmp_path),
+        verify_prefix="t",
+        session=h.session,
+    )
+
+    assert h.constructed == [client]
+    assert h.logins == [(client, "1812", True)]
+    # The login's own 0x13 re-arm, then straight into the write.
+    assert client.sent == [
+        ENABLE_DEVICE_STATES,
+        R_80010F,
+        R_80010F,
+        REVISION_QUERY,
+        HID_DELETE_PACKET,
+        R_52010C,
+        R_800114,
+        REVISION_QUERY,
+        ENABLE_DEVICE_STATES,
+    ]
+    assert AUTH_END not in client.sent
+    assert Jablotron.create_packet_authorisation_code("1812") not in client.sent
+    assert h.session._client is client
 
 
 # ------------------------------------------------------------- runtime glue

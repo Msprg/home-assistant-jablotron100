@@ -21,6 +21,12 @@ services:
       # write code: master rights write over HID, service/ARC rights through
       # IMPORT.CFG (which needs the block device below and a mount).
       JABLOTRON_PANEL_WRITE_TRANSPORT: "${JABLOTRON_PANEL_WRITE_TRANSPORT:-auto}"
+      # HID writes and catalog reads run inside the status session; "false"
+      # rolls back to separate logins.
+      JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS: "${JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS:-true}"
+      # Max age (s, from pull start) of the cached user table a write may be
+      # validated against; 0 = always pull before a write.
+      JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS: "${JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS:-60}"
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-auto}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-auto}"
       JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-auto}"

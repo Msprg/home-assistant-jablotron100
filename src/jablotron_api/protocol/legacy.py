@@ -676,10 +676,10 @@ class PersistentSnapshotSession:
                 raise
 
         # Cooperative diagnostics: one device per lock acquisition, yielding the
-        # bus (sleep off-lock) between devices so the stream reader can run —
-        # read pushed motion, age out dwell-offs, and re-solicit the OFF bitmap.
-        # This caps real-time latency during a sweep at one device's diagnostics
-        # window (~2-3s) instead of the whole ~38s sweep.
+        # bus (sleep off-lock) between devices so the stream reader can run:
+        # read pushed motion and age out dwell-offs. This caps real-time
+        # latency during a sweep at one device's diagnostics window (~2-3s)
+        # instead of the whole ~38s sweep.
         for device_id in job.diagnostic_numbers:
             time.sleep(STREAM_LOOP_TICK_SECONDS)
             with self._io_lock:
@@ -1040,6 +1040,53 @@ class PersistentSnapshotSession:
     def sections_mode(self) -> int | None:
         """The last sections-mode byte seen on a 0x51 packet (observability)."""
         return self._last_sections_mode
+
+    def login_rights_for_code(self, code: str, *, timeout: float = LOGIN_RIGHTS_WAIT_SECONDS) -> LoginRights | None:
+        """The rights the panel reported (80 1A 0C) for ``code`` on this session.
+
+        Opens and logs in if needed (the login drain captures the reply) and
+        re-authorises if a control operation left another code active. In the
+        common case, the write code equal to the session code and the session
+        already logged in, the rights were captured by the login drain and this
+        returns without any I/O.
+
+        If no reply for ``code`` has been captured, read for ``timeout``, then
+        fall back to one channel reset with reopen: a fresh login is the proven
+        point where 80 1A 0C arrives (whether an AUTH_END + code
+        re-authorisation repeats it is uncaptured). Returns None when the panel
+        still reported nothing; the caller then probes as before. Raises
+        ConfigWriteError on a refused code or a dead link, with the session
+        closed.
+        """
+        with self._io_lock:
+            try:
+                client = self._ensure_client_locked(auth_code=code)
+                self._ensure_authorized_code_locked(client, code)
+                if self._login_rights_code != code:
+                    self._await_login_rights_locked(client, code, timeout)
+                if self._login_rights_code != code:
+                    LOGGER.info("No login rights reported for the write code on this channel; logging in afresh.")
+                    # A fresh login; its drain captures the 80 1A 0C reply.
+                    self._bounce_client_locked(reopen=True, code=code)
+                    if self._client is not None and self._login_rights_code != code:
+                        self._await_login_rights_locked(self._client, code, timeout)
+            except WrongCodeError as exc:
+                self._close_client_locked()
+                raise ConfigWriteError(f"The panel refused the write code: {exc}") from exc
+            except JablotronUSBStreamError as exc:
+                self._close_client_locked()
+                self._redetect_serial_port_locked()
+                raise ConfigWriteError(f"USB link failed while reading login rights: {exc}") from exc
+            return self._login_rights if self._login_rights_code == code else None
+
+    def _await_login_rights_locked(self, client: JablotronUSBClient, code: str, timeout: float) -> None:
+        """Read through the tee until a login-rights reply tagged with ``code``
+        arrives or ``timeout`` runs out. Every packet read still reaches the
+        live device-state parser."""
+        tee = self._tee_client(client)
+        deadline = time.monotonic() + timeout
+        while self._login_rights_code != code and time.monotonic() < deadline:
+            list(tee.read_packets(timeout=0.1))
 
     def _ensure_client_locked(self, auth_code: str | None = None) -> JablotronUSBClient:
         if self._client is not None:

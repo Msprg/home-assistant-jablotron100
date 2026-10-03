@@ -252,3 +252,21 @@ arbitrary string.
   largest single-user record is bounded by the field limits, not by the
   transport. The new logon identity was accepted. The 1.5 s settle did not
   remove the `retrying (1/3)` warning (seen once per write, retry succeeds).
+
+## Superseded for the server path (2026-10-03, later)
+
+The framing, the record encoding and the CLI tools described above still
+hold. What changed is how the API server runs the write: it no longer opens a
+separate HID session through `apply_config_payload_over_hid`, and it no
+longer runs `pull_verification_export`. The same `jablotron_re_tools` step
+functions now run inside the server's persistent status session
+(`PersistentSnapshotSession.write_configuration`), so device-state streaming
+keeps publishing during the write. The post-write settle and the
+reload-complete retry moved to the one catalog refresh that follows each
+write, and the rights for the `auto` transport come from the status session's
+own login reply instead of a probe login. A confirmed write keeps the
+session's channel; every failure resets it. The SAVE 2 stall noted above is
+one of the reasons that decision is still to be proven live. Details, the
+open live checks and the rollback switch are in
+`docs/api-server-refactor-status.md`, entry "2026-10-03 (user writes and
+catalog reads inside the status session; motion keeps streaming)".
