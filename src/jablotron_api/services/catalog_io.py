@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -44,6 +45,8 @@ from jablotron_api.services.device_inference import (
     is_default_section_name,
     tail_default_cutoff,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 def user_to_model(record: UserRecord) -> UserModel:
@@ -354,28 +357,65 @@ class CatalogPullConfig:
     trigger_session: ExportTriggerSession | None = None
 
 
+class ExportReloadStalled(RuntimeError):
+    """The export refresh never reached the panel's reload-complete state,
+    after every attempt the caller allowed."""
+
+
+_RELOAD_STALL_MARKER = "reload-complete state"
+_RELOAD_RETRY_DELAY_SECONDS = 2.0
+
+
 def pull_catalog_snapshot(
     config: CatalogPullConfig,
     output_prefix: str,
     *,
     sleep: Callable[[float], None] | None = None,
+    settle_seconds: float = 0.0,
+    reload_retries: int = 1,
 ) -> ExportCatalogSnapshot:
     """Pull a fresh export-catalog snapshot from the live panel.
 
     Retries the pull once without reset if the first read came back fully empty,
     which has historically indicated a transient FAT16 read race.
+
+    After a write the caller passes ``settle_seconds`` (a pause before the
+    first export refresh) and ``reload_retries`` (how many attempts the first
+    pull gets when the refresh does not reach the reload-complete state; the
+    panel sometimes answers that way right after a write). The stall arrives
+    as ``SystemExit`` from the separate-client trigger or as a
+    ``RuntimeError`` from the in-session one; once the attempts are used up
+    it is raised as ``ExportReloadStalled``, never as ``SystemExit``.
     """
 
+    if settle_seconds > 0 and sleep is not None:
+        sleep(settle_seconds)
     output = default_export_output(output_prefix)
-    export_snapshot: ExportSnapshot = pull_live_export_snapshot(
-        output=output,
-        device=config.flexi_cfg_device,
-        port=config.port,
-        code=config.auth_code,
-        reset=config.reset,
-        cleanup_mode=config.read_cleanup_mode,
-        trigger_session=config.trigger_session,
-    )
+    attempts = max(1, reload_retries)
+    for attempt in range(1, attempts + 1):
+        try:
+            export_snapshot: ExportSnapshot = pull_live_export_snapshot(
+                output=output,
+                device=config.flexi_cfg_device,
+                port=config.port,
+                code=config.auth_code,
+                reset=config.reset,
+                cleanup_mode=config.read_cleanup_mode,
+                trigger_session=config.trigger_session,
+            )
+            break
+        except (SystemExit, RuntimeError) as exc:
+            if _RELOAD_STALL_MARKER not in str(exc):
+                raise
+            if attempt >= attempts:
+                raise ExportReloadStalled(str(exc)) from exc
+            LOGGER.warning(
+                "export after write did not reach the reload-complete state; retrying (%d/%d)",
+                attempt,
+                attempts,
+            )
+            if sleep is not None:
+                sleep(_RELOAD_RETRY_DELAY_SECONDS)
     catalog = extract_export_catalog(export_snapshot.path)
     if (
         config.reset

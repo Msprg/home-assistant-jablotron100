@@ -178,3 +178,107 @@ def test_the_empty_catalog_retry_pulls_on_the_same_session(monkeypatch, tmp_path
     assert captured[1]["reset"] is False
     assert captured[1]["output"] != captured[0]["output"]
     assert catalog.sections_by_id
+
+
+def _retry_config() -> CatalogPullConfig:
+    return CatalogPullConfig(
+        flexi_cfg_device="auto",
+        port="auto",
+        auth_code="1812",
+        reset=True,
+        read_cleanup_mode="auto",
+        trigger_session=object(),
+    )
+
+
+def _stalling_pull(monkeypatch, tmp_path, failures: list[BaseException]) -> list[dict]:
+    """pull_live_export_snapshot raises each of `failures` in turn, then
+    returns a snapshot whose catalog is not empty (no empty-catalog retry)."""
+
+    calls: list[dict] = []
+
+    def fake_pull_live_export_snapshot(**kwargs):
+        calls.append(kwargs)
+        if failures:
+            raise failures.pop(0)
+        return SimpleNamespace(path=tmp_path / "EXPORT.CFG.bin")
+
+    monkeypatch.setattr(catalog_io, "pull_live_export_snapshot", fake_pull_live_export_snapshot)
+    monkeypatch.setattr(
+        catalog_io,
+        "extract_export_catalog",
+        lambda path: SimpleNamespace(sections_by_id={1: object()}, pgs_by_id={}, objects_by_id={}, users=[]),
+    )
+    return calls
+
+
+STALL = "Export refresh did not reach the reload-complete state."
+
+
+def test_pull_catalog_snapshot_retries_a_stalled_post_write_export(monkeypatch, tmp_path) -> None:
+    sleeps: list[float] = []
+    calls = _stalling_pull(monkeypatch, tmp_path, [RuntimeError(STALL), RuntimeError(STALL)])
+
+    catalog = pull_catalog_snapshot(
+        _retry_config(), "test-prefix", sleep=sleeps.append, settle_seconds=1.5, reload_retries=3
+    )
+
+    assert catalog.sections_by_id
+    assert len(calls) == 3
+    assert sleeps == [1.5, 2.0, 2.0]
+
+
+def test_a_stalled_export_without_retries_is_a_runtime_error(monkeypatch, tmp_path) -> None:
+    sleeps: list[float] = []
+    calls = _stalling_pull(monkeypatch, tmp_path, [RuntimeError(STALL)])
+
+    with pytest.raises(RuntimeError, match="reload-complete state"):
+        pull_catalog_snapshot(
+            _retry_config(), "test-prefix", sleep=sleeps.append, settle_seconds=1.5, reload_retries=1
+        )
+
+    assert len(calls) == 1
+    assert sleeps == [1.5]
+
+
+def test_a_stalled_export_from_the_separate_client_never_escapes_as_system_exit(monkeypatch, tmp_path) -> None:
+    """The separate-client trigger reports the stall with SystemExit; out of
+    a worker thread that would stop the server, so the retry loop always
+    ends in a RuntimeError."""
+
+    sleeps: list[float] = []
+    calls = _stalling_pull(monkeypatch, tmp_path, [SystemExit(STALL) for _ in range(3)])
+
+    with pytest.raises(RuntimeError, match="reload-complete state") as excinfo:
+        pull_catalog_snapshot(
+            _retry_config(), "test-prefix", sleep=sleeps.append, settle_seconds=1.5, reload_retries=3
+        )
+
+    assert isinstance(excinfo.value, catalog_io.ExportReloadStalled)
+    assert len(calls) == 3
+    assert sleeps == [1.5, 2.0, 2.0]
+
+
+def test_other_pull_failures_are_not_retried(monkeypatch, tmp_path) -> None:
+    sleeps: list[float] = []
+    calls = _stalling_pull(monkeypatch, tmp_path, [RuntimeError("USB link failed before the export trigger")])
+
+    with pytest.raises(RuntimeError, match="USB link failed") as excinfo:
+        pull_catalog_snapshot(
+            _retry_config(), "test-prefix", sleep=sleeps.append, settle_seconds=1.5, reload_retries=3
+        )
+
+    assert not isinstance(excinfo.value, catalog_io.ExportReloadStalled)
+    assert len(calls) == 1
+    assert sleeps == [1.5]
+
+
+def test_an_ordinary_pull_neither_settles_nor_retries(monkeypatch, tmp_path) -> None:
+    sleeps: list[float] = []
+    calls = _stalling_pull(monkeypatch, tmp_path, [RuntimeError(STALL)])
+
+    with pytest.raises(RuntimeError, match="reload-complete state"):
+        pull_catalog_snapshot(_retry_config(), "test-prefix", sleep=sleeps.append)
+
+    assert len(calls) == 1
+    assert sleeps == []

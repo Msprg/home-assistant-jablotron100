@@ -26,6 +26,7 @@ from typing import Awaitable, Callable
 
 from jablotron_re_tools import (
     DEFAULT_IMPORT_PATH,
+    POST_WRITE_EXPORT_SETTLE_SECONDS,
     ExportCatalogSnapshot,
     cleanup_read_session,
 )
@@ -45,6 +46,7 @@ from jablotron_api.domain.models import (
 from jablotron_api.protocol.legacy import PanelConfigError, PersistentSnapshotSession
 from jablotron_api.services.catalog_io import (
     CatalogPullConfig,
+    ExportReloadStalled,
     apply_catalog_names as _apply_catalog_names,
     catalog_to_model as _catalog_to_model,
     ensure_id_in_range,
@@ -99,14 +101,16 @@ async def _run_panel_io(func, /, *args, label: str, failure_hint: str | None = N
     """Run a blocking panel operation in a worker thread and report its
     failure as a ``RuntimeError`` (409) prefixed with ``label``.
 
-    Two failure shapes are converted: ``SystemExit`` from the standalone
-    tooling (``jablotron_re_tools``) and ``PanelConfigError`` from the
-    operations that run inside the status session.
+    Three failure shapes are converted: ``SystemExit`` from the standalone
+    tooling (``jablotron_re_tools``), ``PanelConfigError`` from the
+    operations that run inside the status session, and
+    ``ExportReloadStalled`` from a catalog pull whose export refresh never
+    completed (already a ``RuntimeError``; only the label is added).
     """
 
     try:
         return await asyncio.to_thread(func, *args, **kwargs)
-    except (SystemExit, PanelConfigError) as exc:
+    except (SystemExit, PanelConfigError, ExportReloadStalled) as exc:
         message = f"{label}: {exc}"
         if failure_hint and "IMPORT.CFG staging failed" in message:
             message += failure_hint
@@ -164,6 +168,10 @@ class PanelRuntimeConfig:
     # inside the persistent status session; False closes the session and
     # uses a separate client, as before.
     in_session_config_ops: bool = True
+    # Mirrors ServerSettings.panel.write_preflight_max_age_seconds: a user
+    # write validates against the cached user table when its pull started at
+    # most this many seconds ago and no write has dirtied it; 0 = always pull.
+    write_preflight_max_age_seconds: float = 60.0
 
 
 class PanelRuntime:
@@ -176,9 +184,16 @@ class PanelRuntime:
         self._status: PanelStatusModel | None = None
         self._catalog: ExportCatalogModel | None = None
         # Raw snapshot behind `_catalog`, kept for the export endpoints that
-        # need fields the API model does not carry. Never handed to the
-        # user-write preflight: that must validate against its own fresh read.
+        # need fields the API model does not carry. The user-write preflight
+        # may validate against it only inside write_preflight_max_age_seconds
+        # (counted from the pull's start) and while `_catalog_dirty` is False.
         self._catalog_snapshot: ExportCatalogSnapshot | None = None
+        # A write may have changed the panel since the cached catalog was
+        # read: set when a write raised (it may still have reached the panel)
+        # or when the refresh after a confirmed write failed; cleared whenever
+        # a pull replaces the cache. While set, every finite-age read and the
+        # next write preflight pull the panel.
+        self._catalog_dirty: bool = False
         # Freshness bookkeeping for the demand-driven cache, in monotonic time
         # so a wall-clock jump cannot make a stale catalog look current.
         self._catalog_completed_monotonic: float | None = None
@@ -530,6 +545,7 @@ class PanelRuntime:
     #   0     -> require a pull that STARTED at or after this call arrived
     #   inf   -> any cached catalog will do, however old
     #   n > 0 -> cache is acceptable if it completed within n seconds
+    # A cache dirtied by a write (see `_catalog_dirty`) meets no finite age.
 
     def _resolved_max_age(self, max_age_seconds: float | None) -> float:
         if max_age_seconds is None:
@@ -541,6 +557,9 @@ class PanelRuntime:
             return False
         if max_age_seconds == math.inf:
             return True
+        if self._catalog_dirty:
+            # A write may have changed the panel after this cache was read.
+            return False
         if max_age_seconds <= 0:
             # A pull that began before this request arrived answers a question
             # about a panel state that predates the request. `board` reads with
@@ -584,42 +603,66 @@ class PanelRuntime:
             await asyncio.shield(task)
         return served_from_cache
 
+    async def _refresh_catalog_locked(
+        self, *, prefix: str, started_at: float | None = None, after_write: bool = False
+    ) -> ExportCatalogSnapshot:
+        """Pull the export and replace the cache; the caller holds self._lock.
+
+        ``after_write=True`` applies the post-write settle and the
+        reload-complete retry. Returns the new snapshot. Does not emit:
+        callers emit "catalog" after releasing the lock.
+        """
+
+        started_at = time.monotonic() if started_at is None else started_at
+        snapshot = await self._pull_catalog_snapshot_locked(prefix, after_write=after_write)
+        self._catalog_snapshot = snapshot
+        self._catalog = _catalog_to_model(
+            snapshot,
+            as_of=utc_now(),
+            source="panel",
+            # Every catalog read triggers the F-Link export refresh
+            # sequence, which is the only thing that materialises
+            # EXPORT.CFG on the FlexiCFG volume.
+            trigger_used=True,
+        )
+        self._catalog_started_monotonic_for_cache = started_at
+        self._catalog_completed_monotonic = time.monotonic()
+        self._catalog_dirty = False
+        LOGGER.info(
+            "Panel catalog refreshed: sections=%s pgs=%s devices=%s users=%s "
+            "initial_setup_exact=%s took=%.1fs",
+            len(self._catalog.sections),
+            len(self._catalog.pgs),
+            len(self._catalog.devices),
+            len(self._catalog.users),
+            None if self._catalog.initial_setup is None else self._catalog.initial_setup.exact,
+            self._catalog_completed_monotonic - started_at,
+        )
+        if self._status_session is not None:
+            # configure_live_devices takes the session's I/O lock, which
+            # a worker may hold for tens of seconds now that the session
+            # stays alive through pulls; the event-loop thread never
+            # blocks on it (a cancelled to_thread leaves its worker
+            # running, the asyncio lock already released).
+            await asyncio.to_thread(self._configure_session_live_devices, self._status_session)
+        return snapshot
+
     async def _pull_catalog_into_cache(self, *, started_at: float, prefix: str) -> None:
         try:
             async with self._lock:
-                snapshot = await self._pull_catalog_snapshot_locked(prefix)
-                self._catalog_snapshot = snapshot
-                self._catalog = _catalog_to_model(
-                    snapshot,
-                    as_of=utc_now(),
-                    source="panel",
-                    # Every catalog read triggers the F-Link export refresh
-                    # sequence, which is the only thing that materialises
-                    # EXPORT.CFG on the FlexiCFG volume.
-                    trigger_used=True,
-                )
-                self._catalog_started_monotonic_for_cache = started_at
-                self._catalog_completed_monotonic = time.monotonic()
-                LOGGER.info(
-                    "Panel catalog refreshed: sections=%s pgs=%s devices=%s users=%s "
-                    "initial_setup_exact=%s took=%.1fs",
-                    len(self._catalog.sections),
-                    len(self._catalog.pgs),
-                    len(self._catalog.devices),
-                    len(self._catalog.users),
-                    None if self._catalog.initial_setup is None else self._catalog.initial_setup.exact,
-                    self._catalog_completed_monotonic - started_at,
-                )
-                if self._status_session is not None:
-                    # configure_live_devices takes the session's I/O lock, which
-                    # a worker may hold for tens of seconds now that the session
-                    # stays alive through pulls; the event-loop thread never
-                    # blocks on it (a cancelled to_thread leaves its worker
-                    # running, the asyncio lock already released).
-                    await asyncio.to_thread(self._configure_session_live_devices, self._status_session)
+                await self._refresh_catalog_locked(prefix=prefix, started_at=started_at)
             await self._emit("catalog", self._catalog.model_dump(mode="json"))
         finally:
             self._catalog_pull_task = None
+
+    def _catalog_age_seconds(self) -> float:
+        """Age of the cached panel state, counted from when its pull started
+        (EXPORT.CFG shows the table as it was at trigger time); inf when
+        there is no cached snapshot."""
+
+        if self._catalog_snapshot is None:
+            return math.inf
+        return time.monotonic() - self._catalog_started_monotonic_for_cache
 
     async def _catalog_model(
         self, *, max_age_seconds: float | None, prefix: str
@@ -729,27 +772,43 @@ class PanelRuntime:
             raise RuntimeError("Export catalog snapshot unavailable after a panel read.")
         return snapshot
 
-    async def _pull_catalog_snapshot_locked(self, output_prefix: str) -> ExportCatalogSnapshot:
+    async def _pull_catalog_snapshot_locked(
+        self, output_prefix: str, *, after_write: bool = False
+    ) -> ExportCatalogSnapshot:
         """Caller holds self._lock. In-session mode the export refresh runs
         inside the status session (which stays open, so motion keeps
         streaming); legacy mode closes it and uses a separate login + cleanup
         session as before. A SystemExit from the pull tooling or an
         ExportRefreshIncomplete from the session reaches the HTTP layer as a
-        RuntimeError (409) instead of stopping the server."""
+        RuntimeError (409) instead of stopping the server.
+
+        ``after_write=True`` lets the panel settle before the export refresh
+        and retries a refresh that never reaches the reload-complete state,
+        which is how the panel sometimes answers right after a write. Each
+        retry starts from a fresh login: the in-session trigger resets the
+        channel before it reports the stall."""
         session = await self._prepare_panel_config_op_locked()
         LOGGER.info(
-            "Pulling export catalog snapshot: prefix=%s reset=%s cleanup_mode=%s in_session=%s",
+            "Pulling export catalog snapshot: prefix=%s reset=%s cleanup_mode=%s in_session=%s after_write=%s",
             output_prefix,
             self._config.reset,
             self._config.read_cleanup_mode,
             session is not None,
+            after_write,
         )
+        retry_kwargs: dict[str, object] = {}
+        if after_write:
+            retry_kwargs = {
+                "settle_seconds": POST_WRITE_EXPORT_SETTLE_SECONDS,
+                "reload_retries": 3,
+            }
         catalog = await _run_panel_io(
             pull_catalog_snapshot,
             self._catalog_pull_config(session),
             output_prefix,
             sleep=time.sleep,
             label="Panel catalog read failed",
+            **retry_kwargs,
         )
         LOGGER.debug(
             "Export catalog snapshot ready: sections=%s pgs=%s devices=%s users=%s",
@@ -889,26 +948,37 @@ class PanelRuntime:
         user_id: int,
         *,
         include_current: bool,
+        served_from_cache: bool = False,
     ) -> UserWritePreflight:
-        """Bind a freshly read user table to the write about to happen.
+        """Bind a recently read user table to the write about to happen.
 
-        Read-then-decide: the rules are applied to the table as it is now,
-        read under the same lock that then performs the write, so the
-        decision cannot be made against a cached table that no longer
-        exists. The code format comes from the same read rather than from
-        the cached catalog.
+        The rules are applied to the table as the panel held it at most
+        ``write_preflight_max_age_seconds`` ago (default 60 s, counted from
+        when that pull started; 0 means always a fresh read under the write
+        lock). Every write runs under the same lock and ends with a catalog
+        refresh, so back-to-back writes through this server stay consistent;
+        any failed write marks the cache dirty, so the next preflight pulls.
+        The code format comes from the same table rather than from the API
+        model of the catalog.
         """
 
-        if snapshot is self._catalog_snapshot:
+        if served_from_cache:
             # Structural guard, not a style rule. The duplicate, code-format
             # and duress-adjacency rules only mean anything against the table
-            # the panel holds right now: a preflight that passes against a
-            # cached table can assign a code that is another user's silent-panic
-            # twin. If the catalog cache is ever wired in here, fail loudly.
-            raise RuntimeError(
-                "User-write preflight must validate against a fresh panel read, "
-                "not the cached catalog snapshot."
-            )
+            # the panel holds: a preflight that passes against a stale table
+            # can assign a code that is another user's silent-panic twin. A
+            # cached table is acceptable only while it is the current cache,
+            # inside the configured window and not dirtied by a write.
+            if (
+                snapshot is not self._catalog_snapshot
+                or self._catalog_dirty
+                or self._catalog_age_seconds() > self._config.write_preflight_max_age_seconds
+            ):
+                raise RuntimeError(
+                    "User-write preflight was handed a cached catalog older than the "
+                    "configured limit (or dirtied by a write); it must validate against "
+                    "a fresh panel read."
+                )
         return UserWritePreflight.from_records(
             snapshot.users,
             user_id=user_id,
@@ -932,39 +1002,122 @@ class PanelRuntime:
         await self._close_status_session_locked()
         return None
 
+    async def _preflight_snapshot_locked(
+        self, prefix: str
+    ) -> tuple[ExportCatalogSnapshot, bool]:
+        """The user table a write is validated against; the caller holds
+        self._lock.
+
+        The cached export when its pull started within
+        ``write_preflight_max_age_seconds`` and no write has dirtied it
+        (returns ``(snapshot, True)``), else a fresh pull that also replaces
+        the cache (returns ``(snapshot, False)``).
+        """
+
+        max_age = self._config.write_preflight_max_age_seconds
+        age = self._catalog_age_seconds()
+        if (
+            self._catalog_snapshot is not None
+            and not self._catalog_dirty
+            and max_age > 0
+            and age <= max_age
+        ):
+            LOGGER.info(
+                "User-write preflight uses the cached catalog (panel state %.0f s old, limit %.0f s).",
+                age,
+                max_age,
+            )
+            return self._catalog_snapshot, True
+        return await self._refresh_catalog_locked(prefix=prefix), False
+
+    async def _write_then_refresh_locked(
+        self, func, /, *args, failure_hint: str | None, refresh_prefix: str, what: str, **kwargs
+    ) -> None:
+        """Run the panel write, then the one post-write catalog refresh
+        (which also serves the lookup that follows); the caller holds
+        self._lock.
+
+        Any failure marks the cache dirty: a write that raised may still have
+        reached the panel (lost ack, missing accept reply, USB drop), and a
+        confirmed write whose refresh failed leaves the cache behind the
+        panel. The next preflight and every finite-age read then pull.
+        """
+
+        try:
+            await _run_panel_write(func, *args, failure_hint=failure_hint, **kwargs)
+        except BaseException:
+            self._catalog_dirty = True
+            raise
+        try:
+            await self._refresh_catalog_locked(prefix=refresh_prefix, after_write=True)
+        except BaseException as exc:
+            # A cancelled refresh leaves the cache just as far behind the
+            # panel as a failed one; only real errors get the message.
+            self._catalog_dirty = True
+            if isinstance(exc, Exception):
+                raise RuntimeError(
+                    f"{what} was written but the catalog refresh failed: {exc}"
+                ) from exc
+            raise
+
+    async def _announce_preflight_catalog(self) -> None:
+        """Emit "catalog" for a preflight pull that replaced the cache when
+        the write then did not finish; the caller has released self._lock.
+
+        The pull already changed what get_catalog serves, so subscribers
+        should see it too. A listener error here is logged, not raised, so it
+        cannot hide the error that ended the write.
+        """
+
+        try:
+            await self._emit("catalog", self._catalog.model_dump(mode="json"))
+        except Exception:
+            LOGGER.warning("Could not announce the catalog read by a failed user-write preflight.", exc_info=True)
+
     async def add_user(self, payload: UserCreateModel, *, replace: bool = False) -> UserModel:
         self._ensure_usable_user_id(payload.id)
-        async with self._lock:
-            snapshot = await self._pull_catalog_snapshot_locked(
-                f"api-preflight-add-user{payload.id}"
-            )
-            # The panel's import is an upsert, so a create aimed at an
-            # occupied slot would silently overwrite its user. Decided on the
-            # table just read, never on the cache: a stale "occupied" would
-            # refuse a slot F-Link has since freed, and a stale "free" is the
-            # overwrite this check exists to prevent.
-            occupant = next(
-                (record for record in snapshot.users if record.user_id == payload.id), None
-            )
-            if occupant is not None and (occupant.name or "").strip() and not replace:
-                raise UserSlotOccupied(payload.id)
-            preflight = self._user_write_preflight(
-                snapshot, payload.id, include_current=False
-            )
-            session = await self._prepare_panel_config_op_locked()
-            await _run_panel_write(
-                _apply_upsert_user,
-                self._user_manager_config(),
-                failure_hint=self._write_failure_hint(),
-                user_id=payload.id,
-                payload=payload,
-                current=None,
-                preflight=preflight,
-                verify_prefix=f"api-add-user{payload.id}",
-                session=session,
-            )
-        await self.refresh_catalog()
-        user = await self.get_user(payload.id)
+        preflight_pulled = False
+        try:
+            async with self._lock:
+                snapshot, from_cache = await self._preflight_snapshot_locked(
+                    f"api-preflight-add-user{payload.id}"
+                )
+                preflight_pulled = not from_cache
+                # The panel's import is an upsert, so a create aimed at an
+                # occupied slot would silently overwrite its user. Decided on the
+                # preflight table (fresh, or a clean cache inside the write
+                # window): a stale "occupied" would refuse a slot F-Link has since
+                # freed, and a stale "free" is the overwrite this check exists to
+                # prevent.
+                occupant = next(
+                    (record for record in snapshot.users if record.user_id == payload.id), None
+                )
+                if occupant is not None and (occupant.name or "").strip() and not replace:
+                    raise UserSlotOccupied(payload.id)
+                preflight = self._user_write_preflight(
+                    snapshot, payload.id, include_current=False, served_from_cache=from_cache
+                )
+                session = await self._prepare_panel_config_op_locked()
+                await self._write_then_refresh_locked(
+                    _apply_upsert_user,
+                    self._user_manager_config(),
+                    failure_hint=self._write_failure_hint(),
+                    refresh_prefix=f"api-after-add-user{payload.id}",
+                    what=f"User {payload.id}",
+                    user_id=payload.id,
+                    payload=payload,
+                    current=None,
+                    preflight=preflight,
+                    verify_prefix=f"api-add-user{payload.id}",
+                    session=session,
+                )
+        except BaseException:
+            if preflight_pulled:
+                await self._announce_preflight_catalog()
+            raise
+        await self._emit("catalog", self._catalog.model_dump(mode="json"))
+        # Served by the refresh the write just made.
+        user = await self.get_user(payload.id, max_age_seconds=math.inf)
         if user is None:
             raise RuntimeError(f"User {payload.id} was not present after add.")
         self._verify_added_user(user, payload)
@@ -973,41 +1126,59 @@ class PanelRuntime:
 
     async def edit_user(self, user_id: int, payload: UserPatchModel) -> UserModel:
         self._ensure_usable_user_id(user_id)
-        # Any cached view will do for the existence check: the fresh read
-        # taken under the lock below is the authority for both the preflight
-        # and the carried-over field values, so making this lookup pull too
-        # would just spend a second ~16 s panel session on the same answer.
-        current = await self.get_user(user_id, max_age_seconds=math.inf)
-        if current is None:
+        # A cheap early-out on any cached view. It is never the source of the
+        # written values: the preflight table taken under the lock below (a
+        # fresh read, or a clean cache inside the write window) decides
+        # whether the user still exists and supplies every carried-over field,
+        # so making this lookup pull too would just spend a second ~16 s
+        # panel session on the same answer.
+        if await self.get_user(user_id, max_age_seconds=math.inf) is None:
             raise RuntimeError(f"User {user_id} not found.")
-        current_record = user_to_record(current)
-        async with self._lock:
-            snapshot = await self._pull_catalog_snapshot_locked(
-                f"api-preflight-edit-user{user_id}"
-            )
-            preflight = self._user_write_preflight(snapshot, user_id, include_current=True)
-            fresh_record = next(
-                (record for record in snapshot.users if record.user_id == user_id), None
-            )
-            if fresh_record is not None:
-                # Carry unsupplied fields over from the table we just read,
-                # not from the poller's cache, so an edit cannot silently
-                # rewrite a field with a value the panel has since changed.
+        preflight_pulled = False
+        try:
+            async with self._lock:
+                snapshot, from_cache = await self._preflight_snapshot_locked(
+                    f"api-preflight-edit-user{user_id}"
+                )
+                preflight_pulled = not from_cache
+                fresh_record = next(
+                    (record for record in snapshot.users if record.user_id == user_id), None
+                )
+                if fresh_record is None or not (fresh_record.name or "").strip():
+                    # The lookup above may come from a stale or dirtied cache
+                    # (a delete whose reply was lost, or one made in F-Link).
+                    # The panel no longer has the user, and writing the edit
+                    # would bring them back with their old code and sections.
+                    # A nameless slot counts as free, as in add_user.
+                    raise RuntimeError(f"User {user_id} not found.")
+                preflight = self._user_write_preflight(
+                    snapshot, user_id, include_current=True, served_from_cache=from_cache
+                )
+                # Carry unsupplied fields over from the preflight table, so an
+                # edit cannot silently rewrite a field with a value the panel
+                # has since changed.
                 current_record = user_to_record(_user_to_model(fresh_record))
-            session = await self._prepare_panel_config_op_locked()
-            await _run_panel_write(
-                _apply_upsert_user,
-                self._user_manager_config(),
-                failure_hint=self._write_failure_hint(),
-                user_id=user_id,
-                payload=payload,
-                current=current_record,
-                preflight=preflight,
-                verify_prefix=f"api-edit-user{user_id}",
-                session=session,
-            )
-        await self.refresh_catalog()
-        user = await self.get_user(user_id)
+                session = await self._prepare_panel_config_op_locked()
+                await self._write_then_refresh_locked(
+                    _apply_upsert_user,
+                    self._user_manager_config(),
+                    failure_hint=self._write_failure_hint(),
+                    refresh_prefix=f"api-after-edit-user{user_id}",
+                    what=f"User {user_id}",
+                    user_id=user_id,
+                    payload=payload,
+                    current=current_record,
+                    preflight=preflight,
+                    verify_prefix=f"api-edit-user{user_id}",
+                    session=session,
+                )
+        except BaseException:
+            if preflight_pulled:
+                await self._announce_preflight_catalog()
+            raise
+        await self._emit("catalog", self._catalog.model_dump(mode="json"))
+        # Served by the refresh the write just made.
+        user = await self.get_user(user_id, max_age_seconds=math.inf)
         if user is None:
             raise RuntimeError(f"User {user_id} disappeared after edit.")
         self._verify_edited_user(user, payload)
@@ -1018,16 +1189,19 @@ class PanelRuntime:
         self._ensure_usable_user_id(user_id)
         async with self._lock:
             session = await self._prepare_panel_config_op_locked()
-            await _run_panel_write(
+            await self._write_then_refresh_locked(
                 _apply_delete_user,
                 self._user_manager_config(),
                 failure_hint=self._write_failure_hint(),
+                refresh_prefix=f"api-after-delete-user{user_id}",
+                what=f"User {user_id}",
                 user_id=user_id,
                 verify_prefix=f"api-delete-user{user_id}",
                 session=session,
             )
-        await self.refresh_catalog()
-        if await self.get_user(user_id) is not None:
+        await self._emit("catalog", self._catalog.model_dump(mode="json"))
+        # Served by the refresh the write just made.
+        if await self.get_user(user_id, max_age_seconds=math.inf) is not None:
             raise RuntimeError(f"User {user_id} was still present after delete.")
         await self._emit("users", {"action": "deleted", "user_id": user_id})
 

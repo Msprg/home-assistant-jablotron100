@@ -8,8 +8,10 @@ arrives before anything reaches the panel.
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -300,7 +302,11 @@ class _FakeConfigSession:
 
 
 def _runtime() -> PanelRuntime:
-    runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="1812"))
+    # A zero write window: every preflight reads the panel, so the tests
+    # below can tell the fresh read and the cache apart.
+    runtime = PanelRuntime(
+        PanelRuntimeConfig(port="auto", auth_code="1812", write_preflight_max_age_seconds=0.0)
+    )
     # A status session object so _prepare_panel_config_op_locked never
     # constructs a real one (that would look for the USB device).
     runtime._status_session = _FakeConfigSession()
@@ -325,6 +331,29 @@ def _snapshot(users, *, code_len=4, code_prefix=False):
         users=users,
         main_config=SimpleNamespace(code_len_raw=code_len, code_prefix=code_prefix),
     )
+
+
+def _route_refresh(monkeypatch, runtime: PanelRuntime) -> list[tuple[str, bool]]:
+    """Replace the cache refresh with one that takes its snapshot from the
+    runtime's (patched) ``_pull_catalog_snapshot_locked`` and keeps the
+    freshness bookkeeping, but skips the API-model conversion these minimal
+    snapshots cannot go through. Returns the recorded (prefix, after_write)
+    pairs: the preflight pull and the one post-write refresh."""
+
+    refreshes: list[tuple[str, bool]] = []
+
+    async def fake_refresh(*, prefix, started_at=None, after_write=False):
+        refreshes.append((prefix, after_write))
+        started = time.monotonic() if started_at is None else started_at
+        snapshot = await runtime._pull_catalog_snapshot_locked(prefix, after_write=after_write)
+        runtime._catalog_snapshot = snapshot
+        runtime._catalog_started_monotonic_for_cache = started
+        runtime._catalog_completed_monotonic = time.monotonic()
+        runtime._catalog_dirty = False
+        return snapshot
+
+    monkeypatch.setattr(runtime, "_refresh_catalog_locked", fake_refresh)
+    return refreshes
 
 
 def test_runtime_takes_the_code_format_from_the_snapshot_it_just_read() -> None:
@@ -359,7 +388,6 @@ def test_runtime_validates_against_a_fresh_read_not_the_cached_catalog(monkeypat
     captured: dict = {}
 
     async def fake_pull(prefix: str, *, after_write: bool = False):
-        captured["prefix"] = prefix
         return _snapshot([_Record(7, "1483")])
 
     def fake_apply(config, **kwargs):
@@ -371,11 +399,11 @@ def test_runtime_validates_against_a_fresh_read_not_the_cached_catalog(monkeypat
     monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
     monkeypatch.setattr(runtime_module, "_apply_upsert_user", fake_apply)
-    monkeypatch.setattr(runtime, "refresh_catalog", fake_close)
+    refreshes = _route_refresh(monkeypatch, runtime)
     monkeypatch.setattr(
         runtime,
         "get_user",
-        lambda user_id: _async_value(None),
+        lambda user_id, max_age_seconds=None: _async_value(None),
     )
 
     async def run() -> None:
@@ -386,7 +414,7 @@ def test_runtime_validates_against_a_fresh_read_not_the_cached_catalog(monkeypat
 
     asyncio.run(run())
 
-    assert captured["prefix"].startswith("api-preflight-add-user")
+    assert refreshes[0] == ("api-preflight-add-user4", False)
     assert captured["preflight"].existing == (UserTableEntry(7, "1483", (), None),)
     assert captured["preflight"].code_format == CodeFormat(4, False, "panel")
 
@@ -411,6 +439,7 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
     monkeypatch.setattr(runtime_module, "_apply_upsert_user", refused)
     monkeypatch.setattr(runtime_module, "_apply_delete_user", refused)
+    refreshes = _route_refresh(monkeypatch, runtime)
 
     async def run() -> None:
         with pytest.raises(RuntimeError, match="Panel write failed: IMPORT.CFG staging failed"):
@@ -419,6 +448,9 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
             await runtime.delete_user(4)
 
     asyncio.run(run())
+    # A refused write gets no post-write refresh; it marks the cache dirty.
+    assert refreshes == [("api-preflight-add-user4", False)]
+    assert runtime._catalog_dirty is True
 
 
 def test_runtime_hands_the_status_session_to_the_write(monkeypatch) -> None:
@@ -432,13 +464,14 @@ def test_runtime_hands_the_status_session_to_the_write(monkeypatch) -> None:
     async def fake_close() -> None:
         closes.append(True)
 
-    async def noop() -> None:
-        return None
+    async def fake_pull(prefix: str, *, after_write: bool = False):
+        return _snapshot([])
 
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
     monkeypatch.setattr(runtime_module, "_apply_delete_user", fake_apply)
-    monkeypatch.setattr(runtime, "refresh_catalog", noop)
-    monkeypatch.setattr(runtime, "get_user", lambda user_id: _async_value(None))
+    _route_refresh(monkeypatch, runtime)
+    monkeypatch.setattr(runtime, "get_user", lambda user_id, max_age_seconds=None: _async_value(None))
 
     asyncio.run(runtime.delete_user(4))
     assert captured["session"] is runtime._status_session
@@ -450,6 +483,41 @@ def test_runtime_hands_the_status_session_to_the_write(monkeypatch) -> None:
     asyncio.run(runtime.delete_user(4))
     assert captured["session"] is None
     assert closes == [True]
+
+
+def test_the_post_write_refresh_is_flagged_after_write(monkeypatch) -> None:
+    """Each write ends with exactly one catalog refresh, flagged after_write
+    so the pull settles first and retries a stalled reload; the preflight
+    pull is an ordinary one. No trailing refresh_catalog() follows."""
+
+    runtime = _runtime()
+    pulls: list[tuple[str, bool]] = []
+
+    async def fake_pull(prefix: str, *, after_write: bool = False):
+        pulls.append((prefix, after_write))
+        return _snapshot([_full_record(4, "1486", name="Old")])
+
+    async def no_trailing_refresh():
+        pytest.fail("the write must not run a second, trailing catalog refresh")
+
+    async def get_user(user_id, max_age_seconds=None):
+        assert max_age_seconds == math.inf, "the lookup after a write is served by its own refresh"
+        return None
+
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", lambda config, **kw: None)
+    monkeypatch.setattr(runtime_module, "_apply_delete_user", lambda config, **kw: None)
+    monkeypatch.setattr(runtime, "refresh_catalog", no_trailing_refresh)
+    refreshes = _route_refresh(monkeypatch, runtime)
+
+    with pytest.raises(RuntimeError, match="not present after add"):
+        asyncio.run(runtime.add_user(UserCreateModel(id=5, name="New", code="1484"), replace=True))
+    assert refreshes == [("api-preflight-add-user5", False), ("api-after-add-user5", True)]
+    assert pulls == refreshes
+
+    refreshes.clear()
+    asyncio.run(runtime.delete_user(4))
+    assert refreshes == [("api-after-delete-user4", True)]
 
 
 def _full_record(user_id: int, code: str, *, name: str):
@@ -487,14 +555,15 @@ def test_the_write_gets_the_session_that_survives_the_preflight_pull(monkeypatch
     lookups: list[int] = []
 
     async def fake_pull(prefix: str, *, after_write: bool = False):
-        await runtime._close_status_session_locked()  # the real close, as the pull does today
+        if not after_write:
+            # The real close, as the legacy preflight pull does. The
+            # post-write refresh is left alone so the assertions below see
+            # the session the write was handed.
+            await runtime._close_status_session_locked()
         return _snapshot([_full_record(4, "1486", name="Old")] if operation == "edit" else [])
 
     def fake_apply(config, **kwargs):
         recorded["session"] = kwargs["session"]
-
-    async def noop() -> None:
-        return None
 
     async def get_user(user_id, max_age_seconds=None):
         # The edit's existence check before the write finds the user; the
@@ -505,7 +574,7 @@ def test_the_write_gets_the_session_that_survives_the_preflight_pull(monkeypatch
     monkeypatch.setattr(runtime_module, "PersistentSnapshotSession", lambda **kwargs: _FakeConfigSession())
     monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
     monkeypatch.setattr(runtime_module, "_apply_upsert_user", fake_apply)
-    monkeypatch.setattr(runtime, "refresh_catalog", noop)
+    _route_refresh(monkeypatch, runtime)
     monkeypatch.setattr(runtime, "get_user", get_user)
 
     if operation == "add":
@@ -538,6 +607,7 @@ def _refusing_runtime(monkeypatch, **config):
     monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
     monkeypatch.setattr(runtime_module, "_apply_upsert_user", refused)
+    _route_refresh(monkeypatch, runtime)
     return runtime
 
 
@@ -558,6 +628,31 @@ def test_a_system_exit_from_the_catalog_pull_is_a_runtime_error(monkeypatch) -> 
 
     assert runtime._status_session is not None, "an in-session pull failure leaves the session to the runtime"
     assert runtime._catalog_pull_task is None
+
+
+def test_the_post_write_pull_settles_and_retries_and_reports_a_stall_as_a_catalog_failure(monkeypatch) -> None:
+    runtime = _runtime()
+    seen: list[dict] = []
+
+    def stalled(config, prefix, *, sleep=None, **kwargs):
+        seen.append(kwargs)
+        raise runtime_module.ExportReloadStalled("Export refresh did not reach the reload-complete state.")
+
+    monkeypatch.setattr(runtime_module, "pull_catalog_snapshot", stalled)
+
+    async def run(after_write: bool) -> None:
+        async with runtime._lock:
+            await runtime._pull_catalog_snapshot_locked("test-prefix", after_write=after_write)
+
+    with pytest.raises(RuntimeError, match="Panel catalog read failed: Export refresh did not reach"):
+        asyncio.run(run(True))
+    with pytest.raises(RuntimeError, match="Panel catalog read failed"):
+        asyncio.run(run(False))
+
+    assert seen == [
+        {"settle_seconds": re_tools.POST_WRITE_EXPORT_SETTLE_SECONDS, "reload_retries": 3},
+        {},
+    ]
 
 
 def test_a_missing_panel_at_session_creation_is_a_runtime_error_not_a_process_exit(monkeypatch) -> None:
@@ -865,8 +960,8 @@ def test_runtime_refuses_a_create_onto_an_occupied_slot_from_the_fresh_read(monk
     monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
     monkeypatch.setattr(runtime_module, "_apply_upsert_user", fake_apply)
-    monkeypatch.setattr(runtime, "refresh_catalog", fake_close)
-    monkeypatch.setattr(runtime, "get_user", lambda user_id: _async_value(None))
+    _route_refresh(monkeypatch, runtime)
+    monkeypatch.setattr(runtime, "get_user", lambda user_id, max_age_seconds=None: _async_value(None))
 
     with pytest.raises(UserSlotOccupied):
         asyncio.run(runtime.add_user(UserCreateModel(id=7, name="New", code="1486")))

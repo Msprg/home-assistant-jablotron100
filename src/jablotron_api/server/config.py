@@ -46,6 +46,11 @@ class PanelSettings:
     # behaviour: the status session is closed and a separate client logs in
     # for the write. A rollback switch, not a design option.
     in_session_config_ops: bool = True
+    # How old the cached user table may be, counted from when its pull
+    # started, for a user write to be validated against it instead of a fresh
+    # panel read under the write lock. 0 means every write pulls first. A
+    # failed write marks the cache dirty, so the next write pulls regardless.
+    write_preflight_max_age_seconds: float = 60.0
 
 
 @dataclass
@@ -85,5 +90,8 @@ class ServerSettings:
             ),
             in_session_config_ops=os.getenv("JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS", "true").lower()
             not in {"0", "false", "no"},
+            write_preflight_max_age_seconds=float(
+                os.getenv("JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS", "60")
+            ),
         )
     )

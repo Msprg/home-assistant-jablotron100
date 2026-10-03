@@ -205,6 +205,12 @@ def create_app(
                     "JABLOTRON_PANEL_WRITE_TRANSPORT must be one of auto, hid or storage, "
                     f"not {settings.panel.write_transport!r}."
                 )
+            if not settings.panel.write_preflight_max_age_seconds >= 0:
+                raise RuntimeError(
+                    "JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS must be >= 0 "
+                    "(0 makes every user write read the panel first), "
+                    f"not {settings.panel.write_preflight_max_age_seconds!r}."
+                )
             from jablotron_api.panel.runtime import PanelRuntime
 
             runtime = PanelRuntime(settings.panel)
