@@ -39,6 +39,7 @@ from jablotron_api.domain.user_validation import (
 from jablotron_api.panel.demo import DemoPanelRuntime
 import jablotron_api.panel.runtime as runtime_module
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
+from jablotron_api.protocol import legacy
 from jablotron_api.server.app import create_app
 from jablotron_api.server.config import ServerSettings
 import jablotron_api.services.user_manager as user_manager
@@ -357,7 +358,7 @@ def test_runtime_validates_against_a_fresh_read_not_the_cached_catalog(monkeypat
     runtime = _runtime()
     captured: dict = {}
 
-    async def fake_pull(prefix: str):
+    async def fake_pull(prefix: str, *, after_write: bool = False):
         captured["prefix"] = prefix
         return _snapshot([_Record(7, "1483")])
 
@@ -397,7 +398,7 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
 
     runtime = _runtime()
 
-    async def fake_pull(prefix: str):
+    async def fake_pull(prefix: str, *, after_write: bool = False):
         return _snapshot([])
 
     def refused(config, **kwargs):
@@ -485,7 +486,7 @@ def test_the_write_gets_the_session_that_survives_the_preflight_pull(monkeypatch
     existing = UserModel(id=4, name="Old", code="1486")
     lookups: list[int] = []
 
-    async def fake_pull(prefix: str):
+    async def fake_pull(prefix: str, *, after_write: bool = False):
         await runtime._close_status_session_locked()  # the real close, as the pull does today
         return _snapshot([_full_record(4, "1486", name="Old")] if operation == "edit" else [])
 
@@ -525,7 +526,7 @@ def _refusing_runtime(monkeypatch, **config):
     for key, value in config.items():
         setattr(runtime._config, key, value)
 
-    async def fake_pull(prefix: str):
+    async def fake_pull(prefix: str, *, after_write: bool = False):
         return _snapshot([])
 
     async def fake_close() -> None:
@@ -538,6 +539,64 @@ def _refusing_runtime(monkeypatch, **config):
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
     monkeypatch.setattr(runtime_module, "_apply_upsert_user", refused)
     return runtime
+
+
+def test_a_system_exit_from_the_catalog_pull_is_a_runtime_error(monkeypatch) -> None:
+    """The pull tooling reports a stalled export refresh with SystemExit. Out
+    of asyncio.to_thread that would stop uvicorn; it must reach the HTTP layer
+    as RuntimeError (409), like a refused write does."""
+
+    runtime = _runtime()
+
+    def stalled(config, prefix, *, sleep=None):
+        raise SystemExit("Export refresh did not reach the reload-complete state.")
+
+    monkeypatch.setattr(runtime_module, "pull_catalog_snapshot", stalled)
+
+    with pytest.raises(RuntimeError, match="Panel catalog read failed: Export refresh did not reach"):
+        asyncio.run(runtime.refresh_catalog())
+
+    assert runtime._status_session is not None, "an in-session pull failure leaves the session to the runtime"
+    assert runtime._catalog_pull_task is None
+
+
+def test_a_missing_panel_at_session_creation_is_a_runtime_error_not_a_process_exit(monkeypatch) -> None:
+    """Without a status session (startup, or right after the events read
+    closed it) the in-session pull creates one on the event-loop thread.
+    The port lookup reports a missing device with SystemExit; that must
+    become the session's reopen backoff and a 409 from the pull, never a
+    SystemExit out of the event loop (a USB dropout is a known event on
+    this install)."""
+    runtime = _runtime()
+    runtime._status_session = None
+    opens: list[str] = []
+
+    def no_device(port):
+        raise SystemExit("Unable to auto-detect Jablotron USB interface.")
+
+    def refuse_open(port):
+        opens.append(port)
+        raise OSError("no such device")
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", no_device)
+    monkeypatch.setattr(legacy, "JablotronUSBClient", refuse_open)
+
+    def pull(config, prefix, *, sleep=None):
+        # What the real pull does first: the export trigger on the session.
+        config.trigger_session.trigger_export()
+        pytest.fail("the trigger cannot succeed without a device")
+
+    monkeypatch.setattr(runtime_module, "pull_catalog_snapshot", pull)
+
+    with pytest.raises(RuntimeError, match="Panel catalog read failed: USB link failed before the export trigger"):
+        asyncio.run(runtime.refresh_catalog())
+
+    session = runtime._status_session
+    assert isinstance(session, legacy.PersistentSnapshotSession), "the session object exists for the next poll"
+    assert session._serial_port == "auto", "the configured value is kept for redetection"
+    assert session._reopen_failures >= 1, "the failed detection armed the reopen backoff"
+    assert opens == [], "nothing was opened under the placeholder port"
+    assert runtime._catalog_pull_task is None
 
 
 def test_a_refused_write_without_a_write_code_points_at_the_setting(monkeypatch) -> None:
@@ -794,7 +853,7 @@ def test_runtime_refuses_a_create_onto_an_occupied_slot_from_the_fresh_read(monk
     runtime = _runtime()
     captured: dict = {}
 
-    async def fake_pull(prefix: str):
+    async def fake_pull(prefix: str, *, after_write: bool = False):
         return _snapshot([_Record(7, "1483", name="Existing user")])
 
     def fake_apply(config, **kwargs):
@@ -814,7 +873,7 @@ def test_runtime_refuses_a_create_onto_an_occupied_slot_from_the_fresh_read(monk
     assert "written" not in captured
 
     # A slot whose record has no name is free: the panel keeps empty records.
-    async def fake_pull_unnamed(prefix: str):
+    async def fake_pull_unnamed(prefix: str, *, after_write: bool = False):
         return _snapshot([_Record(7, "", name="")])
 
     monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull_unnamed)

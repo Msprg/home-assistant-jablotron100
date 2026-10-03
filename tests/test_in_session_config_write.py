@@ -25,10 +25,11 @@ from jablotron_api.protocol import legacy
 from jablotron_api.protocol.legacy import (
     MOTION_ON_MIN_DWELL_SECONDS,
     ConfigWriteError,
+    ExportRefreshIncomplete,
     PersistentSnapshotSession,
     _SessionTeeClient,
 )
-from jablotron_usb_debug import Jablotron, JablotronUSBStreamError
+from jablotron_usb_debug import Jablotron, JablotronUSBStreamError, build_logon_info_reports, perform_sections_query
 from test_hid_config_write import (
     ACCEPT_CONFIRMED,
     CONFIG_ESCAPED,
@@ -60,6 +61,16 @@ EXIT_SEQUENCE = [
     Jablotron.create_packet_command(b"\x02"),
 ]
 PAYLOAD = HID_DELETE_PACKET[4:]
+
+# Export trigger (F-Link's refresh sequence) and the finish step after the read.
+RELOAD_COMPLETE = bytes.fromhex("5207830125")
+R_520102 = bytes.fromhex("520102")
+R_520213059A00 = bytes.fromhex("520213059a")  # ScriptedClient strips the report's zero padding, trailing 00 included
+R_520125 = bytes.fromhex("520125")
+R_800102 = bytes.fromhex("800102")
+SECTIONS_QUERY = Jablotron.create_packet_command(b"\x0e")
+SECTIONS_EXITED = b"\x51\x02" + bytes(2) + bytes([tools.EXITED_SECTIONS_MODE])
+SECTIONS_CONFIG_ACTIVE = b"\x51\x02" + bytes(2) + bytes([tools.CONFIGURATION_SECTIONS_MODE])
 
 
 class ScriptedClient:
@@ -637,6 +648,153 @@ def test_the_login_drain_feeds_pushed_device_state_into_the_latch(monkeypatch) -
         assert h.session._ensure_client_locked() is client
 
     assert h.frames == [{4: "on"}]
+
+
+# ------------------------------------------------------- export trigger
+
+
+def test_trigger_export_runs_the_flink_sequence_in_session_and_streams(monkeypatch) -> None:
+    client = ScriptedClient([[D8_PACKET, RELOAD_COMPLETE], [], []])
+    h = _harness(monkeypatch, client)
+    seen_at: list[tuple[dict[int, str], int]] = []
+    h.session.set_on_device_state_change(lambda frame: seen_at.append((dict(frame), len(client.sent))))
+    # The logon-info line carries a fresh session UUID and timestamp per
+    # call; pin one rendering so the bytes on the wire can be compared.
+    logon_info = build_logon_info_reports()
+    monkeypatch.setattr(tools, "build_logon_info_reports", lambda *args, **kwargs: logon_info)
+    logon_info_reports = [bytes.fromhex(report).rstrip(b"\x00") for report in logon_info]
+    assert len(logon_info_reports) == 3
+
+    h.session.trigger_export()
+
+    assert client.sent == [
+        R_520102,
+        R_520102,
+        R_80010F,
+        R_520102,
+        R_520213059A00,
+        *logon_info_reports,
+        R_520125,
+        R_520102,
+        R_800102,
+        R_520102,
+    ]
+    # The motion edge was published while the reload-complete reply was awaited.
+    assert seen_at == [({4: "on"}, 6 + len(logon_info_reports))]
+    assert h.session._client is client, "a completed trigger keeps the channel for the block read"
+    assert EXIT_SEQUENCE[0] not in client.sent
+    assert h.constructed == [] and h.logins == []
+
+
+def test_trigger_export_without_reload_complete_resets_the_channel_and_raises(monkeypatch) -> None:
+    client = ScriptedClient([])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=2.0))
+
+    with pytest.raises(ExportRefreshIncomplete, match="reload-complete"):
+        h.session.trigger_export()
+
+    assert client.sent[:5] == [R_520102, R_520102, R_80010F, R_520102, R_520213059A00]
+    assert client.sent[-4:] == EXIT_SEQUENCE
+    assert R_800102 not in client.sent, "the post-reload reports are not sent when the reload never completed"
+    assert h.session._client is client2, "the retry starts from a fresh login"
+    assert h.logins == [(client2, "1812", True)]
+
+
+def test_a_usb_error_during_the_trigger_closes_the_session_as_an_export_error(monkeypatch) -> None:
+    client = ScriptedClient([JablotronUSBStreamError("USB read failed on /dev/fakehid")])
+    h = _harness(monkeypatch, client)
+
+    with pytest.raises(ExportRefreshIncomplete, match="USB link failed during the export trigger"):
+        h.session.trigger_export()
+
+    assert h.session._client is None
+    assert client.closed
+    assert h.constructed == []
+
+
+# ---------------------------------------------------------- finish export
+
+
+def test_finish_export_keeps_the_session_on_exited_mode(monkeypatch) -> None:
+    client = ScriptedClient([[SECTIONS_EXITED]])
+    h = _harness(monkeypatch, client)
+    monkeypatch.setattr(legacy, "perform_sections_query", perform_sections_query)  # the harness stubs it
+
+    h.session.finish_export()
+
+    assert client.sent == [SECTIONS_QUERY, ENABLE_DEVICE_STATES]
+    assert h.session._client is client
+    assert h.session.sections_mode == tools.EXITED_SECTIONS_MODE
+    assert h.session._last_enable_device_states_at > 0
+    assert h.constructed == []
+
+
+def test_finish_export_resets_the_channel_on_configuration_mode(monkeypatch) -> None:
+    client = ScriptedClient([[SECTIONS_CONFIG_ACTIVE]])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(legacy, "perform_sections_query", perform_sections_query)
+
+    h.session.finish_export()
+
+    assert client.sent[0] == SECTIONS_QUERY
+    assert client.sent[1:] == EXIT_SEQUENCE
+    assert h.session._client is client2
+    assert h.logins == [(client2, "1812", True)]
+
+
+def test_finish_export_resets_the_channel_when_no_mode_is_reported(monkeypatch) -> None:
+    client = ScriptedClient([])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(legacy, "perform_sections_query", perform_sections_query)
+    monkeypatch.setattr(legacy.time, "monotonic", _clock(step=0.5))
+
+    h.session.finish_export()
+
+    assert client.read_calls >= 1, "the reply window was polled before giving up"
+    assert client.sent[0] == SECTIONS_QUERY
+    assert client.sent[1:] == EXIT_SEQUENCE
+    assert h.session._client is client2
+
+
+def test_finish_export_logs_in_again_when_the_stream_reader_dropped_the_client(monkeypatch) -> None:
+    """The lock is free during the block read; a read error in the stream
+    loop closes the client without the exit sequence. The trigger left the
+    panel in configuration mode, so finish_export must log in again, query
+    the mode and, on configuration-active, send the exit sequence on the new
+    channel instead of returning early."""
+    # The login-time sections query gets no reply; the finish step's query
+    # reports configuration-active mode.
+    client2 = ScriptedClient(replies={SECTIONS_QUERY: [[], [SECTIONS_CONFIG_ACTIVE]]})
+    client3 = ScriptedClient([[]])
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client2, client3])
+    monkeypatch.setattr(legacy, "perform_sections_query", perform_sections_query)
+    h.session._client = None
+
+    h.session.finish_export()
+
+    assert h.constructed == [client2, client3]
+    assert h.logins == [(client2, "1812", True), (client3, "1812", True)]
+    assert client2.sent[:3] == [ENABLE_DEVICE_STATES, SECTIONS_QUERY, SECTIONS_QUERY]
+    assert client2.sent[3:] == EXIT_SEQUENCE
+    assert client2.closed
+    assert h.session._client is client3
+    assert h.session.sections_mode == tools.CONFIGURATION_SECTIONS_MODE
+
+
+def test_finish_export_leaves_the_retry_to_the_next_poll_when_the_reopen_fails(monkeypatch, caplog) -> None:
+    h = _harness(monkeypatch, ScriptedClient(), reopen_error=OSError("device gone"))
+    h.session._client = None
+
+    with caplog.at_level(logging.WARNING, logger=legacy.LOGGER.name):
+        h.session.finish_export()
+
+    assert h.session._client is None
+    assert h.session._reopen_failures == 1, "the failed reopen feeds the normal backoff"
+    assert any("could not be reopened" in record.message for record in caplog.records)
 
 
 # ------------------------------------------------------------- runtime glue

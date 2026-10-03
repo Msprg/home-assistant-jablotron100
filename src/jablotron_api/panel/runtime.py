@@ -209,13 +209,14 @@ class PanelRuntime:
 
     # ------------------------------------------------------------------ config
 
-    def _catalog_pull_config(self) -> CatalogPullConfig:
+    def _catalog_pull_config(self, session: PersistentSnapshotSession | None = None) -> CatalogPullConfig:
         return CatalogPullConfig(
             flexi_cfg_device=self._config.flexi_cfg_device,
             port=self._config.port,
             auth_code=self._config.auth_code,
             reset=self._config.reset,
             read_cleanup_mode=self._config.read_cleanup_mode,
+            trigger_session=session,
         )
 
     def _write_failure_hint(self) -> str | None:
@@ -586,7 +587,6 @@ class PanelRuntime:
     async def _pull_catalog_into_cache(self, *, started_at: float, prefix: str) -> None:
         try:
             async with self._lock:
-                await self._close_status_session_locked()
                 snapshot = await self._pull_catalog_snapshot_locked(prefix)
                 self._catalog_snapshot = snapshot
                 self._catalog = _catalog_to_model(
@@ -611,7 +611,12 @@ class PanelRuntime:
                     self._catalog_completed_monotonic - started_at,
                 )
                 if self._status_session is not None:
-                    self._configure_session_live_devices(self._status_session)
+                    # configure_live_devices takes the session's I/O lock, which
+                    # a worker may hold for tens of seconds now that the session
+                    # stays alive through pulls; the event-loop thread never
+                    # blocks on it (a cancelled to_thread leaves its worker
+                    # running, the asyncio lock already released).
+                    await asyncio.to_thread(self._configure_session_live_devices, self._status_session)
             await self._emit("catalog", self._catalog.model_dump(mode="json"))
         finally:
             self._catalog_pull_task = None
@@ -725,18 +730,26 @@ class PanelRuntime:
         return snapshot
 
     async def _pull_catalog_snapshot_locked(self, output_prefix: str) -> ExportCatalogSnapshot:
+        """Caller holds self._lock. In-session mode the export refresh runs
+        inside the status session (which stays open, so motion keeps
+        streaming); legacy mode closes it and uses a separate login + cleanup
+        session as before. A SystemExit from the pull tooling or an
+        ExportRefreshIncomplete from the session reaches the HTTP layer as a
+        RuntimeError (409) instead of stopping the server."""
+        session = await self._prepare_panel_config_op_locked()
         LOGGER.info(
-            "Pulling export catalog snapshot: prefix=%s reset=%s cleanup_mode=%s",
+            "Pulling export catalog snapshot: prefix=%s reset=%s cleanup_mode=%s in_session=%s",
             output_prefix,
             self._config.reset,
             self._config.read_cleanup_mode,
+            session is not None,
         )
-        await self._close_status_session_locked()
-        catalog = await asyncio.to_thread(
+        catalog = await _run_panel_io(
             pull_catalog_snapshot,
-            self._catalog_pull_config(),
+            self._catalog_pull_config(session),
             output_prefix,
             sleep=time.sleep,
+            label="Panel catalog read failed",
         )
         LOGGER.debug(
             "Export catalog snapshot ready: sections=%s pgs=%s devices=%s users=%s",
@@ -907,10 +920,11 @@ class PanelRuntime:
         """Caller holds self._lock. In-session mode: make sure a status session
         object exists (it logs in lazily on first use) and return it. Legacy
         mode: close the status session so a separate client can log in, as
-        before, and return None. Call it immediately before the write, after
-        any step that may close the session (the preflight pull still does):
-        a session fetched earlier would have been closed and detached by the
-        pull, and would live on as an orphan second login on the device."""
+        before, and return None. Call it immediately before the panel
+        operation, after any step that may close the session (in legacy mode
+        the preflight pull still does): a session fetched earlier would have
+        been closed and detached, and would live on as an orphan second login
+        on the device."""
         if self._config.in_session_config_ops:
             if self._status_session is None:
                 self._status_session = self._create_status_session()

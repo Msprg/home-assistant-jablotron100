@@ -17,6 +17,7 @@ from typing import Callable
 from jablotron_re_tools import (
     ExportCatalogSnapshot,
     ExportSnapshot,
+    ExportTriggerSession,
     UserRecord,
     default_export_output,
     extract_export_catalog,
@@ -348,6 +349,9 @@ class CatalogPullConfig:
     auth_code: str
     reset: bool
     read_cleanup_mode: str
+    # When set, the export refresh runs inside this session (the server's
+    # status session) instead of a separate login + cleanup session.
+    trigger_session: ExportTriggerSession | None = None
 
 
 def pull_catalog_snapshot(
@@ -370,6 +374,7 @@ def pull_catalog_snapshot(
         code=config.auth_code,
         reset=config.reset,
         cleanup_mode=config.read_cleanup_mode,
+        trigger_session=config.trigger_session,
     )
     catalog = extract_export_catalog(export_snapshot.path)
     if (
@@ -389,6 +394,7 @@ def pull_catalog_snapshot(
             code=config.auth_code,
             reset=False,
             cleanup_mode=config.read_cleanup_mode,
+            trigger_session=config.trigger_session,
         )
         catalog = extract_export_catalog(export_snapshot.path)
     return catalog

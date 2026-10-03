@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from struct import unpack_from
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Protocol
 
 import msgpack
 
@@ -2306,6 +2306,18 @@ def trigger_live_export(*, port: str, code: str, reset: bool) -> None:
         client.close()
 
 
+class ExportTriggerSession(Protocol):
+    """An already logged-in session that can run the export refresh sequence
+    on its own channel (the API server's status session). ``trigger_export``
+    runs the refresh sequence; ``finish_export`` is called after the block
+    read, where the separate cleanup session ran before, and settles the
+    channel (keep it or reset it) based on the sections mode."""
+
+    def trigger_export(self) -> None: ...
+
+    def finish_export(self) -> None: ...
+
+
 def pull_live_export_snapshot(
     *,
     output: Path,
@@ -2318,16 +2330,28 @@ def pull_live_export_snapshot(
     sectors: int = EXPORT_SECTORS,
     cleanup_mode: str = "auto",
     verbose: bool = False,
+    trigger_session: ExportTriggerSession | None = None,
 ) -> ExportSnapshot:
     resolved_device = resolve_flexi_cfg_device(device)
     if get_device_mountpoint(resolved_device) is not None:
         unmount_device(resolved_device, mount_tool="sudo")
 
     cleanup_sections_mode: int | None = None
-    if trigger:
-        trigger_live_export(port=port, code=code, reset=reset)
-    read_export_direct(device=resolved_device, output=output, start_lba=start_lba, sectors=sectors)
-    if trigger and cleanup_mode != "none":
+    if trigger and trigger_session is not None:
+        # The session triggers on its own channel; no separate login, no
+        # separate cleanup session. finish_export runs even when the block
+        # read raises: the trigger has already put the panel in
+        # configuration-active mode and the channel must be settled.
+        trigger_session.trigger_export()
+        try:
+            read_export_direct(device=resolved_device, output=output, start_lba=start_lba, sectors=sectors)
+        finally:
+            trigger_session.finish_export()
+    else:
+        if trigger:
+            trigger_live_export(port=port, code=code, reset=reset)
+        read_export_direct(device=resolved_device, output=output, start_lba=start_lba, sectors=sectors)
+    if trigger and trigger_session is None and cleanup_mode != "none":
         cleanup_sections_mode = cleanup_read_session(port=port, code=code, cleanup_mode=cleanup_mode, verbose=verbose)
         if cleanup_sections_mode == CONFIGURATION_SECTIONS_MODE:
             print(

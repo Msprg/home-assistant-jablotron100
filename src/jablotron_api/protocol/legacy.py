@@ -20,6 +20,7 @@ from jablotron_re_tools import (
     parse_login_rights,
     read_config_revision,
     send_accept_configuration,
+    send_flink_export_refresh_sequence,
     send_report,
     verify_config_revision_advanced,
     wait_for_reply,
@@ -539,7 +540,6 @@ class PersistentSnapshotSession:
         # Keep the raw configured value ("auto" or a fixed path) so the port can
         # be re-resolved after a USB re-enumeration, not just once at startup.
         self._configured_port = port
-        self._serial_port = ensure_serial_port(port)
         self._code = code
         self._reset = reset
         self._client: JablotronUSBClient | None = None
@@ -572,6 +572,24 @@ class PersistentSnapshotSession:
         self._login_rights_code: str | None = None
         self._pending_auth_code: str | None = None
         self._last_sections_mode: int | None = None
+        # Resolve the port last, once every field exists: a failed detection
+        # is handled by feeding the reopen backoff, which the fields above
+        # back. ensure_serial_port raises SystemExit when no device is found
+        # (OSError on a host without the hidraw sysfs tree); the runtime
+        # constructs this object on the event-loop thread, where an escaping
+        # SystemExit stops the server. A missing panel is an ordinary USB
+        # dropout: keep the configured value and let the first
+        # _ensure_client_locked redetect and fail into the normal backoff,
+        # so the poll reports it and the next one retries.
+        try:
+            self._serial_port = ensure_serial_port(port)
+        except (SystemExit, OSError) as exc:
+            LOGGER.warning(
+                "No usable panel device at session start (%s); the next open will redetect.",
+                exc,
+            )
+            self._serial_port = port
+            self._note_reopen_failure_locked()
 
     def set_on_device_state_change(self, callback: Callable[[dict[int, str]], None] | None) -> None:
         """Register a callback fired whenever a latched device on/off state
@@ -907,6 +925,121 @@ class PersistentSnapshotSession:
                     "Could not reopen the status session after a configuration op; the next poll will retry.",
                     exc_info=True,
                 )
+
+    def trigger_export(self, *, code: str | None = None) -> None:
+        """Run F-Link's export refresh sequence inside this session, under one
+        _io_lock hold, every reply going through the live parser.
+
+        The sequence is jablotron_re_tools.send_flink_export_refresh_sequence
+        unchanged: 52 01 02 twice, 80 01 0F, 52 01 02, 52 02 13 05 9A 00, the
+        logon-info line, 52 01 25, then up to 8 s waiting for 52 07 83 01 25
+        with 52 01 02 keepalives, then 52 01 02 / 80 01 02 and the drains. The
+        block read of EXPORT.CFG is the caller's job (SCSI, no HID), and the
+        caller must call finish_export() afterwards: the sequence leaves the
+        panel in configuration-active sections mode. When the reload-complete
+        reply does not come, the channel is reset first (graceful exit +
+        reopen, so a retry starts from a fresh login, the shape that recovered
+        live; F-Link's same-channel retry never did) and ExportRefreshIncomplete
+        is raised.
+        """
+        code = code or self._code
+        with self._io_lock:
+            try:
+                client = self._ensure_client_locked(auth_code=code)
+                self._ensure_authorized_code_locked(client, code)
+            except WrongCodeError as exc:
+                self._close_client_locked()
+                raise ExportRefreshIncomplete(f"The panel refused the session code: {exc}") from exc
+            except JablotronUSBStreamError as exc:
+                self._close_client_locked()
+                self._redetect_serial_port_locked()
+                raise ExportRefreshIncomplete(f"USB link failed before the export trigger: {exc}") from exc
+            tee = self._tee_client(client)
+            try:
+                send_flink_export_refresh_sequence(tee, verbose=False)
+            except SystemExit as exc:
+                self._bounce_client_locked(reopen=True, code=code)
+                raise ExportRefreshIncomplete(str(exc)) from None
+            except JablotronUSBStreamError as exc:
+                self._close_client_locked()
+                self._redetect_serial_port_locked()
+                raise ExportRefreshIncomplete(f"USB link failed during the export trigger: {exc}") from exc
+            LOGGER.debug(
+                "In-session export trigger complete; sections_mode=%s",
+                describe_sections_mode(self._last_sections_mode),
+            )
+
+    def finish_export(self) -> None:
+        """Called after the block read of EXPORT.CFG, the point where the
+        separate cleanup session ran before (whether the file stays
+        materialised without a session is untested, so this never runs
+        earlier).
+
+        Queries the sections mode through the tee (52 01 0E, read up to
+        SECTIONS_MODE_QUERY_TIMEOUT_SECONDS). Exited mode: keep the channel
+        and re-arm the device-state subscription. Configuration-active mode,
+        or no 0x51 reply: reset the channel (graceful exit, the proven
+        exit-only cleanup, then reopen). Logs the mode at INFO either way.
+        Never raises.
+
+        The lock is released during the block read, and the stream reader
+        closes the client on any read error in that window. The trigger has
+        still put the panel in configuration-active mode, so a missing client
+        is not a reason to skip this step: log in again first (the separate
+        cleanup session of the old path did exactly that) and run the same
+        check, so the exit sequence is sent when the mode calls for it. When
+        the reopen fails (device gone, backoff) there is nothing to exit on;
+        log it and leave the retry to the next poll.
+        """
+        with self._io_lock:
+            client = self._client
+            if client is None:
+                try:
+                    client = self._ensure_client_locked()
+                except Exception:
+                    LOGGER.warning(
+                        "The status session was lost during the export read and could not be "
+                        "reopened; the panel may still be in configuration mode until the next poll.",
+                        exc_info=True,
+                    )
+                    return
+            mode: int | None = None
+            try:
+                self._last_sections_mode = None
+                tee = self._tee_client(client)
+                perform_sections_query(tee)
+                deadline = time.monotonic() + SECTIONS_MODE_QUERY_TIMEOUT_SECONDS
+                while self._last_sections_mode is None and time.monotonic() < deadline:
+                    list(tee.read_packets(timeout=0.1))
+                mode = self._last_sections_mode
+            except Exception:
+                LOGGER.debug("Sections-mode query after the export read raised", exc_info=True)
+            if mode == EXITED_SECTIONS_MODE:
+                LOGGER.info(
+                    "Export read finished with the panel in %s; keeping the status session.",
+                    describe_sections_mode(mode),
+                )
+                try:
+                    perform_enable_device_states(client)
+                    self._last_enable_device_states_at = time.monotonic()
+                except Exception:
+                    LOGGER.warning(
+                        "Could not re-arm the device-state subscription after the export read; "
+                        "closing the session for the next poll.",
+                        exc_info=True,
+                    )
+                    self._close_client_locked()
+                return
+            LOGGER.info(
+                "Export read finished with the panel in %s; resetting the status session channel.",
+                describe_sections_mode(mode),
+            )
+            self._bounce_client_locked(reopen=True)
+
+    @property
+    def sections_mode(self) -> int | None:
+        """The last sections-mode byte seen on a 0x51 packet (observability)."""
+        return self._last_sections_mode
 
     def _ensure_client_locked(self, auth_code: str | None = None) -> JablotronUSBClient:
         if self._client is not None:

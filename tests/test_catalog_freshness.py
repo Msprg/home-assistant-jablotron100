@@ -81,7 +81,7 @@ class _Harness:
         self.users = list(users)
         self.emitted: list[str] = []
 
-        async def fake_pull(prefix: str):
+        async def fake_pull(prefix: str, *, after_write: bool = False):
             self.pulls.append(prefix)
             self.pull_started.set()
             if self.delay:
@@ -266,7 +266,7 @@ def test_a_failed_pull_is_reported_and_the_next_read_retries(monkeypatch):
     h = _Harness(monkeypatch)
     failures = {"count": 0}
 
-    async def failing_pull(prefix: str):
+    async def failing_pull(prefix: str, *, after_write: bool = False):
         h.pulls.append(prefix)
         failures["count"] += 1
         if failures["count"] == 1:
@@ -282,6 +282,52 @@ def test_a_failed_pull_is_reported_and_the_next_read_retries(monkeypatch):
 
     asyncio.run(run())
     assert len(h.pulls) == 2
+
+
+def test_a_catalog_pull_no_longer_closes_the_status_session(monkeypatch):
+    """The export refresh runs inside the status session now, so a catalog
+    pull keeps it (and its motion stream) alive; legacy mode still closes it
+    so the separate login + cleanup session can have the bus."""
+
+    def pull(in_session: bool) -> tuple[int, object]:
+        h = _Harness(monkeypatch)
+        h.runtime._config.in_session_config_ops = in_session
+        closes = {"count": 0}
+
+        async def counting_close() -> None:
+            closes["count"] += 1
+            h.runtime._status_session = None
+
+        # The real pull path decides whether the session is closed; only the
+        # blocking tool call underneath it is replaced.
+        monkeypatch.setattr(h.runtime, "_close_status_session_locked", counting_close)
+        monkeypatch.setattr(
+            h.runtime,
+            "_pull_catalog_snapshot_locked",
+            PanelRuntime._pull_catalog_snapshot_locked.__get__(h.runtime),
+        )
+        session = _FakeConfigSession()
+        h.runtime._status_session = session
+        configs: list = []
+
+        def fake_pull_catalog_snapshot(config, prefix, *, sleep=None):
+            configs.append(config)
+            # The real pull path logs the catalog's counts.
+            return SimpleNamespace(**vars(_snapshot([])), sections_by_id={}, pgs_by_id={}, objects_by_id={})
+
+        monkeypatch.setattr(runtime_module, "pull_catalog_snapshot", fake_pull_catalog_snapshot)
+        asyncio.run(h.runtime.refresh_catalog())
+        assert len(configs) == 1
+        assert configs[0].trigger_session is (session if in_session else None)
+        return closes["count"], h.runtime._status_session
+
+    closes, remaining = pull(True)
+    assert closes == 0
+    assert remaining is not None
+
+    closes, remaining = pull(False)
+    assert closes == 1
+    assert remaining is None
 
 
 # ------------------------------------------------------------- max_age_seconds=0
