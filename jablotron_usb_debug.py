@@ -279,6 +279,9 @@ class JablotronUSBClient:
         self._serial_port = serial_port
         self._write_delay = write_delay
         self._fd = os.open(self._serial_port, os.O_RDWR | os.O_NONBLOCK)
+        # Chunks of a long panel reply (`48 3E <count>`, `49 3E`..., `4A <len>`)
+        # collected until the last one arrives; see `_reassemble_chunks`.
+        self._pending_chunks: list[bytes] = []
 
     def send_packet(self, packet: bytes) -> None:
         self._log_outgoing(packet)
@@ -335,9 +338,47 @@ class JablotronUSBClient:
                     break
 
                 for packet in Jablotron.get_packets_from_packet(raw):
-                    yield packet
+                    yield from self._reassemble_chunks(packet)
         except OSError as exc:
             raise JablotronUSBStreamError(f"USB read failed on {self._serial_port}: {exc}") from exc
+
+    def _reassemble_chunks(self, packet: bytes) -> Iterator[bytes]:
+        """Turn the panel's `48/49/4A` chunk reports back into the one long packet they carry.
+
+        The panel sends a TLV longer than one report (the `90 EF` device table,
+        the `52 FA` reply to `52 2B`, ...) as chunk reports, back to back. Without
+        this step a reader sees three or four unrelated `48`, `49`, `4A` packets
+        and drops them. Chunks are kept across `read_packets` calls because a
+        batch can end between two of them. Any other packet while chunks are
+        pending means the sequence broke off: the fragments are dropped with a
+        debug log and the packet goes through as usual.
+        """
+
+        packet_type = packet[0]
+        if packet_type == HID_CHUNK_FIRST:
+            if self._pending_chunks:
+                _LOGGER.debug("Dropping %d chunk(s) of an unfinished long packet", len(self._pending_chunks))
+            self._pending_chunks = [packet]
+            return
+        if packet_type == HID_CHUNK_MIDDLE and self._pending_chunks:
+            self._pending_chunks.append(packet)
+            return
+        if packet_type == HID_CHUNK_LAST and self._pending_chunks:
+            chunks = [*self._pending_chunks, packet]
+            self._pending_chunks = []
+            try:
+                yield reassemble_hid_chunk_reports(chunks)
+            except ValueError as exc:
+                _LOGGER.debug("Dropping a malformed long packet (%s)", exc)
+            return
+        if self._pending_chunks:
+            _LOGGER.debug(
+                "Dropping %d chunk(s) of an unfinished long packet before a %02x packet",
+                len(self._pending_chunks),
+                packet_type,
+            )
+            self._pending_chunks = []
+        yield packet
 
     def close(self) -> None:
         os.close(self._fd)

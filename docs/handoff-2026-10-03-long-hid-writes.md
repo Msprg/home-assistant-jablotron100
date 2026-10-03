@@ -1,8 +1,9 @@
 # Handoff: user records longer than one HID report (2026-10-03)
 
 > **Status (2026-10-03, later):** items 1, 2, 4 and 5 of "What to build" are
-> implemented and unit-tested; item 3 has a reassembler but the diagnostics
-> reader does not use it yet; item 6 is done: live-proven through the API on
+> implemented and unit-tested; item 3 is done too: `JablotronUSBClient.read_packets`
+> reassembles chunked panel replies for every reader, live-proven with the
+> `52 2B` query; item 6 is done: live-proven through the API on
 > 2026-10-03 01:10-01:13 UTC (slot 96 save as two chunks, acked; delete;
 > table back to baseline). See "Done" at the end and the status doc entry.
 
@@ -234,10 +235,11 @@ arbitrary string.
   `POST_WRITE_EXPORT_SETTLE_SECONDS` = 1.5 s before the first export pull;
   the 3-attempt retry stays. Whether the `retrying (1/3)` warning
   disappears is to be read off the first live write.
-- Not done: wiring `reassemble_hid_chunk_reports` into the diagnostics
-  reader (`src/jablotron_api/protocol/legacy.py` reads single reports and
-  so still sees a `90 EF` device table as four unrelated `48/49/4A`
-  packets). Not needed for writes.
+- Item 3 done after the API proof: `JablotronUSBClient.read_packets`
+  reassembles `48/49/4A` sequences (`_reassemble_chunks`), so the
+  diagnostics reader and every other consumer see the whole `90 EF` or
+  `52 FA` packet. Live: `52 03 2B 01 E6` answered with one 306-byte `52 FA`
+  packet, no raw chunks. Tests in `tests/test_hid_chunk_reassembly.py`.
 - Item 6 done once the panel was back: container rebuilt (image
   `1e0f3648` from `df900d1`), `JABLOTRON_PANEL_WRITE_AUTH_CODE` commented
   out in `.env`, `POST /v1/users` slot 96 with a 59-character comment: two
