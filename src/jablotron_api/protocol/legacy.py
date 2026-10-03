@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from jablotron_usb_debug import (
+    DEVICE_INFO_KNOWN_SUBPACKETS,
+    DEVICE_INFO_SUBPACKET_WIRELESS,
+    DEVICE_INFO_UNKNOWN_SUBPACKETS,
     DeviceConnection,
     DeviceFault,
     DeviceInfoType,
@@ -317,7 +320,23 @@ class _SnapshotParser:
         subpackets = Jablotron._parse_device_info_subpackets_from_device_info_packet(packet)
         for subpacket in subpackets:
             subpacket_type = subpacket[0:1]
-            if subpacket_type == b"\x01":
+            if subpacket_type not in DEVICE_INFO_KNOWN_SUBPACKETS:
+                # Same guard as the upstream integration: only the wireless
+                # (`01`), periodic (`9C`) and requested (`0A`) subpackets have
+                # the battery byte and info records the code below expects. A
+                # diagnostics-command response (for example the 236-byte `6B`
+                # answer to `96 <dev> 6A ...`, which the USB client now hands
+                # over whole) would otherwise set a bogus battery level and be
+                # scanned as info records.
+                if subpacket_type not in DEVICE_INFO_UNKNOWN_SUBPACKETS:
+                    LOGGER.debug(
+                        "Ignoring device %d info subpacket of unknown type %s (%s)",
+                        device_id,
+                        subpacket_type.hex(),
+                        packet.hex(),
+                    )
+                continue
+            if subpacket_type == DEVICE_INFO_SUBPACKET_WIRELESS:
                 device = self.devices_by_id.get(device_id)
                 if device is not None:
                     device.signal_strength = Jablotron._parse_device_signal_strength_from_device_info_subpacket(subpacket)
