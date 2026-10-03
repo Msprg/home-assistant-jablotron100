@@ -339,6 +339,9 @@ def test_the_server_event_path_never_mounts(monkeypatch, tmp_path):
         event_tool, "enter_setup_mode", lambda *a, **k: calls.append("enter_setup_mode")
     )
     monkeypatch.setattr(event_tool, "graceful_exit_session", lambda *a, **k: [])
+    # cleanup_read_session opens its own client and logs in; unpatched it reached the
+    # real panel with the placeholder code on every suite run (2026-10-03 false alarm).
+    monkeypatch.setattr(event_tool, "cleanup_read_session", lambda **k: calls.append("cleanup") or None)
     monkeypatch.setattr(event_tool, "extract_sections_state_mode", lambda packet: None)
     monkeypatch.setattr(event_tool.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(
