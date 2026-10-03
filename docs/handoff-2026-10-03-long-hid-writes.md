@@ -2,8 +2,9 @@
 
 > **Status (2026-10-03, later):** items 1, 2, 4 and 5 of "What to build" are
 > implemented and unit-tested; item 3 has a reassembler but the diagnostics
-> reader does not use it yet; item 6 (deploy and live proof) is open because
-> the panel was not on the host when the code landed. See "Done" at the end.
+> reader does not use it yet; item 6 is done: live-proven through the API on
+> 2026-10-03 01:10-01:13 UTC (slot 96 save as two chunks, acked; delete;
+> table back to baseline). See "Done" at the end and the status doc entry.
 
 The HID `0x1D` user write (see `docs/handoff-2026-09-25-write-gate.md`,
 "Decoded" and "Implemented") is live-proven for records that fit one 64-byte
@@ -237,7 +238,15 @@ arbitrary string.
   reader (`src/jablotron_api/protocol/legacy.py` reads single reports and
   so still sees a `90 EF` device table as four unrelated `48/49/4A`
   packets). Not needed for writes.
-- Not done: item 6. The panel was not attached to the host (no
-  `/dev/hidraw0`, container backing off on reopen), so no live write and
-  no rebuild. Steps stay as written above; the API image must be rebuilt
-  from a tree that contains this change.
+- Item 6 done once the panel was back: container rebuilt (image
+  `1e0f3648` from `df900d1`), `JABLOTRON_PANEL_WRITE_AUTH_CODE` commented
+  out in `.env`, `POST /v1/users` slot 96 with a 59-character comment: two
+  chunks `48 3E 02 1D 6B 09 00 ...` + `4A 30 ...`, 0.1 s apart, acked
+  `1D 03 44 00 00` 0.9 s later, 200 in 81 s, record read back; `DELETE`
+  single `1D 07` report, acked, 200 in 59 s; table byte-identical to the
+  baseline afterwards. Capture (private) in `.git/claude-scratch/long-write-96/`.
+  The panel's comment field itself holds 60 bytes: a longer comment is a
+  400 `comment_too_long` from the API before any panel traffic, so the
+  largest single-user record is bounded by the field limits, not by the
+  transport. The new logon identity was accepted. The 1.5 s settle did not
+  remove the `retrying (1/3)` warning (seen once per write, retry succeeds).
