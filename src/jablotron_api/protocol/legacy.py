@@ -209,6 +209,14 @@ EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
 SETUP_MODE_LEAVE_TIMEOUT_SECONDS = 3.0  # wait for 80 01 17 after an error-path 80 01 14
 SECTIONS_MODE_QUERY_TIMEOUT_SECONDS = 0.8  # finish_export's 52 01 0E reply window
 LOGIN_RIGHTS_WAIT_SECONDS = 1.5  # how long login_rights_for_code reads for an 80 1A 0C
+# The panel ends a login's authorisation by itself about 57 s after the login
+# (it pushes 80 01 01). From then on the session still polls, but 80 01 0F is
+# answered 80 02 1B 03 and 0x13 / 52 01 25 are refused with 52 03 82 FD <cmd>
+# (2026-10-03 capture). A configuration operation therefore logs in again on
+# the open channel first, unless the channel's login is younger than this and
+# no configuration operation has used it yet.
+CONFIG_OP_FRESH_LOGIN_SECONDS = 5.0
+PANEL_AUTHORISATION_ENDED_PACKET = bytes.fromhex("800101")
 # After a fully confirmed write (accept confirmed, 80 01 17 seen, revision
 # advanced) the session keeps its channel and only re-arms the device-state
 # subscription: F-Link stays connected across its writes, and the post-write
@@ -573,6 +581,10 @@ class PersistentSnapshotSession:
         self._login_rights_code: str | None = None
         self._pending_auth_code: str | None = None
         self._last_sections_mode: int | None = None
+        # Monotonic time of a login on this channel that no configuration
+        # operation has used yet and the panel has not ended; 0.0 when there
+        # is none. See _ensure_fresh_login_locked.
+        self._fresh_login_at = 0.0
         # Resolve the port last, once every field exists: a failed detection
         # is handled by feeding the reopen backoff, which the fields above
         # back. ensure_serial_port raises SystemExit when no device is found
@@ -793,6 +805,8 @@ class PersistentSnapshotSession:
         Every packet read on the way is fed to the live device-state parser,
         so motion keeps publishing while the write holds the bus.
 
+        The write starts from a fresh login (_ensure_fresh_login_locked): the
+        panel refuses 80 01 0F on a session whose authorisation it has ended.
         The first 80 01 0F does not race the login reply: when no 80 1A 0C
         has been captured for ``code`` on this channel, the write reads for
         it (up to LOGIN_RIGHTS_WAIT_SECONDS) first, and after a login made by
@@ -819,7 +833,8 @@ class PersistentSnapshotSession:
                 client_before = self._client
                 client = self._ensure_client_locked(auth_code=code)
                 logged_in_now = client is not client_before
-                self._ensure_authorized_code_locked(client, code)
+                if self._ensure_fresh_login_locked(client, code):
+                    logged_in_now = True
                 # The first 80 01 0F must not race the panel's 80 1A 0C login
                 # reply. Usually the login drain (or an earlier rights lookup)
                 # has already captured it; otherwise read for it first.
@@ -948,7 +963,10 @@ class PersistentSnapshotSession:
         """Run F-Link's export refresh sequence inside this session, under one
         _io_lock hold, every reply going through the live parser.
 
-        The sequence is jablotron_re_tools.send_flink_export_refresh_sequence
+        The sequence starts from a fresh login (_ensure_fresh_login_locked):
+        sent from a session whose authorisation the panel had ended, it was
+        refused live (80 01 0F -> 80 02 1B 03, 52 03 82 FD 13, 52 03 82 FD 25).
+        It is jablotron_re_tools.send_flink_export_refresh_sequence
         unchanged: 52 01 02 twice, 80 01 0F, 52 01 02, 52 02 13 05 9A 00, the
         logon-info line, 52 01 25, then up to 8 s waiting for 52 07 83 01 25
         with 52 01 02 keepalives, then 52 01 02 / 80 01 02 and the drains. The
@@ -964,7 +982,7 @@ class PersistentSnapshotSession:
         with self._io_lock:
             try:
                 client = self._ensure_client_locked(auth_code=code)
-                self._ensure_authorized_code_locked(client, code)
+                self._ensure_fresh_login_locked(client, code)
             except WrongCodeError as exc:
                 self._close_client_locked()
                 raise ExportRefreshIncomplete(f"The panel refused the session code: {exc}") from exc
@@ -1155,6 +1173,7 @@ class PersistentSnapshotSession:
         self._authorized_code = active_code
         self._pending_auth_code = None
         self._last_control_authorized_at = time.monotonic()
+        self._fresh_login_at = self._last_control_authorized_at
         # Successful (re)open clears the backoff streak.
         self._reopen_failures = 0
         self._next_reopen_allowed_at = 0.0
@@ -1213,6 +1232,7 @@ class PersistentSnapshotSession:
         self._last_enable_device_states_at = 0.0
         self._authorized_code = None
         self._last_control_authorized_at = 0.0
+        self._fresh_login_at = 0.0
         self._login_rights = None
         self._login_rights_code = None
         self._pending_auth_code = None
@@ -1223,8 +1243,11 @@ class PersistentSnapshotSession:
         except Exception:
             pass
 
-    def _ensure_authorized_code_locked(self, client: JablotronUSBClient, code: str) -> None:
-        if self._authorized_code == code:
+    def _ensure_authorized_code_locked(self, client: JablotronUSBClient, code: str, *, force: bool = False) -> None:
+        """Authorise ``code`` on the open channel with the two packets a login
+        sends (80 01 01 + the code). Nothing is sent when ``code`` is already
+        the authorised one, unless ``force`` asks for a new login anyway."""
+        if self._authorized_code == code and not force:
             return
         # AUTHORISATION_END clears the panel's authorization immediately.
         # Invalidate our cache before awaiting the result so a wrong-code
@@ -1232,6 +1255,7 @@ class PersistentSnapshotSession:
         # authorized on the panel (it isn't).
         self._authorized_code = None
         self._last_control_authorized_at = 0.0
+        self._fresh_login_at = 0.0
         # The rights on record belong to the code that was just logged out.
         self._login_rights = None
         self._login_rights_code = None
@@ -1249,6 +1273,37 @@ class PersistentSnapshotSession:
         finally:
             self._pending_auth_code = None
         self._last_control_authorized_at = time.monotonic()
+        self._fresh_login_at = self._last_control_authorized_at
+
+    def _ensure_fresh_login_locked(self, client: JablotronUSBClient, code: str) -> bool:
+        """Make sure the configuration operation about to run starts from a
+        fresh login for ``code``. Returns True when it logged in.
+
+        One login serves one configuration operation: a login made on this
+        channel within CONFIG_OP_FRESH_LOGIN_SECONDS (the open, a channel
+        reset, a re-authorisation) is used as it is and counts as spent
+        afterwards. Otherwise the session logs in again on the open channel,
+        with the same two packets a reopen sends but without the exit
+        sequence and the device reopen, and re-arms the device-state
+        subscription as the reopen does. The login-rights reply (80 1A 0C) is
+        captured by the read that waits for the login result. Raises
+        WrongCodeError when the panel refuses the code and
+        JablotronUSBStreamError when the link fails; the caller closes the
+        session for both.
+        """
+        fresh_at = self._fresh_login_at
+        self._fresh_login_at = 0.0
+        if (
+            self._authorized_code == code
+            and fresh_at > 0.0
+            and time.monotonic() - fresh_at <= CONFIG_OP_FRESH_LOGIN_SECONDS
+        ):
+            return False
+        self._ensure_authorized_code_locked(client, code, force=True)
+        self._fresh_login_at = 0.0
+        perform_enable_device_states(client)
+        self._last_enable_device_states_at = time.monotonic()
+        return True
 
     def _restore_previous_authorization_locked(self, previous_code: str | None) -> None:
         client = self._client
@@ -1326,14 +1381,18 @@ class PersistentSnapshotSession:
     def _inspect_packet_locked(self, packet: bytes) -> None:
         """Session bookkeeping for every packet read by any path: the
         login-rights reply (80 1A 0C -> LoginRights, tagged with the code being
-        authorised) and the sections-mode trailer byte of a 0x51 packet (its
-        last byte, as jablotron_re_tools.extract_sections_state_mode reads it)."""
+        authorised), the sections-mode trailer byte of a 0x51 packet (its
+        last byte, as jablotron_re_tools.extract_sections_state_mode reads it)
+        and the panel ending the authorisation (80 01 01)."""
         rights = parse_login_rights(packet)
         if rights is not None:
             self._login_rights = rights
             self._login_rights_code = self._authorized_code or self._pending_auth_code
         if Jablotron._is_sections_states_packet(packet) and packet:
             self._last_sections_mode = packet[-1]
+        if packet.startswith(PANEL_AUTHORISATION_ENDED_PACKET):
+            # The panel ended the authorisation; the login is no longer fresh.
+            self._fresh_login_at = 0.0
 
     def _observe_packet_locked(self, packet: bytes) -> None:
         """Tee/drain hook: bookkeeping, then the live parser with the

@@ -132,12 +132,14 @@ class ScriptedClient:
         self.closed = True
 
 
-def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None, rights_captured=True):
-    """A session already logged in on ``client`` (no login runs for the write
-    itself) with one motion device whose live parser flips on a d8 packet.
-    Reopens construct the next prepared client, or fail with reopen_error.
-    ``rights_captured`` records the login-rights reply of that login, as the
-    login drain would have; the tests about capturing it pass False."""
+def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None, rights_captured=True, fresh_login=True):
+    """A session that has just logged in on ``client`` (no login runs for the
+    write itself) with one motion device whose live parser flips on a d8
+    packet. Reopens construct the next prepared client, or fail with
+    reopen_error. ``rights_captured`` records the login-rights reply of that
+    login, as the login drain would have; the tests about capturing it pass
+    False. ``fresh_login=False`` is the warm status session: logged in long
+    ago, so a configuration operation has to log in again first."""
 
     monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
     monkeypatch.setattr(legacy.time, "sleep", lambda seconds: None)
@@ -164,6 +166,8 @@ def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None, right
     monkeypatch.setattr(session, "_ensure_keepalive_thread_locked", lambda: None)
     session._client = client
     session._authorized_code = "1812"
+    if fresh_login:
+        session._fresh_login_at = legacy.time.monotonic()
     if rights_captured:
         session._login_rights = tools.LoginRights(0x28, 100)
         session._login_rights_code = "1812"
@@ -705,6 +709,145 @@ def test_a_failed_reopen_after_the_write_is_logged_not_raised(monkeypatch, caplo
     assert "Could not reopen the status session" in caplog.text
     assert h.session._client is None
     assert h.session._reopen_failures == 1
+
+
+# ------------------------------------------- fresh login before an operation
+
+AUTH_END = Jablotron.create_packet_ui_control(b"\x01")
+LOGIN_PACKETS = [AUTH_END, Jablotron.create_packet_authorisation_code("1812")]
+PANEL_ENDED_AUTHORISATION = bytes.fromhex("800101")
+
+
+def _one_read_per_login_wait(monkeypatch):
+    """The wait for the login result reads until its 0.8 s deadline; give it
+    a clock that expires after one read so the scripts stay positional."""
+
+    def await_login_success(client, *, timeout=0.8):
+        for packet in client.read_packets(timeout=0.1):
+            if Jablotron._is_login_error_packet(packet):
+                raise WrongCodeError("Wrong code.")
+
+    monkeypatch.setattr(legacy, "_await_login_success", await_login_success)
+
+
+def test_a_write_on_a_warm_session_logs_in_again_on_the_open_channel(monkeypatch) -> None:
+    """The panel ends a login's authorisation after about a minute and then
+    answers 80 01 0F with 80 02 1B 03; the write logs in again first, with
+    the login packets on the same channel and no exit sequence."""
+
+    client = ScriptedClient([[LOGIN_MASTER_POSITION_100]], replies=_success_replies())
+    h = _harness(monkeypatch, client, fresh_login=False, rights_captured=False)
+    _one_read_per_login_wait(monkeypatch)
+    sleeps: list[tuple[float, int]] = []
+    monkeypatch.setattr(legacy.time, "sleep", lambda seconds: sleeps.append((seconds, len(client.sent))))
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert client.sent == [
+        *LOGIN_PACKETS,
+        ENABLE_DEVICE_STATES,
+        R_80010F,
+        R_80010F,
+        REVISION_QUERY,
+        HID_DELETE_PACKET,
+        R_52010C,
+        R_800114,
+        REVISION_QUERY,
+        ENABLE_DEVICE_STATES,
+    ]
+    assert h.session._client is client and h.constructed == [] and h.logins == []
+    assert EXIT_SEQUENCE[0] not in client.sent
+    assert h.session._login_rights == tools.LoginRights(0x28, 100), "the login reply was captured again"
+    assert _nudge_sleeps(sleeps) == [(tools.SETUP_MODE_NUDGE_DELAY, 3)], (
+        "the nudge delay sits between the login and the first 80 01 0F"
+    )
+
+
+def test_trigger_export_on_a_warm_session_logs_in_again_first(monkeypatch) -> None:
+    client = ScriptedClient([[LOGIN_MASTER_POSITION_100], [RELOAD_COMPLETE], [], []])
+    h = _harness(monkeypatch, client, fresh_login=False)
+    _one_read_per_login_wait(monkeypatch)
+
+    h.session.trigger_export()
+
+    assert client.sent[:6] == [*LOGIN_PACKETS, ENABLE_DEVICE_STATES, R_520102, R_520102, R_80010F]
+    assert client.sent[-3:] == [R_520102, R_800102, R_520102]
+    assert h.session._client is client and h.constructed == [] and h.logins == []
+    assert EXIT_SEQUENCE[0] not in client.sent
+
+
+def test_one_login_serves_one_configuration_operation(monkeypatch) -> None:
+    """A fresh login is spent by the operation that used it: the export
+    trigger after a write logs in again even inside the freshness window."""
+
+    replies = _success_replies()
+    client = ScriptedClient(replies=replies)
+    h = _harness(monkeypatch, client)
+    _one_read_per_login_wait(monkeypatch)
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+    assert LOGIN_PACKETS[1] not in client.sent, "the write used the fresh login"
+
+    sent_by_write = len(client.sent)
+    client.reads = [[LOGIN_MASTER_POSITION_100], [RELOAD_COMPLETE], [], []]
+    h.session.trigger_export()
+
+    assert client.sent[sent_by_write : sent_by_write + 3] == [*LOGIN_PACKETS, ENABLE_DEVICE_STATES]
+
+
+def test_a_login_older_than_the_window_is_not_fresh(monkeypatch) -> None:
+    client = ScriptedClient(replies=_success_replies())
+    h = _harness(monkeypatch, client)
+    _one_read_per_login_wait(monkeypatch)
+    h.session._fresh_login_at -= legacy.CONFIG_OP_FRESH_LOGIN_SECONDS + 0.1
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert client.sent[:3] == [*LOGIN_PACKETS, ENABLE_DEVICE_STATES]
+
+
+def test_the_panel_ending_the_authorisation_spends_the_login(monkeypatch) -> None:
+    """80 01 01 pushed by the panel, read by any path, means the next
+    configuration operation must log in again."""
+
+    client = ScriptedClient([[PANEL_ENDED_AUTHORISATION]], replies=_success_replies())
+    h = _harness(monkeypatch, client)
+    _one_read_per_login_wait(monkeypatch)
+
+    with h.session._io_lock:
+        list(h.session._tee_client(client).read_packets(timeout=0.1))
+    assert h.session._fresh_login_at == 0.0
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+    assert client.sent[:3] == [*LOGIN_PACKETS, ENABLE_DEVICE_STATES]
+
+
+def test_a_login_made_by_the_reopen_is_used_as_it_is(monkeypatch) -> None:
+    """finish_export resets the channel; the write that follows within the
+    window starts from that login and sends no second one."""
+
+    client = ScriptedClient([[SECTIONS_CONFIG_ACTIVE]])
+    client2 = ScriptedClient([[LOGIN_MASTER_POSITION_100], []], replies=_success_replies())
+    h = _harness(monkeypatch, client, reopen_clients=[client2], fresh_login=False)
+
+    h.session.finish_export()
+    assert h.session._client is client2
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+    assert client2.sent[:2] == [ENABLE_DEVICE_STATES, R_80010F]
+    assert LOGIN_PACKETS[1] not in client2.sent
+
+
+def test_a_refused_login_before_the_trigger_is_an_export_error(monkeypatch) -> None:
+    client = ScriptedClient([[bytes.fromhex("80021b03")]])
+    h = _harness(monkeypatch, client, fresh_login=False)
+    _one_read_per_login_wait(monkeypatch)
+
+    with pytest.raises(ExportRefreshIncomplete, match="refused the session code"):
+        h.session.trigger_export()
+
+    assert h.session._client is None
+    assert client.sent == LOGIN_PACKETS, "nothing follows a refused login"
 
 
 # ------------------------------------------------------- tee client / emit
