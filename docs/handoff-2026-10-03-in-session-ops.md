@@ -6,6 +6,14 @@ date in `docs/api-server-refactor-status.md` and to the earlier handoffs
 `docs/handoff-2026-10-03-long-hid-writes.md` (chunked HID write, now
 superseded for the server path) and `docs/handoff-2026-09-25-write-gate.md`.
 
+**Resolved later the same day.** The warm session had lost its authorisation
+(the panel pushes `80 01 01` about 57 s after a login). The operations now log
+in again on the open channel first (`ff2b26d`), and the slot 96 proof passed
+with the switch on. Result and numbers: the status entry "in-session
+operations proven live on slot 96" in `docs/api-server-refactor-status.md`.
+The steps under "What to do next" are done except for the open items listed
+there. The rules below still apply.
+
 ## Rules first
 
 - The live JA-107K is attached to this host. On 2026-10-03 the test suite
