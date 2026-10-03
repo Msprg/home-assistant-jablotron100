@@ -23,12 +23,13 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Protocol
 
 from jablotron_re_tools import (
+    LoginRights,
     UserRecord,
     apply_config_payload_over_hid,
     apply_import_sector,
-    default_export_output,
     probe_login_rights,
     sector_payload_bytes as _sector_payload_bytes,
 )
@@ -71,6 +72,24 @@ class UserManagerConfig:
     # the panel grants the write code, then uses hid for master rights and
     # storage for service or ARC rights.
     write_transport: str = "auto"
+
+
+class PanelConfigSession(Protocol):
+    """What write_sector_to_panel needs from the status session
+    (PersistentSnapshotSession)."""
+
+    def login_rights_for_code(self, code: str) -> LoginRights | None: ...
+
+    def write_configuration(self, payload: bytes, *, code: str | None = None) -> int | None: ...
+
+    def close(self) -> None: ...
+
+
+def session_code_matches(config: UserManagerConfig) -> bool:
+    """True when user writes log in with the same code as the status session,
+    so a write can run inside that session instead of a separate client."""
+
+    return not config.write_auth_code or config.write_auth_code == config.auth_code
 
 
 def resolve_write_transport(config: UserManagerConfig) -> str:
@@ -120,10 +139,42 @@ def sector_payload_bytes(sector_path: Path) -> bytes:
     return _sector_payload_bytes(sector_path.read_bytes())
 
 
-def write_sector_to_panel(config: UserManagerConfig, *, sector_path: Path, verify_prefix: str) -> None:
-    transport = select_write_transport(config)
-    verify_output = default_export_output(verify_prefix)
+def write_sector_to_panel(
+    config: UserManagerConfig,
+    *,
+    sector_path: Path,
+    verify_prefix: str,
+    session: PanelConfigSession | None = None,
+) -> None:
+    """Write one user-table sector to the panel.
+
+    With a status ``session`` and a write code equal to the session code, the
+    HID transport runs inside that session (device-state streaming keeps
+    publishing). Every separate-client path closes the session first: the
+    probe and the standalone write sessions need the bus to themselves, and
+    the runtime's next poll reopens the session. No verification export runs
+    in the server path; the runtime's post-write catalog refresh is the
+    read-back. ``verify_prefix`` is kept as a log label.
+    """
+
     code = config.write_auth_code or config.auth_code
+    in_session_allowed = session is not None and session_code_matches(config)
+    transport = resolve_write_transport(config)
+    if transport == "auto":
+        # The rights come from a separate probe login for now; the session's
+        # own login reply takes over once the session reports it.
+        rights = None
+        if rights is None and session is not None:
+            # The probe logs in with its own client; two sessions on the
+            # device split the replies.
+            session.close()
+        transport = select_write_transport(config)
+    if transport == "hid" and in_session_allowed:
+        LOGGER.info("User write %s goes over HID inside the status session.", verify_prefix)
+        session.write_configuration(sector_payload_bytes(sector_path), code=code)
+        return
+    if session is not None:
+        session.close()
     if transport == "hid":
         apply_config_payload_over_hid(
             payload=sector_payload_bytes(sector_path),
@@ -133,7 +184,7 @@ def write_sector_to_panel(config: UserManagerConfig, *, sector_path: Path, verif
             reset=config.reset,
             write_cleanup_mode=config.write_cleanup_mode,
             verbose=False,
-            verify_output=verify_output,
+            verify_output=None,
         )
         return
     apply_import_sector(
@@ -147,7 +198,7 @@ def write_sector_to_panel(config: UserManagerConfig, *, sector_path: Path, verif
         stage_mode=config.stage_mode,
         write_cleanup_mode=config.write_cleanup_mode,
         verbose=False,
-        verify_output=verify_output,
+        verify_output=None,
     )
 
 
@@ -343,6 +394,7 @@ def apply_upsert(
     current: UserRecord | None,
     preflight: UserWritePreflight,
     verify_prefix: str,
+    session: PanelConfigSession | None = None,
 ) -> None:
     """Build the upsert sector, validate it, then write it to the panel.
 
@@ -378,7 +430,7 @@ def apply_upsert(
         for message in warnings:
             LOGGER.warning("User %s write preflight warning: %s", user_id, message)
 
-        write_sector_to_panel(config, sector_path=sector_path, verify_prefix=verify_prefix)
+        write_sector_to_panel(config, sector_path=sector_path, verify_prefix=verify_prefix, session=session)
     finally:
         if cleanup_sector and sector_path.exists():
             sector_path.unlink()
@@ -389,11 +441,12 @@ def apply_delete(
     *,
     user_id: int,
     verify_prefix: str,
+    session: PanelConfigSession | None = None,
 ) -> None:
     args = build_user_args(config, command="delete", user_id=user_id)
     sector_path, _, cleanup_sector = build_delete_sector(args)
     try:
-        write_sector_to_panel(config, sector_path=sector_path, verify_prefix=verify_prefix)
+        write_sector_to_panel(config, sector_path=sector_path, verify_prefix=verify_prefix, session=session)
     finally:
         if cleanup_sector and sector_path.exists():
             sector_path.unlink()

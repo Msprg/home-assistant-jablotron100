@@ -41,6 +41,11 @@ class PanelSettings:
     # catalog be served as if it were current. Refreshes are demand-driven —
     # nothing in the server refreshes the catalog on a timer.
     catalog_max_age_seconds: float = 3600.0
+    # User writes run inside the persistent status session (device-state
+    # streaming keeps publishing during them). False restores the previous
+    # behaviour: the status session is closed and a separate client logs in
+    # for the write. A rollback switch, not a design option.
+    in_session_config_ops: bool = True
 
 
 @dataclass
@@ -78,5 +83,7 @@ class ServerSettings:
             catalog_max_age_seconds=float(
                 os.getenv("JABLOTRON_PANEL_CATALOG_MAX_AGE_SECONDS", "3600")
             ),
+            in_session_config_ops=os.getenv("JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS", "true").lower()
+            not in {"0", "false", "no"},
         )
     )

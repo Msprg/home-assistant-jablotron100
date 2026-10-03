@@ -23,6 +23,7 @@ from jablotron_api.domain.models import (
     InitialSetupModel,
     InitialSetupRangeModel,
     UserCreateModel,
+    UserModel,
     UserPatchModel,
 )
 from jablotron_api.domain.user_validation import (
@@ -267,8 +268,41 @@ def test_preflight_from_records_omits_current_for_a_create():
 # ---------------------------------------------------------------- panel runtime
 
 
+class _FakeConfigSession:
+    """Stand-in for the persistent status session as the runtime and the
+    user manager see it. Shared with other test files. A write through it
+    is a test failure: these tests exercise the separate-client stubs."""
+
+    def __init__(self) -> None:
+        self.closes = 0
+
+    def login_rights_for_code(self, code):
+        return None
+
+    def write_configuration(self, payload, *, code=None):
+        pytest.fail("the fake status session must not be written through")
+
+    def close(self) -> None:
+        self.closes += 1
+
+    def trigger_export(self) -> None:
+        return None
+
+    def finish_export(self) -> None:
+        return None
+
+    def configure_live_devices(self, devices, *, pg_count, panel_model) -> None:
+        return None
+
+    def set_on_device_state_change(self, callback) -> None:
+        return None
+
+
 def _runtime() -> PanelRuntime:
     runtime = PanelRuntime(PanelRuntimeConfig(port="auto", auth_code="1812"))
+    # A status session object so _prepare_panel_config_op_locked never
+    # constructs a real one (that would look for the USB device).
+    runtime._status_session = _FakeConfigSession()
     # A cached catalog that knows the user range but holds NO users: anything
     # the rules find has to have come from the fresh read.
     runtime._catalog = ExportCatalogModel(
@@ -384,6 +418,106 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
             await runtime.delete_user(4)
 
     asyncio.run(run())
+
+
+def test_runtime_hands_the_status_session_to_the_write(monkeypatch) -> None:
+    runtime = _runtime()
+    captured: dict = {}
+    closes: list[bool] = []
+
+    def fake_apply(config, **kwargs):
+        captured["session"] = kwargs["session"]
+
+    async def fake_close() -> None:
+        closes.append(True)
+
+    async def noop() -> None:
+        return None
+
+    monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
+    monkeypatch.setattr(runtime_module, "_apply_delete_user", fake_apply)
+    monkeypatch.setattr(runtime, "refresh_catalog", noop)
+    monkeypatch.setattr(runtime, "get_user", lambda user_id: _async_value(None))
+
+    asyncio.run(runtime.delete_user(4))
+    assert captured["session"] is runtime._status_session
+    assert captured["session"] is not None
+    assert closes == [], "in-session mode keeps the status session open across the write"
+
+    # The rollback switch: the session is closed and the write gets no session.
+    runtime._config.in_session_config_ops = False
+    asyncio.run(runtime.delete_user(4))
+    assert captured["session"] is None
+    assert closes == [True]
+
+
+def _full_record(user_id: int, code: str, *, name: str):
+    """A fresh-read row with every field user_to_model reads: the edit path
+    re-derives the carried-over fields from the row it has just pulled."""
+
+    return SimpleNamespace(
+        user_id=user_id,
+        code=code,
+        cards=[],
+        time_limited_group_raw=None,
+        name=name,
+        phone="",
+        comment="",
+        flags_raw=None,
+        access_raw=None,
+        section_ids=[],
+        pg_ids=[],
+        enabled=None,
+        rights="",
+    )
+
+
+@pytest.mark.parametrize("operation", ["add", "edit"])
+def test_the_write_gets_the_session_that_survives_the_preflight_pull(monkeypatch, operation) -> None:
+    """The preflight pull still closes and detaches the status session. The
+    write must receive the session object the runtime owns *after* that, not
+    one fetched earlier that would log in again as an orphan second session.
+    Both write paths that pull first are covered; delete has no preflight."""
+
+    runtime = _runtime()
+    first = runtime._status_session
+    recorded: dict = {}
+    existing = UserModel(id=4, name="Old", code="1486")
+    lookups: list[int] = []
+
+    async def fake_pull(prefix: str):
+        await runtime._close_status_session_locked()  # the real close, as the pull does today
+        return _snapshot([_full_record(4, "1486", name="Old")] if operation == "edit" else [])
+
+    def fake_apply(config, **kwargs):
+        recorded["session"] = kwargs["session"]
+
+    async def noop() -> None:
+        return None
+
+    async def get_user(user_id, max_age_seconds=None):
+        # The edit's existence check before the write finds the user; the
+        # verification lookup after the write (either path) finds nothing.
+        lookups.append(user_id)
+        return existing if operation == "edit" and len(lookups) == 1 else None
+
+    monkeypatch.setattr(runtime_module, "PersistentSnapshotSession", lambda **kwargs: _FakeConfigSession())
+    monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", fake_apply)
+    monkeypatch.setattr(runtime, "refresh_catalog", noop)
+    monkeypatch.setattr(runtime, "get_user", get_user)
+
+    if operation == "add":
+        with pytest.raises(RuntimeError, match="not present after add"):
+            asyncio.run(runtime.add_user(UserCreateModel(id=4, name="New", code="1484")))
+    else:
+        with pytest.raises(RuntimeError, match="disappeared after edit"):
+            asyncio.run(runtime.edit_user(4, UserPatchModel(code="1484")))
+
+    assert first.closes == 1
+    assert recorded["session"] is not None
+    assert recorded["session"] is runtime._status_session
+    assert recorded["session"] is not first
 
 
 def _refusing_runtime(monkeypatch, **config):

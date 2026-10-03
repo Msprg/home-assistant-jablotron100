@@ -42,7 +42,7 @@ from jablotron_api.domain.models import (
     UserPatchModel,
     utc_now,
 )
-from jablotron_api.protocol.legacy import PersistentSnapshotSession
+from jablotron_api.protocol.legacy import PanelConfigError, PersistentSnapshotSession
 from jablotron_api.services.catalog_io import (
     CatalogPullConfig,
     apply_catalog_names as _apply_catalog_names,
@@ -95,6 +95,24 @@ _WRITE_CODE_HINT = (
 )
 
 
+async def _run_panel_io(func, /, *args, label: str, failure_hint: str | None = None, **kwargs):
+    """Run a blocking panel operation in a worker thread and report its
+    failure as a ``RuntimeError`` (409) prefixed with ``label``.
+
+    Two failure shapes are converted: ``SystemExit`` from the standalone
+    tooling (``jablotron_re_tools``) and ``PanelConfigError`` from the
+    operations that run inside the status session.
+    """
+
+    try:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    except (SystemExit, PanelConfigError) as exc:
+        message = f"{label}: {exc}"
+        if failure_hint and "IMPORT.CFG staging failed" in message:
+            message += failure_hint
+        raise RuntimeError(message) from None
+
+
 async def _run_panel_write(func, /, *args, failure_hint: str | None = None, **kwargs):
     """Run a blocking user write in a worker thread, SystemExit-safe.
 
@@ -104,16 +122,12 @@ async def _run_panel_write(func, /, *args, failure_hint: str | None = None, **kw
     every ``except Exception`` and, raised out of ``asyncio.to_thread``,
     stops uvicorn; on 2026-09-25 a panel refusal restarted the container
     that way. Re-raised as ``RuntimeError`` it becomes the 409 the HTTP
-    layer already uses for "the panel or the link failed, stop".
+    layer already uses for "the panel or the link failed, stop". The
+    in-session write reports its failures as ``ConfigWriteError``, which
+    takes the same route.
     """
 
-    try:
-        return await asyncio.to_thread(func, *args, **kwargs)
-    except SystemExit as exc:
-        message = f"Panel write failed: {exc}"
-        if failure_hint and "IMPORT.CFG staging failed" in message:
-            message += failure_hint
-        raise RuntimeError(message) from None
+    return await _run_panel_io(func, *args, label="Panel write failed", failure_hint=failure_hint, **kwargs)
 
 
 @dataclass
@@ -146,6 +160,10 @@ class PanelRuntimeConfig:
     # Mirrors ServerSettings.panel.catalog_max_age_seconds; production passes
     # a PanelSettings here, so the two dataclasses must stay in step.
     catalog_max_age_seconds: float = 3600.0
+    # Mirrors ServerSettings.panel.in_session_config_ops: user writes run
+    # inside the persistent status session; False closes the session and
+    # uses a separate client, as before.
+    in_session_config_ops: bool = True
 
 
 class PanelRuntime:
@@ -271,9 +289,10 @@ class PanelRuntime:
         await self.refresh_all()
         self._poller_task = asyncio.create_task(self._poll_loop(), name="jablotron-panel-poller")
         LOGGER.info(
-            "Panel runtime started: user writes use the %s transport and log in with %s",
+            "Panel runtime started: user writes use the %s transport and log in with %s; in_session=%s",
             self._write_transport(),
             "the separate write code" if self._config.write_auth_code else "the session code",
+            self._config.in_session_config_ops,
         )
 
     async def close(self) -> None:
@@ -884,10 +903,24 @@ class PanelRuntime:
             include_current=include_current,
         )
 
+    async def _prepare_panel_config_op_locked(self) -> PersistentSnapshotSession | None:
+        """Caller holds self._lock. In-session mode: make sure a status session
+        object exists (it logs in lazily on first use) and return it. Legacy
+        mode: close the status session so a separate client can log in, as
+        before, and return None. Call it immediately before the write, after
+        any step that may close the session (the preflight pull still does):
+        a session fetched earlier would have been closed and detached by the
+        pull, and would live on as an orphan second login on the device."""
+        if self._config.in_session_config_ops:
+            if self._status_session is None:
+                self._status_session = self._create_status_session()
+            return self._status_session
+        await self._close_status_session_locked()
+        return None
+
     async def add_user(self, payload: UserCreateModel, *, replace: bool = False) -> UserModel:
         self._ensure_usable_user_id(payload.id)
         async with self._lock:
-            await self._close_status_session_locked()
             snapshot = await self._pull_catalog_snapshot_locked(
                 f"api-preflight-add-user{payload.id}"
             )
@@ -904,6 +937,7 @@ class PanelRuntime:
             preflight = self._user_write_preflight(
                 snapshot, payload.id, include_current=False
             )
+            session = await self._prepare_panel_config_op_locked()
             await _run_panel_write(
                 _apply_upsert_user,
                 self._user_manager_config(),
@@ -913,6 +947,7 @@ class PanelRuntime:
                 current=None,
                 preflight=preflight,
                 verify_prefix=f"api-add-user{payload.id}",
+                session=session,
             )
         await self.refresh_catalog()
         user = await self.get_user(payload.id)
@@ -933,7 +968,6 @@ class PanelRuntime:
             raise RuntimeError(f"User {user_id} not found.")
         current_record = user_to_record(current)
         async with self._lock:
-            await self._close_status_session_locked()
             snapshot = await self._pull_catalog_snapshot_locked(
                 f"api-preflight-edit-user{user_id}"
             )
@@ -946,6 +980,7 @@ class PanelRuntime:
                 # not from the poller's cache, so an edit cannot silently
                 # rewrite a field with a value the panel has since changed.
                 current_record = user_to_record(_user_to_model(fresh_record))
+            session = await self._prepare_panel_config_op_locked()
             await _run_panel_write(
                 _apply_upsert_user,
                 self._user_manager_config(),
@@ -955,6 +990,7 @@ class PanelRuntime:
                 current=current_record,
                 preflight=preflight,
                 verify_prefix=f"api-edit-user{user_id}",
+                session=session,
             )
         await self.refresh_catalog()
         user = await self.get_user(user_id)
@@ -967,13 +1003,14 @@ class PanelRuntime:
     async def delete_user(self, user_id: int) -> None:
         self._ensure_usable_user_id(user_id)
         async with self._lock:
-            await self._close_status_session_locked()
+            session = await self._prepare_panel_config_op_locked()
             await _run_panel_write(
                 _apply_delete_user,
                 self._user_manager_config(),
                 failure_hint=self._write_failure_hint(),
                 user_id=user_id,
                 verify_prefix=f"api-delete-user{user_id}",
+                session=session,
             )
         await self.refresh_catalog()
         if await self.get_user(user_id) is not None:

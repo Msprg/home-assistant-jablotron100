@@ -30,6 +30,7 @@ import jablotron_api.panel.runtime as runtime_module
 import jablotron_api.services.user_manager as user_manager
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
 from jablotron_api.server.config import PanelSettings, ServerSettings
+from test_user_write_paths import _FakeConfigSession
 
 
 class _Record:
@@ -393,6 +394,9 @@ def _write_harness(monkeypatch, tmp_path, *, cached_users, fresh_users):
     monkeypatch.setattr(user_manager, "build_upsert_sector", fake_build)
     monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: applied.append(kw))
     monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: re_tools.LoginRights(0x2A, 7))
+    # The write asks the status session for rights (none yet), the probe then
+    # reports ARC rights, so the storage stub above records the write.
+    h.runtime._status_session = _FakeConfigSession()
     h.runtime._catalog = _model(cached_users)
     h.runtime._catalog_snapshot = _snapshot(cached_users)
     h.runtime._catalog_completed_monotonic = time.monotonic()

@@ -6,8 +6,25 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterator
 
+from jablotron_re_tools import (
+    CONFIGURATION_ESCAPED_PREFIX,
+    CONFIGURATION_SECTIONS_MODE,
+    EXITED_SECTIONS_MODE,
+    REPORT_800114,
+    LoginRights,
+    describe_sections_mode,
+    enter_setup_mode,
+    leave_configuration_mode,
+    parse_login_rights,
+    read_config_revision,
+    send_accept_configuration,
+    send_report,
+    verify_config_revision_advanced,
+    wait_for_reply,
+    write_config_over_hid,
+)
 from jablotron_usb_debug import (
     DEVICE_INFO_KNOWN_SUBPACKETS,
     DEVICE_INFO_SUBPACKET_WIRELESS,
@@ -37,6 +54,24 @@ LOGGER = logging.getLogger(__name__)
 
 class WrongCodeError(ValueError):
     """Raised when the panel rejects a user-supplied control code."""
+
+
+class PanelConfigError(RuntimeError):
+    """A configuration operation inside the status session failed.
+
+    The session's channel has been reset (graceful exit, then a reopen
+    attempt) or the session was closed so the next poll logs in afresh; the
+    panel is not left in setup mode by this process. ``RuntimeError`` so the
+    HTTP layer reports it as 409, like every other panel or link failure.
+    """
+
+
+class ConfigWriteError(PanelConfigError):
+    """The HID configuration write inside the status session failed."""
+
+
+class ExportRefreshIncomplete(PanelConfigError):
+    """The export refresh sequence inside the status session did not complete."""
 
 
 @dataclass(frozen=True)
@@ -124,8 +159,62 @@ def _await_login_success(client: JablotronUSBClient, *, timeout: float = 0.8) ->
                 raise WrongCodeError("Wrong code.")
 
 
+class _SessionTeeClient:
+    """Client handed to the jablotron_re_tools step functions when they run
+    inside the status session.
+
+    Every packet read is fed to the session's live parser (per-packet latch
+    sync and edge emit, as in _stream_loop) and then returned to the caller,
+    so a motion edge pushed while a write or export trigger holds the bus is
+    published within one read slice instead of being dropped by
+    wait_for_reply. Writes pass straight through. The caller must hold
+    _io_lock.
+    """
+
+    def __init__(self, session: "PersistentSnapshotSession", client: JablotronUSBClient) -> None:
+        self._session = session
+        self._client = client
+
+    def read_packets(self, *, timeout: float | None = None) -> Iterator[bytes]:
+        # Materialise the batch first so the post-read dwell hook runs at a
+        # deterministic point (the step functions list() the iterator anyway).
+        # A JablotronUSBStreamError from the underlying read propagates as is.
+        packets = list(self._client.read_packets(timeout=timeout))
+        for packet in packets:
+            self._session._observe_packet_locked(packet)
+        self._session._after_read_locked()
+        return iter(packets)
+
+    def send_packet(self, packet: bytes) -> None:
+        self._client.send_packet(packet)
+
+    def send_packets(self, packets) -> None:
+        self._client.send_packets(packets)
+
+    def _write(self, report: bytes) -> None:
+        # perform_send_raw_report writes raw 64-byte reports through this.
+        self._client._write(report)
+
+    def close(self) -> None:
+        # The step functions never close the client they are handed; the
+        # session owns its channel.
+        LOGGER.debug("Ignoring close() on the session tee client")
+
+
 RAW_SESSION_KEEPALIVE = bytes.fromhex("520102")
 EXIT_DIAGNOSTICS_OFF_PACKET = bytes.fromhex("94020100")
+# In-session configuration operations.
+SETUP_MODE_LEAVE_TIMEOUT_SECONDS = 3.0  # wait for 80 01 17 after an error-path 80 01 14
+SECTIONS_MODE_QUERY_TIMEOUT_SECONDS = 0.8  # finish_export's 52 01 0E reply window
+LOGIN_RIGHTS_WAIT_SECONDS = 1.5  # how long login_rights_for_code reads for an 80 1A 0C
+# After a fully confirmed write (accept confirmed, 80 01 17 seen, revision
+# advanced) the session keeps its channel and only re-arms the device-state
+# subscription: F-Link stays connected across its writes, and the post-write
+# export stalls we saw also happened on fresh logins (the catalog retry covers
+# them). True restores the exit shape of the proven standalone write session
+# (graceful exit + immediate re-login) after every write; failure paths and a
+# missing 80 01 17 always reset the channel regardless of this flag.
+BOUNCE_AFTER_SUCCESSFUL_WRITE = False
 DEVICE_STATE_RENEWAL_SECONDS = 240.0
 DEFAULT_DIAGNOSTICS_TIMEOUT_SECONDS = 2.0
 WIRELESS_TEMPERATURE_DIAGNOSTICS_TIMEOUT_SECONDS = 5.0
@@ -474,14 +563,27 @@ class PersistentSnapshotSession:
         self._state_on_since: dict[int, float] = {}
         self._pending_off: set[int] = set()
         self._on_device_state_change: Callable[[dict[int, str]], None] | None = None
+        # Login-rights bookkeeping (80 1A 0C) and the last sections mode byte
+        # seen on a 0x51 packet, captured from every read path under _io_lock.
+        # _pending_auth_code names the code being authorised while a login or
+        # re-authorisation is in flight, so a rights reply read during it is
+        # tagged with the right code.
+        self._login_rights: LoginRights | None = None
+        self._login_rights_code: str | None = None
+        self._pending_auth_code: str | None = None
+        self._last_sections_mode: int | None = None
 
     def set_on_device_state_change(self, callback: Callable[[dict[int, str]], None] | None) -> None:
-        """Register a callback fired (off the I/O lock) whenever a latched device
-        on/off state changes. The argument is a fresh copy of the latched map.
+        """Register a callback fired whenever a latched device on/off state
+        changes. The argument is a fresh copy of the latched map.
 
-        The callback runs on the stream-reader thread; it must be cheap and
-        thread-safe (the runtime hands the work straight to the event loop via
-        ``loop.call_soon_threadsafe`` and returns)."""
+        The callback fires on the I/O lock, from whichever thread observed the
+        edge: the stream-reader thread, the poll worker (snapshot read hook) or
+        the worker running a configuration operation through the tee client.
+        Every emitter holds the lock while it fires so frames reach the event
+        loop newest-last. The callback must therefore be cheap, thread-safe and
+        must never take the lock itself; the runtime only hands the frame to
+        the event loop via ``loop.call_soon_threadsafe`` and returns."""
         self._on_device_state_change = callback
 
     def configure_live_devices(self, devices, *, pg_count: int, panel_model: str | None) -> None:
@@ -658,6 +760,154 @@ class PersistentSnapshotSession:
                 self._restore_previous_authorization_locked(previous_code)
                 raise
 
+    # ------------------------------------------- in-session configuration ops
+
+    def write_configuration(self, payload: bytes, *, code: str | None = None) -> int | None:
+        """F-Link's HID configuration write, inside this session, under one
+        _io_lock hold.
+
+        Setup mode (80 01 0F -> 80 02 1A 0A -> 80 01 0F -> 80 01 12), revision
+        before (52 03 1A 01 00 -> 52 07 1B 01 00 <u16>), the 1D 09 00 <msgpack>
+        packet (chunked as 48/49/4A when it does not fit one report), the ack
+        1D 03 44 00 00, accept (52 01 0C -> 52 03 83 01 02), leave setup
+        (80 01 14 -> 80 01 17), and the revision after must have advanced.
+        Every packet read on the way is fed to the live device-state parser,
+        so motion keeps publishing while the write holds the bus.
+
+        After a fully confirmed write the session keeps its channel and
+        re-arms the device-state subscription, as F-Link stays connected
+        across its writes (BOUNCE_AFTER_SUCCESSFUL_WRITE=True instead resets
+        the channel the way the proven standalone write session ended:
+        graceful exit + immediate re-login). When the panel did not answer
+        the 80 01 14 with 80 01 17, or on any failure once setup mode was
+        entered, the channel is reset either way, so the session is never
+        left in configuration mode.
+
+        Returns the revision after the write (None when the panel reported
+        none). Raises ConfigWriteError for every failure (step refused or
+        timed out, wrong code, USB gone); the session is then either reopened
+        or closed for the next poll.
+        """
+        code = code or self._code
+        with self._io_lock:
+            try:
+                client = self._ensure_client_locked(auth_code=code)
+                self._ensure_authorized_code_locked(client, code)
+            except WrongCodeError as exc:
+                # AUTH_END already went out: we are logged out on the panel.
+                self._close_client_locked()
+                raise ConfigWriteError(f"The panel refused the write code: {exc}") from exc
+            except JablotronUSBStreamError as exc:
+                self._close_client_locked()
+                self._redetect_serial_port_locked()
+                raise ConfigWriteError(f"USB link failed before the write: {exc}") from exc
+            tee = self._tee_client(client)
+            entered_setup = False  # True once enter_setup_mode returned (80 01 12 seen)
+            # True once the panel confirmed the accept (52 03 83 01 02). From
+            # then on the leave step sends its own 80 01 14; before that an
+            # error path has to send it (an unconfirmed accept raises before
+            # 80 01 14 goes out, with the panel still in configuration mode).
+            accept_confirmed = False
+            escaped = True
+            revision_before: int | None = None
+            revision_after: int | None = None
+            try:
+                try:
+                    enter_setup_mode(tee, verbose=False, assume_logged_in=True)
+                    entered_setup = True
+                    revision_before = read_config_revision(tee, verbose=False)
+                    write_config_over_hid(tee, payload, verbose=False)
+                    send_accept_configuration(tee, verbose=False)
+                    accept_confirmed = True
+                    escaped = leave_configuration_mode(tee, verbose=False)
+                    revision_after = verify_config_revision_advanced(tee, before=revision_before, verbose=False)
+                except SystemExit as exc:
+                    raise ConfigWriteError(str(exc)) from None
+            except JablotronUSBStreamError as exc:
+                self._close_client_locked()
+                self._redetect_serial_port_locked()
+                raise ConfigWriteError(f"USB link failed during the write: {exc}") from exc
+            except BaseException:
+                # 80 01 14 goes out only from inside configuration mode (80 01 12
+                # seen) and only while the accept is unconfirmed: a missing ack,
+                # a refused or unconfirmed accept. Once the accept was confirmed
+                # the leave step has sent its own. A failed entry (no 80 01 12,
+                # or another configuration session holds the panel) gets the
+                # graceful exit for our channel only.
+                if entered_setup and not accept_confirmed:
+                    self._leave_setup_mode_locked(tee)
+                self._bounce_client_locked(reopen=True, code=code)
+                raise
+            if not escaped:
+                LOGGER.warning(
+                    "The panel did not acknowledge leaving configuration mode after the write (no 80 01 17); "
+                    "resetting the channel."
+                )
+                self._bounce_client_locked(reopen=True, code=code)
+            elif BOUNCE_AFTER_SUCCESSFUL_WRITE:
+                self._bounce_client_locked(reopen=True, code=code)
+            else:
+                try:
+                    perform_enable_device_states(client)
+                    self._last_enable_device_states_at = time.monotonic()
+                except Exception:
+                    LOGGER.warning(
+                        "Could not re-arm the device-state subscription after the write; resetting the channel.",
+                        exc_info=True,
+                    )
+                    self._bounce_client_locked(reopen=True, code=code)
+            LOGGER.info(
+                "In-session configuration write applied: revision 0x%04x -> %s, sections_mode=%s",
+                revision_before or 0,
+                None if revision_after is None else f"0x{revision_after:04x}",
+                describe_sections_mode(self._last_sections_mode),
+            )
+            return revision_after
+
+    def _leave_setup_mode_locked(self, tee: _SessionTeeClient) -> None:
+        """Error path from inside setup mode before the accept: send 80 01 14
+        and wait SETUP_MODE_LEAVE_TIMEOUT_SECONDS for 80 01 17 through the tee.
+        Logs the outcome; never raises. The caller resets the channel afterwards
+        either way."""
+        try:
+            send_report(tee, REPORT_800114, verbose=False)
+            reply = wait_for_reply(
+                tee,
+                prefix_hex=CONFIGURATION_ESCAPED_PREFIX,
+                timeout=SETUP_MODE_LEAVE_TIMEOUT_SECONDS,
+                verbose=False,
+                label="leave-setup",
+            )
+            if reply is None:
+                LOGGER.warning("No 80 01 17 after the error-path 80 01 14.")
+        except Exception:
+            LOGGER.debug("Leaving setup mode after a failed write raised", exc_info=True)
+
+    def _bounce_client_locked(self, *, reopen: bool = False, code: str | None = None) -> None:
+        """Reset this session's channel: graceful exit (best effort; the F-Link
+        exit sequence 94 02 01 00 / 80 01 01 / 52 01 0E / 52 01 02 with its
+        drain through the packet hook) and close. With reopen=True, log in
+        again at once via _ensure_client_locked (fresh login, 0x13 re-armed,
+        80 1A 0C captured by the drain) so the stream is back before the lock
+        is released; a reopen failure is logged and left to the next poll
+        (backoff applies). Keeps the stream thread, which idles while _client
+        is None."""
+        client = self._client
+        if client is not None:
+            try:
+                self._graceful_exit_locked(client)
+            except Exception:
+                LOGGER.debug("Graceful exit during channel reset raised", exc_info=True)
+        self._close_client_locked()
+        if reopen:
+            try:
+                self._ensure_client_locked(auth_code=code or self._code)
+            except Exception:
+                LOGGER.warning(
+                    "Could not reopen the status session after a configuration op; the next poll will retry.",
+                    exc_info=True,
+                )
+
     def _ensure_client_locked(self, auth_code: str | None = None) -> JablotronUSBClient:
         if self._client is not None:
             return self._client
@@ -686,21 +936,26 @@ class PersistentSnapshotSession:
                 f"Failed to open USB device {self._serial_port}: {exc}"
             ) from exc
 
+        active_code = auth_code or self._code
+        self._pending_auth_code = active_code
         try:
-            active_code = auth_code or self._code
             perform_login(client, active_code, reset=self._reset)
             time.sleep(0.5)
             perform_enable_device_states(client)
             self._last_enable_device_states_at = time.monotonic()
             perform_sections_query(client)
+            # The drain runs the packet hook, so the 80 1A 0C login reply is
+            # captured (and tagged with active_code) at every login.
             self._drain_packets_locked(client, timeout=0.5)
         except Exception:
             client.close()
+            self._pending_auth_code = None
             self._note_reopen_failure_locked()
             raise
 
         self._client = client
         self._authorized_code = active_code
+        self._pending_auth_code = None
         self._last_control_authorized_at = time.monotonic()
         # Successful (re)open clears the backoff streak.
         self._reopen_failures = 0
@@ -760,6 +1015,9 @@ class PersistentSnapshotSession:
         self._last_enable_device_states_at = 0.0
         self._authorized_code = None
         self._last_control_authorized_at = 0.0
+        self._login_rights = None
+        self._login_rights_code = None
+        self._pending_auth_code = None
         if client is None:
             return
         try:
@@ -776,15 +1034,22 @@ class PersistentSnapshotSession:
         # authorized on the panel (it isn't).
         self._authorized_code = None
         self._last_control_authorized_at = 0.0
-        client.send_packets(
-            [
-                Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END),
-                Jablotron.create_packet_authorisation_code(code),
-            ]
-        )
-        _await_login_success(client)
-        time.sleep(0.5)
-        self._authorized_code = code
+        # The rights on record belong to the code that was just logged out.
+        self._login_rights = None
+        self._login_rights_code = None
+        self._pending_auth_code = code
+        try:
+            client.send_packets(
+                [
+                    Jablotron.create_packet_ui_control(UI_CONTROL_AUTHORISATION_END),
+                    Jablotron.create_packet_authorisation_code(code),
+                ]
+            )
+            _await_login_success(self._tee_client(client))
+            time.sleep(0.5)
+            self._authorized_code = code
+        finally:
+            self._pending_auth_code = None
         self._last_control_authorized_at = time.monotonic()
 
     def _restore_previous_authorization_locked(self, previous_code: str | None) -> None:
@@ -815,13 +1080,15 @@ class PersistentSnapshotSession:
         Each tick (off the lock, so control is never starved more than one burst)
         it takes _io_lock and: sends the ~1s keepalive when due, renews the
         device-state stream, drains pushed device-state packets into the live
-        parser/latch, and ages out any dwell-deferred "off". After releasing the
-        lock it notifies the runtime if a latched state changed. The client is
-        only consumed here, never opened — (re)open + backoff stay owned by
-        _ensure_client_locked, driven by the snapshot poll."""
+        parser/latch, and ages out any dwell-deferred "off". When a latched
+        state changed it notifies the runtime while still holding the lock, so
+        its frame cannot be overtaken by a newer one from the poll worker or a
+        configuration operation and then delivered stale (the callback only
+        schedules work on the event loop). The client is only consumed here,
+        never opened — (re)open + backoff stay owned by _ensure_client_locked,
+        driven by the snapshot poll."""
         last_keepalive = 0.0
         while not self._stop_event.wait(STREAM_LOOP_TICK_SECONDS):
-            emit_states: dict[int, str] | None = None
             with self._io_lock:
                 client = self._client
                 if client is not None:
@@ -834,6 +1101,7 @@ class PersistentSnapshotSession:
                         changed = False
                         if self._live_parser is not None:
                             for packet in client.read_packets(timeout=STREAM_READ_BUDGET_SECONDS):
+                                self._inspect_packet_locked(packet)
                                 self._live_parser.parse_packet(packet, pg_count=self._live_pg_count)
                                 # Sync after *every* packet so the rising edge of a
                                 # same-burst on->off pulse is latched before the
@@ -843,7 +1111,7 @@ class PersistentSnapshotSession:
                         if self._expire_pending_offs_locked(time.monotonic()):
                             changed = True
                         if changed:
-                            emit_states = dict(self._latched_states)
+                            self._notify_latched_locked()
                     except Exception:
                         self._close_client_locked()
                         # Follow a re-enumerated port so the next reopen targets it.
@@ -851,14 +1119,63 @@ class PersistentSnapshotSession:
                         # SystemExit ensure_serial_port raises when no device is
                         # found), so it cannot kill this daemon thread.
                         self._redetect_serial_port_locked()
-                        emit_states = None
-            if emit_states is not None and self._on_device_state_change is not None:
-                try:
-                    self._on_device_state_change(emit_states)
-                except Exception:
-                    LOGGER.debug("Device-state change callback failed", exc_info=True)
 
     # ----------------------------------------------------- device-state latch
+
+    def _tee_client(self, client: JablotronUSBClient) -> _SessionTeeClient:
+        return _SessionTeeClient(self, client)
+
+    def _inspect_packet_locked(self, packet: bytes) -> None:
+        """Session bookkeeping for every packet read by any path: the
+        login-rights reply (80 1A 0C -> LoginRights, tagged with the code being
+        authorised) and the sections-mode trailer byte of a 0x51 packet (its
+        last byte, as jablotron_re_tools.extract_sections_state_mode reads it)."""
+        rights = parse_login_rights(packet)
+        if rights is not None:
+            self._login_rights = rights
+            self._login_rights_code = self._authorized_code or self._pending_auth_code
+        if Jablotron._is_sections_states_packet(packet) and packet:
+            self._last_sections_mode = packet[-1]
+
+    def _observe_packet_locked(self, packet: bytes) -> None:
+        """Tee/drain hook: bookkeeping, then the live parser with the
+        per-packet latch sync and emit. Never raises: a malformed pushed packet
+        must not abort the configuration operation that happens to be reading
+        (the stream loop would close the client on the same exception; here the
+        operation owns the channel and decides)."""
+        try:
+            self._inspect_packet_locked(packet)
+            if self._live_parser is None:
+                return
+            self._live_parser.parse_packet(packet, pg_count=self._live_pg_count)
+            if self._sync_latch_from_live_parser_locked(time.monotonic()):
+                self._notify_latched_locked()
+        except Exception:
+            LOGGER.debug(
+                "Live-parser bookkeeping failed for a packet read inside a configuration op", exc_info=True
+            )
+
+    def _after_read_locked(self) -> None:
+        """Post-read dwell hook for the tee: a dwell-deferred off is published
+        within one read slice even when no packet arrives. Never raises."""
+        try:
+            if self._expire_pending_offs_locked(time.monotonic()):
+                self._notify_latched_locked()
+        except Exception:
+            LOGGER.debug("Dwell expiry failed inside a configuration op", exc_info=True)
+
+    def _notify_latched_locked(self) -> None:
+        """Fire the device-state callback with a copy of the latch, under the
+        lock. Ordering: every emitter holds _io_lock while it fires, so frames
+        reach the event loop newest-last. Swallows callback errors."""
+        callback = self._on_device_state_change
+        if callback is None:
+            return
+        snapshot = dict(self._latched_states)
+        try:
+            callback(snapshot)
+        except Exception:
+            LOGGER.debug("Device-state change callback failed", exc_info=True)
 
     def _sync_latch_from_live_parser_locked(self, now: float) -> bool:
         if self._live_parser is None:
@@ -925,7 +1242,7 @@ class PersistentSnapshotSession:
                 Jablotron.create_packet_enable_device_states(),
             ]
         )
-        _await_login_success(client)
+        _await_login_success(self._tee_client(client))
         self._drain_packets_locked(client, timeout=AUTHORIZATION_REFRESH_SETTLE_SECONDS)
         self._last_enable_device_states_at = time.monotonic()
         self._last_control_authorized_at = self._last_enable_device_states_at
@@ -1043,6 +1360,10 @@ class PersistentSnapshotSession:
         return False
 
     def _drain_packets_locked(self, client: JablotronUSBClient, *, timeout: float) -> list[bytes]:
+        """Read until a quiet slice or the timeout. Every packet goes through
+        the full packet hook: a device-state bitmap pushed during a login
+        drain, a control-op settle or the graceful exit is device state and
+        belongs in the latch, and the login-rights reply is captured here."""
         packets: list[bytes] = []
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -1050,6 +1371,8 @@ class PersistentSnapshotSession:
             batch = list(client.read_packets(timeout=min(0.1, remaining)))
             if not batch:
                 break
+            for packet in batch:
+                self._observe_packet_locked(packet)
             packets.extend(batch)
         return packets
 
@@ -1074,6 +1397,7 @@ class PersistentSnapshotSession:
                 continue
             saw_packets = True
             for packet in batch:
+                self._inspect_packet_locked(packet)
                 parser.parse_packet(packet, pg_count=pg_count)
                 # Surface device-state edges as they are parsed, even mid-read.
                 # A long diagnostics read holds the bus for many seconds; without
@@ -1233,12 +1557,8 @@ class PersistentSnapshotSession:
                     changed = True
         if self._expire_pending_offs_locked(now):
             changed = True
-        if changed and self._on_device_state_change is not None:
-            snapshot = dict(self._latched_states)
-            try:
-                self._on_device_state_change(snapshot)
-            except Exception:
-                LOGGER.debug("Device-state change callback failed", exc_info=True)
+        if changed:
+            self._notify_latched_locked()
         return changed
 
     def _reconcile_snapshot_devices_locked(

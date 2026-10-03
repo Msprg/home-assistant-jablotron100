@@ -1,0 +1,650 @@
+"""The HID configuration write running inside the persistent status session.
+
+The panel is a scripted client; the assertions are about which bytes go out
+in which order, that every packet read on the way still reaches the live
+device-state parser (motion keeps publishing while the write holds the bus),
+and that the session's channel ends every write in a known state: kept and
+re-armed after a fully confirmed write, reset (graceful exit + re-login) on
+every failure path and whenever the panel did not acknowledge leaving
+configuration mode. No test opens hardware: the USB client, the port lookup
+and the login helpers are replaced.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from types import SimpleNamespace
+
+import pytest
+
+import jablotron_re_tools as tools
+from jablotron_api.domain.models import DeviceStatusModel
+from jablotron_api.panel.runtime import _run_panel_write
+from jablotron_api.protocol import legacy
+from jablotron_api.protocol.legacy import (
+    MOTION_ON_MIN_DWELL_SECONDS,
+    ConfigWriteError,
+    PersistentSnapshotSession,
+    _SessionTeeClient,
+)
+from jablotron_usb_debug import Jablotron, JablotronUSBStreamError
+from test_hid_config_write import (
+    ACCEPT_CONFIRMED,
+    CONFIG_ESCAPED,
+    HID_ACK,
+    HID_DELETE_PACKET,
+    REVISION_0X204F,
+    REVISION_0X2050,
+    _clock,
+)
+
+# Panel replies.
+SETUP_1A0A = bytes.fromhex("80021a0a")
+SETUP_ENTERED = bytes.fromhex("800112")
+CONFIG_IN_USE = b"\x73\x09" + bytes(6) + b"\x94\x00\x00"  # system-state packet reporting 0x94
+D8_ON = b"\xd8\x01"
+D8_OFF = b"\xd8\x00"
+D8_PACKET = D8_ON
+
+# Raw reports and packets we send.
+R_80010F = bytes.fromhex("80010f")
+R_52010C = bytes.fromhex("52010c")
+R_800114 = bytes.fromhex("800114")
+REVISION_QUERY = tools.CONFIG_REVISION_QUERY_PACKET
+ENABLE_DEVICE_STATES = Jablotron.create_packet_enable_device_states()
+EXIT_SEQUENCE = [
+    bytes.fromhex("94020100"),
+    Jablotron.create_packet_ui_control(b"\x01"),
+    Jablotron.create_packet_command(b"\x0e"),
+    Jablotron.create_packet_command(b"\x02"),
+]
+PAYLOAD = HID_DELETE_PACKET[4:]
+
+
+class ScriptedClient:
+    """Answers reads from a positional script and, optionally, queues a reply
+    batch when a given packet or raw report goes out. Records everything sent;
+    raw reports arrive through ``_write`` and are stored without padding."""
+
+    def __init__(self, reads=None, *, replies=None) -> None:
+        self.reads = list(reads or [])
+        self.replies = {key: list(batches) for key, batches in (replies or {}).items()}
+        self.sent: list[bytes] = []
+        self.read_calls = 0
+        self.closed = False
+
+    def read_packets(self, *, timeout=None):
+        self.read_calls += 1
+        if not self.reads:
+            return iter(())
+        batch = self.reads.pop(0)
+        if isinstance(batch, BaseException):
+            raise batch
+        return iter(batch)
+
+    def _queue_reply(self, packet: bytes) -> None:
+        batches = self.replies.get(packet)
+        if batches:
+            self.reads.insert(0, batches.pop(0))
+
+    def send_packet(self, packet: bytes) -> None:
+        self.sent.append(packet)
+        self._queue_reply(packet)
+
+    def send_packets(self, packets) -> None:
+        for packet in packets:
+            self.send_packet(packet)
+
+    def _write(self, report: bytes) -> None:
+        stripped = report.rstrip(b"\x00")
+        self.sent.append(stripped)
+        self._queue_reply(stripped)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None):
+    """A session already logged in on ``client`` (no login runs for the write
+    itself) with one motion device whose live parser flips on a d8 packet.
+    Reopens construct the next prepared client, or fail with reopen_error."""
+
+    monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
+    monkeypatch.setattr(legacy.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(tools.time, "sleep", lambda seconds: None)
+    pending = list(reopen_clients)
+    constructed: list = []
+    logins: list = []
+
+    def factory(port):
+        if reopen_error is not None:
+            raise reopen_error
+        assert pending, "the test prepared no client for this reopen"
+        reopened = pending.pop(0)
+        constructed.append(reopened)
+        return reopened
+
+    monkeypatch.setattr(legacy, "JablotronUSBClient", factory)
+    monkeypatch.setattr(legacy, "perform_login", lambda c, code, *, reset: logins.append((c, code, reset)))
+    monkeypatch.setattr(legacy, "perform_sections_query", lambda c: None)
+
+    session = PersistentSnapshotSession(port="auto", code="1812", reset=True)
+    # The stream thread is exercised in test_device_state_stream; here every
+    # read must come from the test thread so the scripts stay deterministic.
+    monkeypatch.setattr(session, "_ensure_keepalive_thread_locked", lambda: None)
+    session._client = client
+    session._authorized_code = "1812"
+    session.configure_live_devices(
+        [DeviceStatusModel(id=4, name="PIR", inferred_entity_type="motion", state="off")],
+        pg_count=0,
+        panel_model="JA-107K",
+    )
+
+    def parse(packet, *, pg_count):
+        if packet[:1] == b"\xd8":
+            session._live_parser.devices_by_id[4].state = "on" if packet[1:2] != b"\x00" else "off"
+
+    monkeypatch.setattr(session._live_parser, "parse_packet", parse)
+    # The stream reader would have latched the baseline long before a write;
+    # pre-latch it so the first packet through the tee does not publish "off".
+    session._latched_states[4] = "off"
+    frames: list[dict[int, str]] = []
+    session.set_on_device_state_change(frames.append)
+    return SimpleNamespace(session=session, frames=frames, logins=logins, constructed=constructed)
+
+
+def _success_replies(*, escape=True, revision_after=REVISION_0X2050):
+    """Reply-driven script for a complete write; the escape reply is optional."""
+
+    replies = {
+        R_80010F: [[SETUP_1A0A], [SETUP_ENTERED]],
+        REVISION_QUERY: [[REVISION_0X204F], [revision_after]],
+        HID_DELETE_PACKET: [[HID_ACK]],
+        R_52010C: [[ACCEPT_CONFIRMED]],
+    }
+    if escape:
+        replies[R_800114] = [[CONFIG_ESCAPED]]
+    return replies
+
+
+def _exit_sequence_sent_after(sent: list[bytes], marker: bytes) -> bool:
+    index = len(sent) - 1 - sent[::-1].index(marker)
+    return sent[index + 1 : index + 5] == EXIT_SEQUENCE
+
+
+# ------------------------------------------------------------ happy path
+
+
+def test_write_configuration_runs_the_captured_sequence_and_keeps_streaming(monkeypatch) -> None:
+    client = ScriptedClient(
+        [
+            [SETUP_1A0A],
+            [SETUP_ENTERED],
+            [REVISION_0X204F],
+            [D8_PACKET, HID_ACK],  # motion pushed while the ack is awaited
+            [ACCEPT_CONFIRMED],
+            [CONFIG_ESCAPED],
+            [REVISION_0X2050],
+        ]
+    )
+    h = _harness(monkeypatch, client)
+    seen_at: list[tuple[dict[int, str], int]] = []
+    h.session.set_on_device_state_change(lambda frame: seen_at.append((dict(frame), len(client.sent))))
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert client.sent == [
+        R_80010F,
+        R_80010F,
+        REVISION_QUERY,
+        HID_DELETE_PACKET,
+        R_52010C,
+        R_800114,
+        REVISION_QUERY,
+        ENABLE_DEVICE_STATES,  # the 0x13 re-arm after 80 01 14 / 80 01 17
+    ]
+    assert EXIT_SEQUENCE[0] not in client.sent, "a confirmed write keeps the channel"
+    # The motion edge was published during the write step, before the ack was consumed.
+    assert seen_at == [({4: "on"}, 4)]
+    assert h.session._client is client
+    assert h.constructed == [] and h.logins == []
+    assert h.session._last_enable_device_states_at > 0
+
+
+def test_the_bounce_flag_restores_the_exit_shape_after_a_confirmed_write(monkeypatch) -> None:
+    monkeypatch.setattr(legacy, "BOUNCE_AFTER_SUCCESSFUL_WRITE", True)
+    client = ScriptedClient(replies=_success_replies())
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert client.sent[:7] == [R_80010F, R_80010F, REVISION_QUERY, HID_DELETE_PACKET, R_52010C, R_800114, REVISION_QUERY]
+    assert client.sent[7:] == EXIT_SEQUENCE
+    assert h.logins == [(client2, "1812", True)]
+    assert h.session._client is client2
+    assert h.session._last_enable_device_states_at > 0
+
+
+class _DepthTrackingLock:
+    """Wraps the session's RLock and records every moment it is fully released
+    (nesting depth back at 0) together with how far the write had got by then.
+    A per-step lock would show a full release between steps; one whole-write
+    hold shows exactly one, at the very end."""
+
+    def __init__(self, inner, progress) -> None:
+        self._inner = inner
+        self._progress = progress
+        self.depth = 0
+        self.full_releases: list = []
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        acquired = self._inner.acquire(blocking, timeout)
+        if acquired:
+            self.depth += 1
+        return acquired
+
+    def release(self) -> None:
+        self._inner.release()
+        self.depth -= 1
+        if self.depth == 0:
+            self.full_releases.append(self._progress())
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+    def _is_owned(self) -> bool:
+        return self._inner._is_owned()
+
+
+def test_write_configuration_holds_the_io_lock_for_the_whole_write(monkeypatch) -> None:
+    """One lock hold from the first 80 01 0F to the end of the reopen's drain.
+    A lock taken and released around each step would pass a per-read
+    ownership check but let the stream thread slip a keepalive or the 0x13
+    re-enable into the setup/accept handshake."""
+
+    monkeypatch.setattr(legacy, "BOUNCE_AFTER_SUCCESSFUL_WRITE", True)  # include the reopen's drain
+    client = ScriptedClient(replies=_success_replies())
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+
+    def progress():
+        return (len(client.sent), client.read_calls, client2.read_calls)
+
+    lock = _DepthTrackingLock(h.session._io_lock, progress)
+    h.session._io_lock = lock
+    depth_at_read: list[int] = []
+    for scripted in (client, client2):
+        original = scripted.read_packets
+
+        def read_packets(*, timeout=None, _original=original):
+            depth_at_read.append(lock.depth)
+            return _original(timeout=timeout)
+
+        scripted.read_packets = read_packets
+    depth_at_send: list[int] = []
+    original_write = client._write
+
+    def _write(report: bytes) -> None:
+        depth_at_send.append(lock.depth)
+        original_write(report)
+
+    client._write = _write
+
+    h.session.write_configuration(PAYLOAD)
+
+    assert client.sent[0] == R_80010F and depth_at_send[0] >= 1, "the lock was taken before the first 80 01 0F"
+    assert client2.read_calls >= 1, "the reopen drained the new client"
+    assert depth_at_read and min(depth_at_read) >= 1
+    assert min(depth_at_send) >= 1
+    # The lock dropped to depth 0 exactly once: when write_configuration
+    # returned, after every send and every read (both clients) had happened.
+    assert lock.full_releases == [progress()]
+    assert not lock._is_owned()
+
+
+def test_a_missing_80_01_17_on_success_reports_success_after_the_reset(monkeypatch, caplog) -> None:
+    client = ScriptedClient(replies=_success_replies(escape=False))
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=0.5))
+
+    with caplog.at_level(logging.WARNING, logger="jablotron_api.protocol.legacy"):
+        assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert "did not acknowledge leaving configuration mode after the write" in caplog.text
+    assert _exit_sequence_sent_after(client.sent, REVISION_QUERY)
+    assert h.session._client is client2
+
+
+def test_a_failed_post_write_re_arm_resets_the_channel_and_still_reports_success(monkeypatch, caplog) -> None:
+    """The write is already applied when the 0x13 re-arm fails: the failure
+    must not turn an applied change into a 409, and the channel must not be
+    left half-dead, so the session resets it (graceful exit + re-login)."""
+
+    client = ScriptedClient(replies=_success_replies())
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    real_enable = legacy.perform_enable_device_states
+    enable_calls: list = []
+
+    def flaky_enable(c):
+        enable_calls.append(c)
+        if len(enable_calls) == 1:
+            raise JablotronUSBStreamError("USB write failed on /dev/fakehid")
+        real_enable(c)
+
+    monkeypatch.setattr(legacy, "perform_enable_device_states", flaky_enable)
+
+    with caplog.at_level(logging.WARNING, logger="jablotron_api.protocol.legacy"):
+        assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert "Could not re-arm the device-state subscription" in caplog.text
+    assert enable_calls == [client, client2], "the failed re-arm, then the reopen's own 0x13"
+    assert ENABLE_DEVICE_STATES not in client.sent
+    assert _exit_sequence_sent_after(client.sent, REVISION_QUERY)
+    assert ENABLE_DEVICE_STATES in client2.sent
+    assert h.session._client is client2
+    assert h.logins == [(client2, "1812", True)]
+    assert h.session._last_enable_device_states_at > 0
+
+
+def test_a_live_parser_error_during_the_write_does_not_abort_it(monkeypatch) -> None:
+    client = ScriptedClient(replies=_success_replies())
+    client.replies[HID_DELETE_PACKET] = [[D8_PACKET, HID_ACK]]
+    h = _harness(monkeypatch, client)
+
+    def broken(packet, *, pg_count):
+        if packet[:1] == b"\xd8":
+            raise ValueError("malformed bitmap")
+
+    monkeypatch.setattr(h.session._live_parser, "parse_packet", broken)
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+    assert h.session._client is client
+
+
+# ------------------------------------------------------------ failure paths
+
+
+class _LeaveAwareClient(ScriptedClient):
+    """Answers the error-path 80 01 14 with 80 01 17."""
+
+    def _write(self, report: bytes) -> None:
+        super()._write(report)
+        if report.rstrip(b"\x00") == R_800114:
+            self.reads.insert(0, [CONFIG_ESCAPED])
+
+
+def test_a_missing_ack_leaves_setup_mode_then_resets_the_channel(monkeypatch) -> None:
+    client = _LeaveAwareClient([[SETUP_1A0A], [SETUP_ENTERED], [REVISION_0X204F]])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=1.0))
+
+    with pytest.raises(ConfigWriteError, match="did not answer the HID configuration write"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert client.sent[:4] == [R_80010F, R_80010F, REVISION_QUERY, HID_DELETE_PACKET]
+    assert client.sent.count(R_800114) == 1
+    assert client.sent[4:] == [R_800114, *EXIT_SEQUENCE]
+    assert h.session._client is client2
+    assert h.logins == [(client2, "1812", True)]
+
+
+def test_an_unconfirmed_accept_leaves_setup_mode_then_resets_the_channel(monkeypatch) -> None:
+    """52 01 0C draws no 52 03 83 01 02. The accept step raises before it ever
+    sends 80 01 14, so the panel is still inside configuration mode (80 01 12
+    was seen, the write was acked); the error path must send the captured way
+    out, 80 01 14, exactly once, and then reset the channel."""
+
+    replies = _success_replies()
+    del replies[R_52010C]
+    client = ScriptedClient(replies=replies)  # the error-path 80 01 14 still draws 80 01 17
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=0.5))
+
+    with pytest.raises(ConfigWriteError, match="did not confirm the configuration accept"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert client.sent == [
+        R_80010F,
+        R_80010F,
+        REVISION_QUERY,
+        HID_DELETE_PACKET,
+        R_52010C,
+        R_800114,
+        *EXIT_SEQUENCE,
+    ]
+    assert h.session._client is client2
+    assert h.logins == [(client2, "1812", True)]
+
+
+def test_a_missing_80_01_17_on_the_error_path_still_resets_the_channel(monkeypatch, caplog) -> None:
+    client = ScriptedClient([[SETUP_1A0A], [SETUP_ENTERED], [REVISION_0X204F]])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=1.0))
+
+    with caplog.at_level(logging.WARNING, logger="jablotron_api.protocol.legacy"):
+        with pytest.raises(ConfigWriteError, match="did not answer the HID configuration write"):
+            h.session.write_configuration(PAYLOAD)
+
+    assert "No 80 01 17 after the error-path 80 01 14." in caplog.text
+    assert client.sent[4:] == [R_800114, *EXIT_SEQUENCE]
+    assert h.session._client is client2
+
+
+def test_a_failed_setup_entry_sends_no_80_01_14_and_resets_the_channel(monkeypatch) -> None:
+    client = ScriptedClient([])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=5.0))
+
+    with pytest.raises(ConfigWriteError, match="Did not enter setup mode"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert R_800114 not in client.sent
+    assert client.sent == [R_80010F, *EXIT_SEQUENCE]
+    assert h.session._client is client2
+
+
+def test_a_configuration_in_use_entry_failure_sends_no_80_01_14(monkeypatch) -> None:
+    assert tools.extract_system_state_mode(CONFIG_IN_USE) == 0x94
+    client = ScriptedClient([[CONFIG_IN_USE]])
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+
+    with pytest.raises(ConfigWriteError, match="already in configuration mode"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert R_800114 not in client.sent
+    assert client.sent == [R_80010F, *EXIT_SEQUENCE]
+    assert h.session._client is client2
+
+
+def test_an_unadvanced_revision_is_a_write_error_with_a_single_80_01_14(monkeypatch) -> None:
+    client = ScriptedClient(replies=_success_replies(revision_after=REVISION_0X204F))
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+
+    with pytest.raises(ConfigWriteError, match="revision stayed"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert client.sent.count(R_800114) == 1
+    assert client.sent[:7] == [R_80010F, R_80010F, REVISION_QUERY, HID_DELETE_PACKET, R_52010C, R_800114, REVISION_QUERY]
+    assert client.sent[7:] == EXIT_SEQUENCE
+    assert h.session._client is client2
+
+
+def test_a_missing_80_01_17_and_an_unadvanced_revision_still_reset_the_channel(monkeypatch) -> None:
+    client = ScriptedClient(replies=_success_replies(escape=False, revision_after=REVISION_0X204F))
+    client2 = ScriptedClient([[]])
+    h = _harness(monkeypatch, client, reopen_clients=[client2])
+    monkeypatch.setattr(tools.time, "time", _clock(step=0.5))
+
+    with pytest.raises(ConfigWriteError, match="revision stayed"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert client.sent.count(R_800114) == 1
+    assert _exit_sequence_sent_after(client.sent, REVISION_QUERY)
+    assert h.session._client is client2
+
+
+def test_a_usb_error_mid_write_closes_the_session_as_a_config_error(monkeypatch) -> None:
+    client = ScriptedClient([[SETUP_1A0A], [SETUP_ENTERED], JablotronUSBStreamError("USB read failed on /dev/fakehid")])
+    h = _harness(monkeypatch, client)
+
+    with pytest.raises(ConfigWriteError, match="USB link failed during the write"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert h.session._client is None
+    assert client.closed
+    assert h.constructed == [], "a dead link is left to the next poll's reopen and backoff"
+    assert EXIT_SEQUENCE[0] not in client.sent
+
+
+def test_a_usb_failure_before_the_write_is_a_config_error(monkeypatch) -> None:
+    """Auto mode closes the session before the rights probe, so the write has
+    to reopen it; a reopen refused by the backoff must reach the API as a
+    ConfigWriteError (409), not as the raw OSError (500)."""
+
+    h = _harness(monkeypatch, ScriptedClient())
+    h.session._client = None
+    h.session._authorized_code = None
+    h.session._reopen_failures = 1
+    h.session._next_reopen_allowed_at = legacy.time.monotonic() + 60.0
+
+    with pytest.raises(ConfigWriteError, match="USB link failed before the write"):
+        h.session.write_configuration(PAYLOAD)
+
+    assert h.session._client is None
+    assert h.constructed == [], "the backoff refused the reopen before any client was built"
+
+
+def test_a_refused_write_code_is_a_config_error_and_closes_the_session(monkeypatch) -> None:
+    # The session is authorised with another code; re-authorising with the
+    # write code draws the panel's login-error reply (80 02 1B 03).
+    client = ScriptedClient([[bytes.fromhex("80021b03")]])
+    h = _harness(monkeypatch, client)
+    h.session._authorized_code = "4458"
+
+    with pytest.raises(ConfigWriteError, match="refused the write code"):
+        h.session.write_configuration(PAYLOAD, code="1812")
+
+    assert h.session._client is None
+    assert R_80010F not in client.sent
+
+
+def test_a_failed_reopen_after_the_write_is_logged_not_raised(monkeypatch, caplog) -> None:
+    client = ScriptedClient(replies=_success_replies(escape=False))
+    h = _harness(monkeypatch, client, reopen_error=OSError("device gone"))
+    monkeypatch.setattr(tools.time, "time", _clock(step=0.5))
+
+    with caplog.at_level(logging.WARNING, logger="jablotron_api.protocol.legacy"):
+        assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert "Could not reopen the status session" in caplog.text
+    assert h.session._client is None
+    assert h.session._reopen_failures == 1
+
+
+# ------------------------------------------------------- tee client / emit
+
+
+def test_tee_client_feeds_every_packet_and_ages_pending_offs(monkeypatch) -> None:
+    client = ScriptedClient([[D8_ON], [D8_OFF], []])
+    h = _harness(monkeypatch, client)
+    tee = h.session._tee_client(client)
+    assert isinstance(tee, _SessionTeeClient)
+
+    with h.session._io_lock:
+        assert list(tee.read_packets(timeout=0.5)) == [D8_ON]
+        assert h.frames[-1] == {4: "on"}
+
+        # The off inside the dwell is deferred: the pulse stays visible.
+        assert list(tee.read_packets(timeout=0.5)) == [D8_OFF]
+        assert h.session._latched_states[4] == "on"
+        assert 4 in h.session._pending_off
+        assert h.frames[-1] == {4: "on"}
+
+        # An empty read after the dwell publishes the deferred off through the post-read hook.
+        base = legacy.time.monotonic()
+        monkeypatch.setattr(legacy.time, "monotonic", lambda: base + MOTION_ON_MIN_DWELL_SECONDS + 0.1)
+        assert list(tee.read_packets(timeout=0.5)) == []
+        assert h.frames[-1] == {4: "off"}
+        assert 4 not in h.session._pending_off
+
+    assert client.read_calls == 3
+
+
+def test_tee_client_passes_writes_through_and_never_closes_the_channel(monkeypatch) -> None:
+    client = ScriptedClient()
+    h = _harness(monkeypatch, client)
+    tee = h.session._tee_client(client)
+
+    tee.send_packet(REVISION_QUERY)
+    tee.send_packets([R_52010C, R_800114])
+    tee._write(R_80010F + b"\x00" * 61)
+    tee.close()
+
+    assert client.sent == [REVISION_QUERY, R_52010C, R_800114, R_80010F]
+    assert not client.closed
+
+
+def test_emitters_fire_under_the_lock_in_order(monkeypatch) -> None:
+    class StreamClient(ScriptedClient):
+        pass
+
+    client = StreamClient([[D8_ON]])
+    h = _harness(monkeypatch, client)
+    records: list[tuple[dict[int, str], bool]] = []
+    h.session.set_on_device_state_change(lambda frame: records.append((dict(frame), h.session._io_lock._is_owned())))
+
+    waits = {"n": 0}
+
+    def fake_wait(timeout):
+        waits["n"] += 1
+        return waits["n"] > 1  # one loop body, then exit
+
+    monkeypatch.setattr(h.session._stop_event, "wait", fake_wait)
+    h.session._stream_loop()
+    assert records == [({4: "on"}, True)]
+
+    # A later tee read (a configuration op holding the bus) sees the off after the dwell.
+    h.session._state_on_since[4] -= MOTION_ON_MIN_DWELL_SECONDS + 1.0
+    client.reads.append([D8_OFF])
+    with h.session._io_lock:
+        list(h.session._tee_client(client).read_packets(timeout=0.5))
+
+    assert records == [({4: "on"}, True), ({4: "off"}, True)]
+
+
+def test_the_login_drain_feeds_pushed_device_state_into_the_latch(monkeypatch) -> None:
+    # A d8 pushed during the post-login drain is device state, not noise.
+    client = ScriptedClient([[D8_ON], []])
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client])
+    h.session._client = None
+    h.session._authorized_code = None
+
+    with h.session._io_lock:
+        assert h.session._ensure_client_locked() is client
+
+    assert h.frames == [{4: "on"}]
+
+
+# ------------------------------------------------------------- runtime glue
+
+
+def test_run_panel_write_turns_a_config_error_into_a_409_runtime_error() -> None:
+    def failing_write():
+        raise ConfigWriteError("x")
+
+    with pytest.raises(RuntimeError, match="Panel write failed: x"):
+        asyncio.run(_run_panel_write(failing_write))

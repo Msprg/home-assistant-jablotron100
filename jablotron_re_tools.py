@@ -2547,19 +2547,33 @@ def send_packets(client: JablotronUSBClient, packets: Iterable[bytes], *, verbos
 
 
 def enter_setup_mode(
-    client: JablotronUSBClient, *, verbose: bool, initial_packets: list[bytes] | None = None
+    client: JablotronUSBClient,
+    *,
+    verbose: bool,
+    initial_packets: list[bytes] | None = None,
+    assume_logged_in: bool = False,
 ) -> LoginRights | None:
     """Bring a logged-in session into configuration mode.
 
     Returns the rights the panel reported for the login (from the `80 1A 0C`
     reply) when that reply was seen, else ``None``. Raises ``SystemExit`` when
     the panel does not report "Setting mode entered" (`80 01 12`).
+
+    ``assume_logged_in`` is for a session that logged in long ago (the server's
+    persistent status session): its `80 1A 0C` reply is gone, so the first
+    `80 01 0F` goes out right away instead of waiting for a login reply that
+    will not come again. The rest of the handshake is unchanged.
     """
 
     service_rights = False
     service_rights_at: float | None = None
     login_rights: LoginRights | None = None
     nudged_0f = False
+    if assume_logged_in:
+        send_report(client, REPORT_80010F, verbose=verbose)
+        service_rights = True
+        service_rights_at = time.time()
+        nudged_0f = True
     saw_1a0a = False
     saw_1a0a_at: float | None = None
     saw_1b00 = False
@@ -2707,14 +2721,11 @@ def verify_config_revision_advanced(client: JablotronUSBClient, *, before: int |
     return after
 
 
-def perform_accept_configuration(client: JablotronUSBClient, *, verbose: bool) -> None:
-    """Commit a staged configuration change the way F-Link does after a write.
-
-    `52 01 0C` (talker JA100_ACCEPT_CFG) is answered by `52 03 83 01 02` once
-    the panel has applied the change; `80 01 14` then leaves configuration
-    mode and is answered by `80 01 17`. F-Link re-enters configuration mode
-    after that because it stays connected; this session exits instead.
-    """
+def send_accept_configuration(client: JablotronUSBClient, *, verbose: bool) -> None:
+    """Commit a staged configuration change: `52 01 0C` (talker
+    JA100_ACCEPT_CFG), answered by `52 03 83 01 02` once the panel has applied
+    the change. Raises SystemExit when that confirmation does not come; the
+    panel is then still in configuration mode and nothing has left it."""
 
     send_report(client, REPORT_52010C, verbose=verbose)
     accepted = wait_for_reply(
@@ -2723,12 +2734,41 @@ def perform_accept_configuration(client: JablotronUSBClient, *, verbose: bool) -
     if accepted is None:
         raise SystemExit("The panel did not confirm the configuration accept (no 52 03 83 01 02 after 52 01 0C).")
 
+
+def leave_configuration_mode(client: JablotronUSBClient, *, verbose: bool) -> bool:
+    """Leave configuration mode after an accepted change: `80 01 14`, answered
+    by `80 01 17`. Returns True when that acknowledgement was seen, False (with
+    a warning) when it did not come within the window."""
+
     send_report(client, REPORT_800114, verbose=verbose)
     escaped = wait_for_reply(
         client, prefix_hex=CONFIGURATION_ESCAPED_PREFIX, timeout=3.0, verbose=verbose, label="escape"
     )
     if escaped is None:
         LOGGER.warning("The panel did not acknowledge leaving configuration mode (no 80 01 17 after 80 01 14).")
+    return escaped is not None
+
+
+def perform_accept_configuration(client: JablotronUSBClient, *, verbose: bool) -> bool:
+    """Commit a staged configuration change the way F-Link does after a write.
+
+    `52 01 0C` (talker JA100_ACCEPT_CFG) is answered by `52 03 83 01 02` once
+    the panel has applied the change; `80 01 14` then leaves configuration
+    mode and is answered by `80 01 17`. F-Link re-enters configuration mode
+    after that because it stays connected; this session exits instead.
+
+    The two halves are `send_accept_configuration` and
+    `leave_configuration_mode`; the in-session write calls them separately so
+    it knows whether the accept was confirmed before it decides how to leave
+    configuration mode on an error. An unconfirmed accept raises SystemExit
+    here before `80 01 14` goes out.
+
+    Returns True when the panel acknowledged leaving configuration mode
+    (`80 01 17` seen), False when that reply did not come within the window.
+    """
+
+    send_accept_configuration(client, verbose=verbose)
+    return leave_configuration_mode(client, verbose=verbose)
 
 
 def perform_import_accept_sequence(client: JablotronUSBClient, *, verbose: bool) -> None:

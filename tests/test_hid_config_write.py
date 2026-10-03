@@ -17,7 +17,7 @@ import import_cfg_tool
 import jablotron_re_tools as tools
 import jablotron_api.services.user_manager as user_manager
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
-from jablotron_api.server.config import PanelSettings
+from jablotron_api.server.config import PanelSettings, ServerSettings
 from jablotron_api.services.user_manager import UserManagerConfig
 
 # Login replies `80 1A 0C ...` as the panel sent them.
@@ -547,3 +547,152 @@ def test_the_transport_setting_reaches_the_user_manager() -> None:
     assert PanelSettings(auth_code="9146").write_transport == "auto"
     # PanelSettings is what production hands to PanelRuntime; the field must exist on both.
     assert PanelRuntime(PanelSettings(auth_code="9146", write_transport="storage"))._user_manager_config().write_transport == "storage"
+
+
+def test_the_in_session_switch_is_read_from_the_environment(monkeypatch) -> None:
+    """JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS is the rollback for the in-session
+    write: it must default on, parse like the other boolean settings, and
+    reach the runtime through PanelSettings."""
+
+    monkeypatch.delenv("JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS", raising=False)
+    assert ServerSettings().panel.in_session_config_ops is True
+    for value in ("false", "0", "no", "False"):
+        monkeypatch.setenv("JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS", value)
+        assert ServerSettings().panel.in_session_config_ops is False, value
+    monkeypatch.setenv("JABLOTRON_PANEL_IN_SESSION_CONFIG_OPS", "true")
+    assert ServerSettings().panel.in_session_config_ops is True
+
+    assert PanelRuntime(PanelSettings(auth_code="9146"))._config.in_session_config_ops is True
+    assert PanelRuntime(PanelSettings(auth_code="9146", in_session_config_ops=False))._config.in_session_config_ops is False
+
+
+# ---------------------------------------------- in-session write plumbing
+
+
+def test_enter_setup_mode_assume_logged_in_sends_the_nudge_without_a_login_reply(monkeypatch) -> None:
+    """The status session logged in long ago; its 80 1A 0C is gone. The first
+    80 01 0F goes out at once, the rest of the handshake is unchanged."""
+
+    client = ScriptedClient([[bytes.fromhex("80021a0a")], [bytes.fromhex("800112")]])
+    reports: list[bytes] = []
+    monkeypatch.setattr(
+        tools, "perform_send_raw_report", lambda c, report_hex: reports.append(bytes.fromhex(report_hex).rstrip(b"\x00"))
+    )
+
+    assert tools.enter_setup_mode(client, verbose=False, assume_logged_in=True) is None
+
+    assert reports == [bytes.fromhex("80010f"), bytes.fromhex("80010f")]
+    assert client.sent == []
+
+
+def test_accept_reports_whether_the_panel_left_configuration_mode(monkeypatch) -> None:
+    client = ScriptedClient([[ACCEPT_CONFIRMED], [CONFIG_ESCAPED]])
+    _raw(monkeypatch, client)
+    assert tools.perform_accept_configuration(client, verbose=False) is True
+
+    client = ScriptedClient([[ACCEPT_CONFIRMED]])
+    _raw(monkeypatch, client)
+    monkeypatch.setattr(tools.time, "time", _clock(step=1.0))
+    assert tools.perform_accept_configuration(client, verbose=False) is False, "a missing 80 01 17 warns, it does not raise"
+    assert client.sent == [bytes.fromhex("52010c"), bytes.fromhex("800114")]
+
+
+class FakeSession:
+    """The status session as write_sector_to_panel sees it."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[bytes, str | None]] = []
+        self.closes = 0
+
+    def login_rights_for_code(self, code: str):
+        return None
+
+    def write_configuration(self, payload: bytes, *, code: str | None = None) -> int | None:
+        self.writes.append((payload, code))
+        return 0x2050
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+def _delete_sector(tmp_path: Path) -> Path:
+    sector = tmp_path / "sector.bin"
+    sector.write_bytes(import_cfg_tool.encode_sector(import_cfg_tool.build_user_delete_payload(96)))
+    return sector
+
+
+def test_write_sector_to_panel_uses_the_session_for_hid_when_the_codes_match(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("separate client used"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: pytest.fail("probed"))
+    session = FakeSession()
+
+    user_manager.write_sector_to_panel(
+        _config(tmp_path, write_transport="hid"), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session
+    )
+
+    assert session.writes == [(HID_DELETE_PACKET[4:], "9146")]
+    assert session.closes == 0
+
+
+def test_write_sector_to_panel_falls_back_to_a_separate_client_when_the_write_code_differs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    sent: list = []
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
+    session = FakeSession()
+    config = _config(tmp_path, write_transport="hid", write_auth_code="4455")
+    assert user_manager.session_code_matches(config) is False
+    assert user_manager.session_code_matches(_config(tmp_path)) is True
+    assert user_manager.session_code_matches(_config(tmp_path, write_auth_code="9146")) is True
+
+    user_manager.write_sector_to_panel(config, sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session)
+
+    assert session.writes == []
+    assert session.closes == 1, "the separate client needs the bus to itself"
+    assert len(sent) == 1
+    assert sent[0]["code"] == "4455"
+    assert sent[0]["payload"] == HID_DELETE_PACKET[4:]
+    assert sent[0]["verify_output"] is None, "no verification export in the server path"
+
+
+def test_storage_transport_closes_the_session_and_skips_the_verification_export(monkeypatch, tmp_path: Path) -> None:
+    staged: list = []
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("hid path used"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: staged.append(kw))
+    session = FakeSession()
+
+    user_manager.write_sector_to_panel(
+        _config(tmp_path, write_transport="storage"), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session
+    )
+
+    assert session.writes == []
+    assert session.closes == 1
+    assert len(staged) == 1 and staged[0]["verify_output"] is None
+
+
+def test_auto_transport_closes_the_session_before_the_probe_then_writes_in_session(monkeypatch, tmp_path: Path) -> None:
+    """Without rights from the session the probe logs in with its own client,
+    so the session is closed first; a master result still writes in-session
+    (the session logs in again on first use)."""
+
+    order: list[str] = []
+    session = FakeSession()
+    monkeypatch.setattr(user_manager, "probe_login_rights", lambda **kw: order.append(f"probe:{session.closes}") or tools.LoginRights(0x28, 100))
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("separate client used"))
+    monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
+
+    user_manager.write_sector_to_panel(_config(tmp_path), sector_path=_delete_sector(tmp_path), verify_prefix="t", session=session)
+
+    assert order == ["probe:1"], "the session was closed before the probe logged in"
+    assert session.writes == [(HID_DELETE_PACKET[4:], "9146")]
+
+
+def test_write_sector_to_panel_without_a_session_keeps_the_separate_client_path(monkeypatch, tmp_path: Path) -> None:
+    sent: list = []
+    monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: sent.append(kw))
+
+    user_manager.write_sector_to_panel(_config(tmp_path, write_transport="hid"), sector_path=_delete_sector(tmp_path), verify_prefix="t")
+
+    assert len(sent) == 1 and sent[0]["verify_output"] is None
