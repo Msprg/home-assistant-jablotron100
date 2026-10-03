@@ -13,6 +13,7 @@ from jablotron_re_tools import (
     CONFIGURATION_SECTIONS_MODE,
     EXITED_SECTIONS_MODE,
     REPORT_800114,
+    SETUP_MODE_NUDGE_DELAY,
     LoginRights,
     describe_sections_mode,
     enter_setup_mode,
@@ -792,6 +793,12 @@ class PersistentSnapshotSession:
         Every packet read on the way is fed to the live device-state parser,
         so motion keeps publishing while the write holds the bus.
 
+        The first 80 01 0F does not race the login reply: when no 80 1A 0C
+        has been captured for ``code`` on this channel, the write reads for
+        it (up to LOGIN_RIGHTS_WAIT_SECONDS) first, and after a login made by
+        this call it also waits SETUP_MODE_NUDGE_DELAY, as the proven
+        standalone write does.
+
         After a fully confirmed write the session keeps its channel and
         re-arms the device-state subscription, as F-Link stays connected
         across its writes (BOUNCE_AFTER_SUCCESSFUL_WRITE=True instead resets
@@ -809,8 +816,19 @@ class PersistentSnapshotSession:
         code = code or self._code
         with self._io_lock:
             try:
+                client_before = self._client
                 client = self._ensure_client_locked(auth_code=code)
+                logged_in_now = client is not client_before
                 self._ensure_authorized_code_locked(client, code)
+                # The first 80 01 0F must not race the panel's 80 1A 0C login
+                # reply. Usually the login drain (or an earlier rights lookup)
+                # has already captured it; otherwise read for it first.
+                if self._login_rights_code != code:
+                    self._await_login_rights_locked(client, code, LOGIN_RIGHTS_WAIT_SECONDS)
+                if logged_in_now:
+                    # The proven standalone write waits at least this long
+                    # after 80 1A 0C before its first 80 01 0F.
+                    time.sleep(SETUP_MODE_NUDGE_DELAY)
             except WrongCodeError as exc:
                 # AUTH_END already went out: we are logged out on the panel.
                 self._close_client_locked()

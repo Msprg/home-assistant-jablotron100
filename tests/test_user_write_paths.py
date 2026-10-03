@@ -543,10 +543,12 @@ def _full_record(user_id: int, code: str, *, name: str):
 
 @pytest.mark.parametrize("operation", ["add", "edit"])
 def test_the_write_gets_the_session_that_survives_the_preflight_pull(monkeypatch, operation) -> None:
-    """The preflight pull still closes and detaches the status session. The
-    write must receive the session object the runtime owns *after* that, not
-    one fetched earlier that would log in again as an orphan second session.
-    Both write paths that pull first are covered; delete has no preflight."""
+    """Legacy mode, kept as a defensive guard: there the preflight pull closes
+    and detaches the status session (the fake pull below does the real
+    close). The write must receive the session object the runtime owns
+    *after* that, not one fetched earlier that would log in again as an
+    orphan second session. Both write paths that pull first are covered;
+    delete has no preflight. The in-session variant follows."""
 
     runtime = _runtime()
     first = runtime._status_session
@@ -588,6 +590,57 @@ def test_the_write_gets_the_session_that_survives_the_preflight_pull(monkeypatch
     assert recorded["session"] is not None
     assert recorded["session"] is runtime._status_session
     assert recorded["session"] is not first
+
+
+@pytest.mark.parametrize("operation", ["add", "edit"])
+def test_the_in_session_write_uses_the_session_that_ran_the_preflight_pull(monkeypatch, operation) -> None:
+    """In-session mode the preflight pull runs its export trigger inside the
+    status session and leaves it open. The write must go through that very
+    session object: no close, no second session. The real
+    _pull_catalog_snapshot_locked runs, with only the catalog_io pull
+    stubbed to record the session it was handed."""
+
+    runtime = _runtime()
+    assert runtime._config.in_session_config_ops is True
+    first = runtime._status_session
+    trigger_sessions: list[tuple[str, object]] = []
+    recorded: dict = {}
+    lookups: list[int] = []
+    existing = UserModel(id=4, name="Old", code="1486")
+
+    def fake_pull_catalog_snapshot(config, prefix, *, sleep=None, **kwargs):
+        trigger_sessions.append((prefix, config.trigger_session))
+        snapshot = _snapshot([_full_record(4, "1486", name="Old")] if operation == "edit" else [])
+        # The fields the pull's debug log counts.
+        snapshot.sections_by_id = snapshot.pgs_by_id = snapshot.objects_by_id = {}
+        return snapshot
+
+    def fake_apply(config, **kwargs):
+        recorded["session"] = kwargs["session"]
+
+    async def get_user(user_id, max_age_seconds=None):
+        lookups.append(user_id)
+        return existing if operation == "edit" and len(lookups) == 1 else None
+
+    monkeypatch.setattr(runtime_module, "PersistentSnapshotSession", lambda **kwargs: pytest.fail("a second session"))
+    monkeypatch.setattr(runtime_module, "pull_catalog_snapshot", fake_pull_catalog_snapshot)
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", fake_apply)
+    _route_refresh(monkeypatch, runtime)
+    monkeypatch.setattr(runtime, "get_user", get_user)
+
+    if operation == "add":
+        with pytest.raises(RuntimeError, match="not present after add"):
+            asyncio.run(runtime.add_user(UserCreateModel(id=4, name="New", code="1484")))
+    else:
+        with pytest.raises(RuntimeError, match="disappeared after edit"):
+            asyncio.run(runtime.edit_user(4, UserPatchModel(code="1484")))
+
+    preflight_prefix, preflight_session = trigger_sessions[0]
+    assert preflight_prefix == f"api-preflight-{operation}-user4"
+    assert preflight_session is first
+    assert recorded["session"] is preflight_session, "the write went through the session that ran the pull"
+    assert runtime._status_session is first
+    assert first.closes == 0
 
 
 def _refusing_runtime(monkeypatch, **config):

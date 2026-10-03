@@ -31,7 +31,12 @@ from jablotron_api.protocol.legacy import (
     WrongCodeError,
     _SessionTeeClient,
 )
-from jablotron_api.services import user_manager
+from jablotron_api.services import catalog_io, user_manager
+
+# A private name, imported on purpose: the retry in pull_catalog_snapshot
+# recognises a stalled export only by this text in the error message, so the
+# test has to check the session's error against the exact marker it uses.
+from jablotron_api.services.catalog_io import _RELOAD_STALL_MARKER
 from jablotron_usb_debug import Jablotron, JablotronUSBStreamError, build_logon_info_reports, perform_sections_query
 from test_hid_config_write import (
     ACCEPT_CONFIRMED,
@@ -127,10 +132,12 @@ class ScriptedClient:
         self.closed = True
 
 
-def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None):
+def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None, rights_captured=True):
     """A session already logged in on ``client`` (no login runs for the write
     itself) with one motion device whose live parser flips on a d8 packet.
-    Reopens construct the next prepared client, or fail with reopen_error."""
+    Reopens construct the next prepared client, or fail with reopen_error.
+    ``rights_captured`` records the login-rights reply of that login, as the
+    login drain would have; the tests about capturing it pass False."""
 
     monkeypatch.setattr(legacy, "ensure_serial_port", lambda port: "/dev/fakehid")
     monkeypatch.setattr(legacy.time, "sleep", lambda seconds: None)
@@ -157,6 +164,9 @@ def _harness(monkeypatch, client, *, reopen_clients=(), reopen_error=None):
     monkeypatch.setattr(session, "_ensure_keepalive_thread_locked", lambda: None)
     session._client = client
     session._authorized_code = "1812"
+    if rights_captured:
+        session._login_rights = tools.LoginRights(0x28, 100)
+        session._login_rights_code = "1812"
     session.configure_live_devices(
         [DeviceStatusModel(id=4, name="PIR", inferred_entity_type="motion", state="off")],
         pg_count=0,
@@ -284,50 +294,170 @@ class _DepthTrackingLock:
         return self._inner._is_owned()
 
 
-def test_write_configuration_holds_the_io_lock_for_the_whole_write(monkeypatch) -> None:
-    """One lock hold from the first 80 01 0F to the end of the reopen's drain.
-    A lock taken and released around each step would pass a per-read
-    ownership check but let the stream thread slip a keepalive or the 0x13
-    re-enable into the setup/accept handshake."""
+def _track_lock_depth(session, clients, progress):
+    """Swap the session's lock for a _DepthTrackingLock and record its depth
+    at every read and every send (packets and raw reports) on ``clients``."""
 
-    monkeypatch.setattr(legacy, "BOUNCE_AFTER_SUCCESSFUL_WRITE", True)  # include the reopen's drain
-    client = ScriptedClient(replies=_success_replies())
-    client2 = ScriptedClient([[]])
-    h = _harness(monkeypatch, client, reopen_clients=[client2])
-
-    def progress():
-        return (len(client.sent), client.read_calls, client2.read_calls)
-
-    lock = _DepthTrackingLock(h.session._io_lock, progress)
-    h.session._io_lock = lock
+    lock = _DepthTrackingLock(session._io_lock, progress)
+    session._io_lock = lock
     depth_at_read: list[int] = []
-    for scripted in (client, client2):
-        original = scripted.read_packets
+    depth_at_send: list[int] = []
+    for scripted in clients:
+        original_read = scripted.read_packets
+        original_send = scripted.send_packet
+        original_write = scripted._write
 
-        def read_packets(*, timeout=None, _original=original):
+        def read_packets(*, timeout=None, _original=original_read):
             depth_at_read.append(lock.depth)
             return _original(timeout=timeout)
 
+        def send_packet(packet: bytes, _original=original_send) -> None:
+            depth_at_send.append(lock.depth)
+            _original(packet)
+
+        def _write(report: bytes, _original=original_write) -> None:
+            depth_at_send.append(lock.depth)
+            _original(report)
+
         scripted.read_packets = read_packets
-    depth_at_send: list[int] = []
-    original_write = client._write
+        scripted.send_packet = send_packet
+        scripted._write = _write
+    return lock, depth_at_read, depth_at_send
 
-    def _write(report: bytes) -> None:
-        depth_at_send.append(lock.depth)
-        original_write(report)
 
-    client._write = _write
+@pytest.mark.parametrize("bounce", [False, True], ids=["keep-channel", "bounce"])
+def test_write_configuration_holds_the_io_lock_for_the_whole_write(monkeypatch, bounce) -> None:
+    """One lock hold from the first 80 01 0F to the end of the write: the
+    0x13 re-arm on the kept channel, or the reopen's drain with the bounce
+    flag. A lock taken and released around each step would pass a per-read
+    ownership check but let the stream thread slip a keepalive or the 0x13
+    re-enable into the setup/accept handshake."""
+
+    monkeypatch.setattr(legacy, "BOUNCE_AFTER_SUCCESSFUL_WRITE", bounce)
+    client = ScriptedClient(replies=_success_replies())
+    client2 = ScriptedClient([[]]) if bounce else None
+    h = _harness(monkeypatch, client, reopen_clients=[client2] if bounce else [])
+
+    def progress():
+        return (len(client.sent), client.read_calls, client2.read_calls if client2 is not None else None)
+
+    clients = [client, client2] if bounce else [client]
+    lock, depth_at_read, depth_at_send = _track_lock_depth(h.session, clients, progress)
 
     h.session.write_configuration(PAYLOAD)
 
     assert client.sent[0] == R_80010F and depth_at_send[0] >= 1, "the lock was taken before the first 80 01 0F"
-    assert client2.read_calls >= 1, "the reopen drained the new client"
     assert depth_at_read and min(depth_at_read) >= 1
     assert min(depth_at_send) >= 1
+    if bounce:
+        assert client2.read_calls >= 1, "the reopen drained the new client"
+    else:
+        assert h.constructed == []
+        assert client.sent[-1] == ENABLE_DEVICE_STATES, "the 0x13 re-arm is the last thing sent"
+        assert depth_at_send[-1] >= 1, "the re-arm went out under the same hold"
     # The lock dropped to depth 0 exactly once: when write_configuration
-    # returned, after every send and every read (both clients) had happened.
+    # returned, after every send and every read had happened.
     assert lock.full_releases == [progress()]
     assert not lock._is_owned()
+
+
+def test_a_chunked_write_goes_out_back_to_back_under_one_lock_hold(monkeypatch) -> None:
+    """A payload too long for one report goes out as the 48/49/4A chunks,
+    consecutively and under the same lock hold as the rest of the write; the
+    single ack comes after the last chunk, and motion read while it is
+    awaited is still published."""
+
+    payload = bytes((index % 250) + 1 for index in range(196))
+    reports = [report.rstrip(b"\x00") for report in tools.build_hid_config_write_reports(payload)]
+    assert len(reports) > 1, "the payload must need chunking"
+    replies = _success_replies()
+    del replies[HID_DELETE_PACKET]
+    replies[reports[-1]] = [[D8_ON, HID_ACK]]
+    client = ScriptedClient(replies=replies)
+    h = _harness(monkeypatch, client)
+    seen_at: list[tuple[dict[int, str], int]] = []
+    h.session.set_on_device_state_change(lambda frame: seen_at.append((dict(frame), len(client.sent))))
+
+    def progress():
+        return (len(client.sent), client.read_calls)
+
+    lock, depth_at_read, depth_at_send = _track_lock_depth(h.session, [client], progress)
+
+    assert h.session.write_configuration(payload) == 0x2050
+
+    assert client.sent == [
+        R_80010F,
+        R_80010F,
+        REVISION_QUERY,
+        *reports,
+        R_52010C,
+        R_800114,
+        REVISION_QUERY,
+        ENABLE_DEVICE_STATES,
+    ]
+    assert seen_at == [({4: "on"}, 3 + len(reports))]
+    chunk_slice = slice(3, 3 + len(reports))
+    assert all(depth >= 1 for depth in depth_at_send[chunk_slice])
+    # No read between the chunks: they go out back to back.
+    assert len(set(client.reads_at_send[chunk_slice])) == 1
+    assert lock.full_releases == [progress()], "the lock never dropped to 0 between chunk reports"
+
+
+def _fresh_login_harness(monkeypatch, reads):
+    """A closed session whose write has to log in first, on a client that
+    answers the login drain from ``reads`` and the write from the success
+    script. Records every sleep with how many packets had gone out by then."""
+
+    client = ScriptedClient(reads, replies=_success_replies())
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client], rights_captured=False)
+    h.session._client = None
+    h.session._authorized_code = None
+    sleeps: list[tuple[float, int]] = []
+    monkeypatch.setattr(legacy.time, "sleep", lambda seconds: sleeps.append((seconds, len(client.sent))))
+    return h, client, sleeps
+
+
+def _nudge_sleeps(sleeps):
+    return [entry for entry in sleeps if entry[0] == tools.SETUP_MODE_NUDGE_DELAY]
+
+
+def test_a_write_that_logs_in_waits_the_nudge_delay_before_80_01_0f(monkeypatch) -> None:
+    # The login drain captures the rights reply, so no extra read is made.
+    h, client, sleeps = _fresh_login_harness(monkeypatch, [[LOGIN_MASTER_POSITION_100], []])
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert h.constructed == [client]
+    assert client.sent[:2] == [ENABLE_DEVICE_STATES, R_80010F]
+    assert client.reads_at_send[1] == 2, "the 80 01 0F followed the login drain without an extra read"
+    assert _nudge_sleeps(sleeps) == [(tools.SETUP_MODE_NUDGE_DELAY, 1)], (
+        "one nudge delay, after the login and before the first 80 01 0F"
+    )
+
+
+def test_a_write_that_logs_in_waits_for_a_late_login_reply(monkeypatch) -> None:
+    # The drain's first read is quiet; the rights reply comes on the next read.
+    h, client, sleeps = _fresh_login_harness(monkeypatch, [[], [LOGIN_MASTER_POSITION_100]])
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert h.session._login_rights_code == "1812"
+    assert client.sent[:2] == [ENABLE_DEVICE_STATES, R_80010F]
+    assert client.reads_at_send[1] >= 2, "the first 80 01 0F went out only after the read that carried 80 1A 0C"
+    assert client.sent[2:] == [R_80010F, REVISION_QUERY, HID_DELETE_PACKET, R_52010C, R_800114, REVISION_QUERY, ENABLE_DEVICE_STATES]
+    assert _nudge_sleeps(sleeps) == [(tools.SETUP_MODE_NUDGE_DELAY, 1)]
+
+
+def test_a_write_on_an_open_channel_adds_no_wait(monkeypatch) -> None:
+    client = ScriptedClient(replies=_success_replies())
+    h = _harness(monkeypatch, client)
+    sleeps: list[float] = []
+    monkeypatch.setattr(legacy.time, "sleep", sleeps.append)
+
+    assert h.session.write_configuration(PAYLOAD) == 0x2050
+
+    assert client.reads_at_send[0] == 0, "nothing was read before the first 80 01 0F"
+    assert tools.SETUP_MODE_NUDGE_DELAY not in sleeps
 
 
 def test_a_missing_80_01_17_on_success_reports_success_after_the_reset(monkeypatch, caplog) -> None:
@@ -697,20 +827,72 @@ def test_trigger_export_runs_the_flink_sequence_in_session_and_streams(monkeypat
     assert h.constructed == [] and h.logins == []
 
 
-def test_trigger_export_without_reload_complete_resets_the_channel_and_raises(monkeypatch) -> None:
+def _stalled_trigger(monkeypatch):
+    """Run trigger_export on a panel that never sends the reload-complete
+    reply. Returns the harness, both clients and the raised exception."""
+
     client = ScriptedClient([])
     client2 = ScriptedClient([[]])
     h = _harness(monkeypatch, client, reopen_clients=[client2])
     monkeypatch.setattr(tools.time, "time", _clock(step=2.0))
 
-    with pytest.raises(ExportRefreshIncomplete, match="reload-complete"):
+    with pytest.raises(ExportRefreshIncomplete, match="reload-complete") as excinfo:
         h.session.trigger_export()
+    return h, client, client2, excinfo.value
 
+
+def test_trigger_export_without_reload_complete_resets_the_channel_and_raises(monkeypatch) -> None:
+    h, client, client2, error = _stalled_trigger(monkeypatch)
+
+    # The catalog pull retries a stall only when its message carries this
+    # marker, so the session's error has to keep it.
+    assert _RELOAD_STALL_MARKER in str(error)
     assert client.sent[:5] == [R_520102, R_520102, R_80010F, R_520102, R_520213059A00]
     assert client.sent[-4:] == EXIT_SEQUENCE
     assert R_800102 not in client.sent, "the post-reload reports are not sent when the reload never completed"
     assert h.session._client is client2, "the retry starts from a fresh login"
     assert h.logins == [(client2, "1812", True)]
+
+
+def test_the_catalog_pull_retries_the_real_in_session_stall(monkeypatch, tmp_path) -> None:
+    """The retry in pull_catalog_snapshot matches the stall by message; feed
+    it the very exception trigger_export raises, not a hand-written copy."""
+
+    _, _, _, error = _stalled_trigger(monkeypatch)
+    failures: list[BaseException] = [error]
+    calls: list[dict] = []
+    sleeps: list[float] = []
+
+    def fake_pull_live_export_snapshot(**kwargs):
+        calls.append(kwargs)
+        if failures:
+            raise failures.pop(0)
+        return SimpleNamespace(path=tmp_path / "EXPORT.CFG.bin")
+
+    monkeypatch.setattr(catalog_io, "pull_live_export_snapshot", fake_pull_live_export_snapshot)
+    monkeypatch.setattr(
+        catalog_io,
+        "extract_export_catalog",
+        lambda path: SimpleNamespace(sections_by_id={1: object()}, pgs_by_id={}, objects_by_id={}, users=[]),
+    )
+    config = catalog_io.CatalogPullConfig(
+        flexi_cfg_device="auto",
+        port="auto",
+        auth_code="1812",
+        reset=True,
+        read_cleanup_mode="auto",
+        trigger_session=object(),
+    )
+
+    catalog = catalog_io.pull_catalog_snapshot(config, "test-prefix", sleep=sleeps.append, reload_retries=3)
+
+    assert catalog.sections_by_id
+    assert len(calls) == 2, "the stall was recognised and retried once"
+
+    # With no retries left the same error ends as ExportReloadStalled.
+    failures.append(error)
+    with pytest.raises(catalog_io.ExportReloadStalled, match="reload-complete"):
+        catalog_io.pull_catalog_snapshot(config, "test-prefix", sleep=sleeps.append, reload_retries=1)
 
 
 def test_a_usb_error_during_the_trigger_closes_the_session_as_an_export_error(monkeypatch) -> None:
@@ -816,7 +998,7 @@ AUTH_END = Jablotron.create_packet_ui_control(b"\x01")
 
 def test_login_rights_are_captured_from_the_login_drain(monkeypatch) -> None:
     client = ScriptedClient([[LOGIN_MASTER_POSITION_100], []])
-    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client])
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client], rights_captured=False)
     h.session._client = None
     h.session._authorized_code = None
 
@@ -835,7 +1017,7 @@ def test_login_rights_are_captured_from_the_login_drain(monkeypatch) -> None:
 
 def test_login_rights_capture_also_works_from_the_stream_loop_read(monkeypatch) -> None:
     client = ScriptedClient([[LOGIN_MASTER_POSITION_100]])
-    h = _harness(monkeypatch, client)
+    h = _harness(monkeypatch, client, rights_captured=False)
     waits = {"n": 0}
 
     def fake_wait(timeout):
@@ -892,7 +1074,7 @@ def test_login_rights_are_reset_when_another_code_is_authorised(monkeypatch) -> 
 def test_login_rights_for_code_returns_none_when_the_panel_never_reports_them(monkeypatch) -> None:
     client = ScriptedClient()
     client2 = ScriptedClient()
-    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client, client2])
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client, client2], rights_captured=False)
     h.session._client = None
     h.session._authorized_code = None
     monkeypatch.setattr(legacy.time, "monotonic", _clock(step=0.5))
@@ -946,7 +1128,7 @@ def test_an_auto_write_in_session_logs_in_once_and_never_probes(monkeypatch, tmp
     monkeypatch.setattr(user_manager, "apply_config_payload_over_hid", lambda **kw: pytest.fail("separate client used"))
     monkeypatch.setattr(user_manager, "apply_import_sector", lambda **kw: pytest.fail("storage path used"))
     client = ScriptedClient([[LOGIN_MASTER_POSITION_100], []], replies=_success_replies())
-    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client])
+    h = _harness(monkeypatch, ScriptedClient(), reopen_clients=[client], rights_captured=False)
     h.session._client = None
     h.session._authorized_code = None
 

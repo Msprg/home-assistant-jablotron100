@@ -25,7 +25,7 @@ from jablotron_api.domain.models import (
     UserPatchModel,
     utc_now,
 )
-from jablotron_api.domain.user_validation import UserSlotOccupied, UserWriteRejected
+from jablotron_api.domain.user_validation import UserSlotOccupied, UserWriteRejected, UserWriteViolation
 import jablotron_api.panel.runtime as runtime_module
 import jablotron_api.services.user_manager as user_manager
 from jablotron_api.panel.runtime import PanelRuntime, PanelRuntimeConfig
@@ -914,6 +914,112 @@ def test_the_post_write_refresh_serves_the_following_get(monkeypatch, tmp_path):
 
     asyncio.run(run())
     assert h.emitted.count("catalog") == 1, "the post-write refresh is announced once"
+
+
+def test_a_rejected_record_leaves_the_cache_clean(monkeypatch, tmp_path):
+    """UserWriteRejected is raised by validation before anything reaches the
+    panel, so the cache is still as good as before: no dirty mark, and the
+    next write inside the window still validates against it without a pull."""
+
+    h, applied = _write_harness(
+        monkeypatch, tmp_path, cached_users=[], fresh_users=[], preflight_max_age=60.0
+    )
+    rejections: list[int] = []
+
+    def rejecting_apply(config, **kwargs):
+        rejections.append(kwargs["user_id"])
+        raise UserWriteRejected([UserWriteViolation("test_rejection", "rejected by the test")])
+
+    monkeypatch.setattr(runtime_module, "_apply_upsert_user", rejecting_apply)
+
+    async def run():
+        with pytest.raises(UserWriteRejected):
+            await h.runtime.add_user(UserCreateModel(id=4, name="New", code="1484"))
+        assert h.runtime._catalog_dirty is False
+        with pytest.raises(UserWriteRejected):
+            await h.runtime.add_user(UserCreateModel(id=4, name="New", code="1484"))
+
+    asyncio.run(run())
+    assert rejections == [4, 4]
+    assert h.runtime._catalog_dirty is False
+    assert h.pulls == [], "both preflights were served by the clean cache"
+
+
+def test_an_edit_on_a_dirty_cache_lets_the_preflight_pull_decide(monkeypatch, tmp_path):
+    """A dirty cache may lack a user the panel has (a create whose reply was
+    lost). The early existence check must not refuse the edit from it; the
+    preflight pull finds the user and the edit goes through."""
+
+    h, applied = _write_harness(
+        monkeypatch,
+        tmp_path,
+        cached_users=[],
+        fresh_users=[_full_record(4, "1486", name="User 4")],
+        preflight_max_age=60.0,
+    )
+    h.runtime._catalog_dirty = True
+
+    async def run():
+        edited = await h.runtime.edit_user(4, UserPatchModel(name="User 4"))
+        assert edited.id == 4
+
+    asyncio.run(run())
+    assert len(applied) == 1
+    assert h.pulls == ["api-preflight-edit-user4", "api-after-edit-user4"]
+
+
+@pytest.mark.parametrize("stage", ["write", "refresh"])
+def test_a_cancelled_write_dirties_the_cache(monkeypatch, tmp_path, stage):
+    """A client that disconnects cancels the write task. Cancelled during the
+    panel write, the write may still land; cancelled during the post-write
+    refresh, it has landed and the cache is behind. Either way the cache is
+    marked dirty and the next write inside the window pulls first."""
+
+    h, applied = _write_harness(
+        monkeypatch, tmp_path, cached_users=[], fresh_users=[], preflight_max_age=60.0
+    )
+    write_gate = {"started": None, "release": None, "gated": stage == "write"}
+    writes: list[str] = []
+
+    async def gated_write(func, /, *args, failure_hint=None, **kwargs):
+        writes.append(kwargs["verify_prefix"])
+        if write_gate["gated"]:
+            write_gate["started"].set()
+            await write_gate["release"].wait()
+
+    monkeypatch.setattr(runtime_module, "_run_panel_write", gated_write)
+
+    async def run():
+        write_gate["started"] = asyncio.Event()
+        write_gate["release"] = asyncio.Event()
+        h.pull_started = asyncio.Event()
+        h.release = asyncio.Event()
+        h.gated = stage == "refresh"
+        task = asyncio.create_task(h.runtime.add_user(UserCreateModel(id=4, name="New", code="1484")))
+        if stage == "write":
+            await write_gate["started"].wait()
+        else:
+            await h.pull_started.wait()
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert h.runtime._catalog_dirty is True
+        assert not h.runtime._lock.locked()
+        pulls_before = list(h.pulls)
+
+        write_gate["gated"] = False
+        h.gated = False
+        with pytest.raises(RuntimeError, match="not present after add"):
+            await h.runtime.add_user(UserCreateModel(id=4, name="New", code="1484"))
+        assert h.pulls[len(pulls_before)] == "api-preflight-add-user4", "the dirty cache sent the next preflight to the panel"
+
+    asyncio.run(run())
+    assert writes == ["api-add-user4", "api-add-user4"]
+    if stage == "write":
+        assert h.pulls == ["api-preflight-add-user4", "api-after-add-user4"]
+    else:
+        assert h.pulls == ["api-after-add-user4", "api-preflight-add-user4", "api-after-add-user4"]
 
 
 def test_the_shipped_preflight_window_is_sixty_seconds(monkeypatch):

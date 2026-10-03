@@ -61,7 +61,7 @@ from jablotron_api.services.catalog_io import (
 )
 from jablotron_api.services.device_inference import infer_device_type as _infer_device_type
 from jablotron_api.services.event_reader import EventReaderConfig, read_recent_events
-from jablotron_api.domain.user_validation import UserSlotOccupied
+from jablotron_api.domain.user_validation import UserSlotOccupied, UserWriteRejected
 from jablotron_api.services.user_manager import (
     UserManagerConfig,
     UserWritePreflight,
@@ -1040,11 +1040,15 @@ class PanelRuntime:
         Any failure marks the cache dirty: a write that raised may still have
         reached the panel (lost ack, missing accept reply, USB drop), and a
         confirmed write whose refresh failed leaves the cache behind the
-        panel. The next preflight and every finite-age read then pull.
+        panel. The next preflight and every finite-age read then pull. The
+        one exception is UserWriteRejected: the record failed validation
+        before anything was sent, so the panel and the cache are unchanged.
         """
 
         try:
             await _run_panel_write(func, *args, failure_hint=failure_hint, **kwargs)
+        except UserWriteRejected:
+            raise
         except BaseException:
             self._catalog_dirty = True
             raise
@@ -1131,8 +1135,10 @@ class PanelRuntime:
         # fresh read, or a clean cache inside the write window) decides
         # whether the user still exists and supplies every carried-over field,
         # so making this lookup pull too would just spend a second ~16 s
-        # panel session on the same answer.
-        if await self.get_user(user_id, max_age_seconds=math.inf) is None:
+        # panel session on the same answer. A cache dirtied by a write is
+        # skipped: it may lack a user the panel has (a create whose reply was
+        # lost), and the preflight pull below decides anyway.
+        if not self._catalog_dirty and await self.get_user(user_id, max_age_seconds=math.inf) is None:
             raise RuntimeError(f"User {user_id} not found.")
         preflight_pulled = False
         try:
