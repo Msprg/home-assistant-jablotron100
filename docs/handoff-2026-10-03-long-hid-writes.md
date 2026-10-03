@@ -1,5 +1,10 @@
 # Handoff: user records longer than one HID report (2026-10-03)
 
+> **Status (2026-10-03, later):** items 1, 2, 4 and 5 of "What to build" are
+> implemented and unit-tested; item 3 has a reassembler but the diagnostics
+> reader does not use it yet; item 6 (deploy and live proof) is open because
+> the panel was not on the host when the code landed. See "Done" at the end.
+
 The HID `0x1D` user write (see `docs/handoff-2026-09-25-write-gate.md`,
 "Decoded" and "Implemented") is live-proven for records that fit one 64-byte
 report. The first real record the owner's board tried to provision did not fit:
@@ -196,3 +201,43 @@ arbitrary string.
   equality only.
 - Write the session summary into `docs/api-server-refactor-status.md`
   (new dated block under "Progress Log"), not only here.
+
+## Done (2026-10-03, later session)
+
+- `jablotron_usb_debug.split_packet_into_hid_reports` and
+  `reassemble_hid_chunk_reports` implement the `48/49/4A` framing;
+  `build_long_tlv_packet` applies the `0xFA` length-byte cap.
+  `jablotron_re_tools.build_hid_config_write_reports` wraps them for the
+  `1D` write, and `write_config_over_hid` sends the chunks back to back
+  through `perform_send_raw_report` (0.1 s apart) when the packet does not
+  fit one report; a short packet still goes out as before.
+  `HID_CONFIG_WRITE_MAX_PAYLOAD` is 1024 (sanity bound; the framing itself
+  carries 255 chunks). Signatures of `write_config_over_hid`,
+  `apply_config_payload_over_hid`, `apply_sector` unchanged.
+- Checked against the capture, framing only: a throwaway script reassembled
+  all 12 chunk groups in `flow.txt` (3 host writes, the logon line, the
+  `52 FA` and `90 EF` replies) and the splitter reproduced every group byte
+  for byte, including the count byte and the last chunk's length. The
+  script lives in the job's temp folder, not in the repo.
+- Tests (`tests/test_hid_config_write.py`): synthetic payloads of the
+  captured sizes (198, 324, 397 data bytes) give 4, 6 and 7 chunks with
+  last-chunk lengths 15, 17 and 28 and length bytes `C6`, `FA`, `FA`; the
+  single-report boundary (60 payload bytes = one report, 61 = two chunks);
+  reassembly rejects a wrong count byte or chunk type; the chunked send
+  path; the logon-info header; the settle wait.
+- Logon-info line: now `A0 <len> 03 "Info(0):--jablotron-api-server started
+  at ..."` (`build_logon_info_reports`; the old `build_flink_info_log_*`
+  names are aliases). **Not yet proven live** that the panel accepts the
+  new name; the first live session will show it.
+- Post-write stall: `pull_verification_export` sleeps
+  `POST_WRITE_EXPORT_SETTLE_SECONDS` = 1.5 s before the first export pull;
+  the 3-attempt retry stays. Whether the `retrying (1/3)` warning
+  disappears is to be read off the first live write.
+- Not done: wiring `reassemble_hid_chunk_reports` into the diagnostics
+  reader (`src/jablotron_api/protocol/legacy.py` reads single reports and
+  so still sees a `90 EF` device table as four unrelated `48/49/4A`
+  packets). Not needed for writes.
+- Not done: item 6. The panel was not attached to the host (no
+  `/dev/hidraw0`, container backing off on reopen), so no live write and
+  no rebuild. Steps stay as written above; the API image must be rebuilt
+  from a tree that contains this change.

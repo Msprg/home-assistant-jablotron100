@@ -495,28 +495,102 @@ FLINK_EXPORT_SESSION_REPORTS = [
 ]
 
 
-def build_flink_info_log_message() -> bytes:
+# A TLV packet longer than one 64-byte report goes out as chunk reports
+# (2026-10-03 F-Link capture, docs/handoff-2026-10-03-long-hid-writes.md):
+# `48 3E <count> <61 bytes>`, `49 3E <62 bytes>`..., `4A <len> <len bytes>`,
+# where `count` is the total number of chunks. The inner packet keeps its own
+# length byte up to 250 and carries 0xFA beyond that; the receiver takes the
+# real length from the chunk framing. The panel's long replies use the same
+# framing.
+HID_REPORT_SIZE = 64
+HID_CHUNK_FIRST = 0x48
+HID_CHUNK_MIDDLE = 0x49
+HID_CHUNK_LAST = 0x4A
+HID_CHUNK_FULL_LENGTH = 0x3E
+HID_CHUNK_FIRST_DATA = HID_REPORT_SIZE - 3
+HID_CHUNK_MIDDLE_DATA = HID_REPORT_SIZE - 2
+HID_LENGTH_BYTE_CAP = 0xFA
+HID_CHUNK_MAX_PACKET = HID_CHUNK_FIRST_DATA + (255 - 2) * HID_CHUNK_MIDDLE_DATA
+
+
+def build_long_tlv_packet(packet_type: int, data: bytes) -> bytes:
+    """`<type> <len> <data>` with the length byte capped at 0xFA, as F-Link frames long packets."""
+
+    return bytes([packet_type, min(len(data), HID_LENGTH_BYTE_CAP)]) + data
+
+
+def split_packet_into_hid_reports(packet: bytes) -> list[bytes]:
+    """Return the 64-byte reports that carry ``packet``: itself, or the `48/49/4A` chunk sequence."""
+
+    if not packet:
+        raise ValueError("Cannot frame an empty packet.")
+    if len(packet) <= HID_REPORT_SIZE:
+        return [packet.ljust(HID_REPORT_SIZE, b"\x00")]
+    if len(packet) > HID_CHUNK_MAX_PACKET:
+        raise ValueError(f"Packet of {len(packet)} bytes exceeds the 255-chunk HID framing.")
+    first, rest = packet[:HID_CHUNK_FIRST_DATA], packet[HID_CHUNK_FIRST_DATA:]
+    middles: list[bytes] = []
+    while len(rest) > HID_CHUNK_MIDDLE_DATA:
+        middles.append(rest[:HID_CHUNK_MIDDLE_DATA])
+        rest = rest[HID_CHUNK_MIDDLE_DATA:]
+    count = 2 + len(middles)
+    reports = [bytes([HID_CHUNK_FIRST, HID_CHUNK_FULL_LENGTH, count]) + first]
+    reports.extend(bytes([HID_CHUNK_MIDDLE, HID_CHUNK_FULL_LENGTH]) + middle for middle in middles)
+    reports.append(bytes([HID_CHUNK_LAST, len(rest)]) + rest)
+    return [report.ljust(HID_REPORT_SIZE, b"\x00") for report in reports]
+
+
+def reassemble_hid_chunk_reports(reports: Iterable[bytes]) -> bytes:
+    """Rebuild the inner packet from a `48 ... 49 ... 4A` chunk sequence (reports or bare TLVs)."""
+
+    chunks = list(reports)
+    if not chunks or chunks[0][0] != HID_CHUNK_FIRST or len(chunks[0]) < 3:
+        raise ValueError("A chunk sequence starts with a 48 3E <count> report.")
+    count = chunks[0][2]
+    if count != len(chunks):
+        raise ValueError(f"Chunk count byte says {count} chunks, got {len(chunks)}.")
+    if chunks[-1][0] != HID_CHUNK_LAST:
+        raise ValueError("A chunk sequence ends with a 4A <len> report.")
+    data = bytearray(chunks[0][3 : 3 + HID_CHUNK_FIRST_DATA])
+    for chunk in chunks[1:-1]:
+        if chunk[0] != HID_CHUNK_MIDDLE:
+            raise ValueError(f"Unexpected chunk type 0x{chunk[0]:02x} inside a chunk sequence.")
+        data += chunk[2 : 2 + HID_CHUNK_MIDDLE_DATA]
+    last = chunks[-1]
+    data += last[2 : 2 + last[1]]
+    return bytes(data)
+
+
+# F-Link writes a logon line into the panel's log as a long `A0` packet:
+# `A0 <len> 03 "Info(0):--F-Link <version> started at <time>--;UUID={<uuid> <host>\<user>}"`.
+# This project announces itself under its own name instead of F-Link's;
+# whether the panel needs the line at all is untested, it tolerates ours.
+LOGON_INFO_TYPE = 0xA0
+LOGON_INFO_SUBTYPE = 0x03
+LOGON_INFO_IDENTITY = "jablotron-api-server"
+LOGON_INFO_MAX_TEXT = 124
+
+
+def build_logon_info_message(identity: str = LOGON_INFO_IDENTITY) -> bytes:
     timestamp = time.strftime("%-m/%-d/%Y %-I:%M:%S %p")
-    hostname = socket.gethostname() or "codex-host"
-    username = getpass.getuser() or "codex"
+    hostname = socket.gethostname() or "host"
+    username = getpass.getuser() or "user"
     session_uuid = uuid.uuid4()
     message = (
-        f"Info(0):--F-Link 2.9.2.1509 started at {timestamp}--;"
+        f"Info(0):--{identity} started at {timestamp}--;"
         f"UUID={{{session_uuid} {hostname}\\{username}}}"
     )
-    return message.encode("utf-8", "replace")[:125]
+    return message.encode("utf-8", "replace")[:LOGON_INFO_MAX_TEXT]
 
 
-def build_flink_info_log_reports() -> list[str]:
-    payload = build_flink_info_log_message()
-    first = bytes([0x48, 0x3E, 0x03]) + payload[:61]
-    second = bytes([0x49, 0x3E]) + payload[61:123]
-    third = bytes([0x4A, 0x03]) + payload[123:185]
-    return [
-        first.ljust(64, b"\x00").hex(),
-        second.ljust(64, b"\x00").hex(),
-        third.ljust(64, b"\x00").hex(),
-    ]
+def build_logon_info_reports(identity: str = LOGON_INFO_IDENTITY) -> list[str]:
+    packet = build_long_tlv_packet(LOGON_INFO_TYPE, bytes([LOGON_INFO_SUBTYPE]) + build_logon_info_message(identity))
+    return [report.hex() for report in split_packet_into_hid_reports(packet)]
+
+
+# Kept for callers of the old name; the string no longer claims to be F-Link.
+build_flink_info_log_message = build_logon_info_message
+build_flink_info_log_reports = build_logon_info_reports
 
 
 def perform_trigger_export(client: JablotronUSBClient, *, include_info_query: bool, include_fl_var_query: bool) -> None:

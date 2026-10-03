@@ -136,6 +136,8 @@ section/PG control, and WebSocket subscriptions.
    `JABLOTRON_PANEL_WRITE_AUTH_CODE` is optional: when set, user writes log in
    with it instead of `JABLOTRON_PANEL_AUTH_CODE`, and every other session keeps
    using `JABLOTRON_PANEL_AUTH_CODE`. A write the panel refuses answers `409`.
+   Records longer than one 64-byte HID report go out in the panel's chunk
+   framing, as F-Link sends them; the size limit per write is 1024 bytes.
 
 ### Home Assistant alpha path
 

@@ -162,9 +162,111 @@ def test_the_sector_builders_feed_the_hid_transport_without_re_encoding(tmp_path
     assert tools.build_hid_config_write_packet(user_manager.sector_payload_bytes(sector)) == HID_DELETE_PACKET
 
 
-def test_a_payload_that_does_not_fit_one_report_is_refused() -> None:
-    with pytest.raises(SystemExit, match="does not fit one HID report"):
+def test_a_payload_over_the_sanity_cap_is_refused() -> None:
+    with pytest.raises(SystemExit, match="exceeds the HID write limit"):
         tools.build_hid_config_write_packet(b"\x00" * (tools.HID_CONFIG_WRITE_MAX_PAYLOAD + 1))
+
+
+# ------------------------------------------------------- chunk framing
+#
+# Sizes and framing from the 2026-10-03 F-Link capture
+# (docs/handoff-2026-10-03-long-hid-writes.md): inner `1D <len> 09 00 <msgpack>`
+# of 198, 324 and 397 data bytes went out as 4, 6 and 7 chunks. The record
+# contents are the owner's; the tests rebuild only the framing from synthetic
+# payloads of the same sizes.
+
+
+@pytest.mark.parametrize(
+    ("data_len", "len_byte", "chunks", "last_len"),
+    [
+        (198, 0xC6, 4, 15),  # SAVE 3, frames 12581-12587
+        (324, 0xFA, 6, 17),  # SAVE 2, frames 9475-9485
+        (397, 0xFA, 7, 28),  # SAVE 1, frames 6333-6345
+    ],
+)
+def test_long_writes_are_framed_as_f_link_frames_them(data_len: int, len_byte: int, chunks: int, last_len: int) -> None:
+    payload = bytes(range(256))[: data_len - 2] if data_len <= 258 else (bytes(range(256)) * 2)[: data_len - 2]
+    packet = tools.build_hid_config_write_packet(payload)
+    assert packet[:2] == bytes([0x1D, len_byte])
+    assert packet[2:4] == b"\x09\x00"
+    assert len(packet) == data_len + 2
+
+    reports = tools.build_hid_config_write_reports(payload)
+    assert len(reports) == chunks
+    assert all(len(report) == 64 for report in reports)
+    assert reports[0][:3] == bytes([0x48, 0x3E, chunks])
+    assert all(report[:2] == bytes([0x49, 0x3E]) for report in reports[1:-1])
+    assert reports[-1][:2] == bytes([0x4A, last_len])
+    assert reports[-1][2 + last_len :] == b"\x00" * (62 - last_len)
+
+    body = reports[0][3:] + b"".join(report[2:] for report in reports[1:-1]) + reports[-1][2 : 2 + last_len]
+    assert body == packet
+    assert tools.reassemble_hid_chunk_reports(reports) == packet
+
+
+def test_the_length_byte_is_real_up_to_250_and_0xfa_beyond() -> None:
+    assert tools.build_hid_config_write_packet(b"\x00" * 248)[1] == 0xFA
+    assert tools.build_hid_config_write_packet(b"\x00" * 249)[1] == 0xFA
+    assert tools.build_hid_config_write_packet(b"\x00" * 247)[1] == 0xF9
+
+
+def test_a_packet_that_fits_one_report_is_sent_unchunked() -> None:
+    # 60 payload bytes: `1D 3E 09 00` + 60 = 64, exactly one report.
+    reports = tools.build_hid_config_write_reports(b"\x00" * 60)
+    assert len(reports) == 1 and reports[0][:2] == bytes([0x1D, 0x3E])
+    # 61 payload bytes: 65-byte packet, two chunks, the last carrying 4 bytes.
+    reports = tools.build_hid_config_write_reports(b"\x00" * 61)
+    assert [report[:2] for report in reports] == [bytes([0x48, 0x3E]), bytes([0x4A, 0x04])]
+    assert reports[0][2] == 2
+
+
+def test_reassembly_checks_the_count_byte_and_the_chunk_types() -> None:
+    reports = tools.build_hid_config_write_reports(b"\x00" * 200)
+    with pytest.raises(ValueError, match="count byte says 4 chunks, got 3"):
+        tools.reassemble_hid_chunk_reports(reports[:-1])
+    broken = [reports[0], bytes([0x4B]) + reports[1][1:], *reports[2:]]
+    with pytest.raises(ValueError, match="Unexpected chunk type 0x4b"):
+        tools.reassemble_hid_chunk_reports(broken)
+
+
+def test_write_config_over_hid_sends_the_chunks_back_to_back(monkeypatch) -> None:
+    client = ScriptedClient([[HID_ACK]])
+    sent_reports: list[bytes] = []
+    monkeypatch.setattr(tools, "perform_send_raw_report", lambda c, report_hex: sent_reports.append(bytes.fromhex(report_hex)))
+    payload = b"\x81" * 196
+    reply = tools.write_config_over_hid(client, payload, verbose=False)
+    assert reply == HID_ACK
+    assert client.sent == []
+    assert sent_reports == tools.build_hid_config_write_reports(payload)
+    assert [report[0] for report in sent_reports] == [0x48, 0x49, 0x49, 0x4A]
+
+
+def test_the_logon_info_line_carries_the_a0_header_and_our_own_name() -> None:
+    import jablotron_usb_debug as usb
+
+    reports = [bytes.fromhex(report) for report in usb.build_logon_info_reports()]
+    assert len(reports) == 3 and reports[0][:3] == bytes([0x48, 0x3E, 0x03])
+    inner = usb.reassemble_hid_chunk_reports(reports)
+    assert inner[0] == 0xA0
+    assert inner[1] == len(inner) - 2 <= 0x7D
+    assert inner[2] == 0x03
+    text = inner[3:].decode()
+    assert text.startswith("Info(0):--jablotron-api-server started at ")
+    assert "F-Link" not in text
+    assert "UUID={" in text
+
+
+def test_the_verification_export_waits_for_the_panel_to_settle(monkeypatch, tmp_path: Path) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(tools.time, "sleep", sleeps.append)
+    monkeypatch.setattr(tools, "pull_live_export_snapshot", lambda **k: "snapshot")
+    assert (
+        tools.pull_verification_export(
+            verify_output=tmp_path / "v.bin", device="/dev/sdx", port="/dev/hidraw0", code="0000", reset=False, settle=1.5
+        )
+        == "snapshot"
+    )
+    assert sleeps == [1.5]
 
 
 def test_write_config_over_hid_waits_for_the_ack() -> None:
@@ -276,6 +378,7 @@ def test_apply_config_payload_over_hid_runs_the_captured_session(monkeypatch, tm
     monkeypatch.setattr(
         tools, "pull_live_export_snapshot", lambda **k: calls.append(("verify", k["device"], k["code"])) or "snapshot"
     )
+    monkeypatch.setattr(tools, "POST_WRITE_EXPORT_SETTLE_SECONDS", 0.0)
     real_drain = tools.drain_packets
     monkeypatch.setattr(tools, "drain_packets", lambda c, **k: [] if k.get("prefix") in {"pre", "exit-post"} else real_drain(c, **k))
 

@@ -24,11 +24,15 @@ from jablotron_usb_debug import (
     Jablotron,
     JablotronUSBClient,
     JablotronUSBStreamError,
-    build_flink_info_log_reports,
+    HID_LENGTH_BYTE_CAP,
+    build_logon_info_reports,
+    build_long_tlv_packet,
     describe_packet,
     ensure_serial_port,
     perform_login,
     perform_send_raw_report,
+    reassemble_hid_chunk_reports,
+    split_packet_into_hid_reports,
 )
 
 SECTOR_SIZE = 512
@@ -88,10 +92,14 @@ CONFIG_REVISION_REPLY_PREFIX = "52071b0100"
 # master-rights login): one TLV packet of type 0x1D carrying `09 00` and the
 # same msgpack command the storage path puts into the IMPORT.CFG sector. The
 # panel acknowledges with `1D 03 44 00 00`, then the usual `52 01 0C` accept.
-HID_CONFIG_WRITE_TYPE = b"\x1d"
+# A packet longer than one report is sent as `48/49/4A` chunk reports
+# (2026-10-03 capture: 198, 324 and 397 data bytes, all acked the same way).
+# The IMPORT.CFG sector allowed 510 command bytes; the cap below is only a
+# sanity bound, the chunk framing itself carries up to 255 reports.
+HID_CONFIG_WRITE_TYPE = 0x1D
 HID_CONFIG_WRITE_PREFIX = b"\x09\x00"
 HID_CONFIG_WRITE_ACK = "1d03440000"
-HID_CONFIG_WRITE_MAX_PAYLOAD = 64 - 2 - len(HID_CONFIG_WRITE_PREFIX)
+HID_CONFIG_WRITE_MAX_PAYLOAD = 1024
 
 IMPORT_PROGRESS_PREFIX = "5204830b24"
 IMPORT_COMPLETE_PREFIX = "520483012401"
@@ -131,14 +139,25 @@ def parse_config_revision(packet: bytes) -> int | None:
 
 
 def build_hid_config_write_packet(payload: bytes) -> bytes:
-    """Wrap a msgpack configuration command the way F-Link sends it over HID."""
+    """Wrap a msgpack configuration command the way F-Link sends it over HID.
+
+    The result is the inner `1D <len> 09 00 <msgpack>` packet; its length byte
+    is the real length up to 250 and `0xFA` beyond that. Use
+    :func:`build_hid_config_write_reports` for the reports that go on the wire.
+    """
 
     if len(payload) > HID_CONFIG_WRITE_MAX_PAYLOAD:
         raise SystemExit(
-            f"Configuration payload of {len(payload)} bytes does not fit one HID report "
-            f"(at most {HID_CONFIG_WRITE_MAX_PAYLOAD}); how F-Link splits larger records is not captured yet."
+            f"Configuration payload of {len(payload)} bytes exceeds the HID write limit "
+            f"of {HID_CONFIG_WRITE_MAX_PAYLOAD} bytes; split the change into smaller records."
         )
-    return Jablotron.create_packet(HID_CONFIG_WRITE_TYPE, HID_CONFIG_WRITE_PREFIX + payload)
+    return build_long_tlv_packet(HID_CONFIG_WRITE_TYPE, HID_CONFIG_WRITE_PREFIX + payload)
+
+
+def build_hid_config_write_reports(payload: bytes) -> list[bytes]:
+    """The 64-byte reports of one HID configuration write: one report, or the `48/49/4A` chunks."""
+
+    return split_packet_into_hid_reports(build_hid_config_write_packet(payload))
 
 
 def master_rights_storage_refusal_message(rights: LoginRights) -> str:
@@ -2241,7 +2260,7 @@ def send_config_reload_sequence(client: JablotronUSBClient, *, verbose: bool) ->
     """
 
     send_report(client, REPORT_520213059A00, verbose=verbose)
-    for report in build_flink_info_log_reports():
+    for report in build_logon_info_reports():
         send_report(client, report, verbose=verbose)
     send_report(client, REPORT_520125, verbose=verbose)
 
@@ -2744,9 +2763,23 @@ def perform_import_accept_sequence(client: JablotronUSBClient, *, verbose: bool)
 
 
 def write_config_over_hid(client: JablotronUSBClient, payload: bytes, *, verbose: bool, timeout: float = 5.0) -> bytes:
-    """Send one msgpack configuration command as a `0x1D` HID packet and await the ack."""
+    """Send one msgpack configuration command as a `0x1D` HID packet and await the ack.
 
-    send_packet(client, build_hid_config_write_packet(payload), verbose=verbose)
+    A packet that fits one report goes out as is. A longer one goes out as
+    the `48 3E <count>` / `49 3E` / `4A <len>` chunk reports back to back, as
+    F-Link sends them (about 2 ms apart; our writer waits 0.1 s between
+    reports). The panel answers both with the single `1D 03 44 00 00`.
+    """
+
+    packet = build_hid_config_write_packet(payload)
+    reports = split_packet_into_hid_reports(packet)
+    if len(reports) == 1:
+        send_packet(client, packet, verbose=verbose)
+    else:
+        if verbose:
+            print("hid_write_chunks", {"packet_bytes": len(packet), "chunks": len(reports)})
+        for report in reports:
+            send_report(client, report.hex(), verbose=verbose)
     reply = wait_for_reply(client, prefix_hex="1d", timeout=timeout, verbose=verbose, label="hid-write")
     if reply is None:
         raise SystemExit(f"The panel did not answer the HID configuration write within {timeout:.0f} s.")
@@ -2941,13 +2974,29 @@ def cleanup_write_session(
             print("write_cleanup_mode", cleanup_mode)
 
 
+# The first export trigger right after a write session did not finish in
+# either of our 2026-10-03 live writes, nor in F-Link's SAVE 2 (its
+# JA107_RELOAD_CFG timed out). Our retry after 2 s succeeded each time. Give
+# the panel a moment before asking; the retry below stays as the safety net.
+POST_WRITE_EXPORT_SETTLE_SECONDS = 1.5
+
+
 def pull_verification_export(
-    *, verify_output: Path | None, device: str, port: str, code: str, reset: bool
+    *,
+    verify_output: Path | None,
+    device: str,
+    port: str,
+    code: str,
+    reset: bool,
+    settle: float | None = None,
 ) -> ExportSnapshot | None:
     """Pull a fresh export after a write; retried when the panel is still rebuilding it."""
 
     if verify_output is None:
         return None
+    settle = POST_WRITE_EXPORT_SETTLE_SECONDS if settle is None else settle
+    if settle > 0:
+        time.sleep(settle)
     last_error: SystemExit | None = None
     for attempt in range(1, 4):
         try:
