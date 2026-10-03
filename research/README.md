@@ -738,6 +738,14 @@ First-pass map of the steady-state configuration-mode traffic (2026-03-29 traces
 - `94 02 <id> ...`, `96 03 ...`, `96 04 ... 6A 01 <subcode>`, and `90 ... 6B ...` -
   layered detail/diagnostic reads.
 
+Decoded 2026-10-03 (one installation, F-Link comm log beside the USB capture):
+the `A8` record fields, the collective table `52 03 2B 01 E6` -> `52 FA A9`
+(one record per position, replaces the whole `52 02 28` sweep), and the
+`6A 01 0D` -> `6B` topology list (device ids with parent position and bus
+line / radio flag). Layouts and confidence per field in
+[`2026-10-03_periphery-state-and-topology.md`](2026-10-03_periphery-state-and-topology.md);
+parsers in `src/jablotron_api/protocol/periphery_tables.py`.
+
 Full notes:
 [`notes/2026-03-29_f-link-config-mode-keepalive.txt`](notes/2026-03-29_f-link-config-mode-keepalive.txt) and
 [`notes/2026-03-29_f-link-background-traffic-first-pass.txt`](notes/2026-03-29_f-link-background-traffic-first-pass.txt).
