@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Protocol
+from typing import Any, Mapping, Protocol
 
 from jablotron_re_tools import (
     LoginRights,
@@ -33,7 +33,10 @@ from jablotron_re_tools import (
     probe_login_rights,
     sector_payload_bytes as _sector_payload_bytes,
 )
-from jablotron_user_tool import build_delete_sector, build_upsert_sector
+from import_cfg_tool import pack_msgpack
+from import_cfg_tool import encode_sector, write_output
+import jablotron_user_tool
+from jablotron_user_tool import build_delete_sector, build_upsert_payload, build_upsert_sector
 
 from jablotron_api.domain.codes import CodeFormat
 from jablotron_api.domain.models import (
@@ -156,6 +159,25 @@ def sector_payload_bytes(sector_path: Path) -> bytes:
     return _sector_payload_bytes(sector_path.read_bytes())
 
 
+def _choose_transport(
+    config: UserManagerConfig, session: PanelConfigSession | None, code: str
+) -> tuple[str, bool]:
+    """The transport for this write ("hid" or "storage") and whether it may
+    run inside ``session``. Under "auto" the session's own login reply names
+    the rights; the separate probe login only runs when the session cannot
+    answer for this code, and the session is closed first, since two
+    sessions on the device split the replies."""
+
+    in_session_allowed = session is not None and session_code_matches(config)
+    transport = resolve_write_transport(config)
+    if transport == "auto":
+        rights = session.login_rights_for_code(code) if in_session_allowed else None
+        if rights is None and session is not None:
+            session.close()
+        transport = select_write_transport(config, session_rights=rights)
+    return transport, in_session_allowed
+
+
 def write_sector_to_panel(
     config: UserManagerConfig,
     *,
@@ -179,17 +201,7 @@ def write_sector_to_panel(
     """
 
     code = config.write_auth_code or config.auth_code
-    in_session_allowed = session is not None and session_code_matches(config)
-    transport = resolve_write_transport(config)
-    if transport == "auto":
-        # The session's own login reply names the rights; the separate probe
-        # login only runs when the session cannot answer for this code.
-        rights = session.login_rights_for_code(code) if in_session_allowed else None
-        if rights is None and session is not None:
-            # The probe logs in with its own client; two sessions on the
-            # device split the replies.
-            session.close()
-        transport = select_write_transport(config, session_rights=rights)
+    transport, in_session_allowed = _choose_transport(config, session, code)
     if transport == "hid" and in_session_allowed:
         LOGGER.info("User write %s goes over HID inside the status session.", verify_prefix)
         session.write_configuration(sector_payload_bytes(sector_path), code=code)
@@ -221,6 +233,66 @@ def write_sector_to_panel(
         verbose=False,
         verify_output=None,
     )
+
+
+def write_payload_to_panel(
+    config: UserManagerConfig,
+    *,
+    payload: Mapping[Any, Any],
+    verify_prefix: str,
+    session: PanelConfigSession | None = None,
+) -> None:
+    """Write one msgpack configuration command, which may carry several user
+    records, to the panel in one configuration event.
+
+    The transport choice is ``write_sector_to_panel``'s. Over HID the msgpack
+    bytes go out as they are, so a command larger than one IMPORT.CFG sector
+    is possible there (up to the HID write's own bound); over storage the
+    command is encoded into one 512-byte sector, and ``encode_sector``
+    refuses a larger one. The batch planner checks the size against the
+    configured transport before any panel traffic.
+    """
+
+    code = config.write_auth_code or config.auth_code
+    data = pack_msgpack(payload)
+    transport, in_session_allowed = _choose_transport(config, session, code)
+    if transport == "hid" and in_session_allowed:
+        LOGGER.info("User write %s goes over HID inside the status session.", verify_prefix)
+        session.write_configuration(data, code=code)
+        return
+    if session is not None:
+        session.close()
+    if transport == "hid":
+        apply_config_payload_over_hid(
+            payload=data,
+            device=config.flexi_cfg_device,
+            port=config.port,
+            code=code,
+            reset=config.reset,
+            write_cleanup_mode=config.write_cleanup_mode,
+            verbose=False,
+            verify_output=None,
+        )
+        return
+    sector_path = jablotron_user_tool.default_sector_output(verify_prefix)
+    write_output(sector_path, encode_sector(payload))
+    try:
+        apply_import_sector(
+            sector_path=sector_path,
+            import_path=config.import_path,
+            device=config.flexi_cfg_device,
+            port=config.port,
+            code=code,
+            reset=config.reset,
+            mount_tool=config.mount_tool,
+            stage_mode=config.stage_mode,
+            write_cleanup_mode=config.write_cleanup_mode,
+            verbose=False,
+            verify_output=None,
+        )
+    finally:
+        if sector_path.exists():
+            sector_path.unlink()
 
 
 @dataclass(frozen=True)
@@ -266,7 +338,12 @@ def build_user_args(
 ) -> SimpleNamespace:
     fields: dict = {}
     if payload is not None:
-        fields = payload.model_dump(exclude_unset=True)
+        # An explicit JSON null means "not sent", like an omitted field.
+        fields = {key: value for key, value in payload.model_dump(exclude_unset=True).items() if value is not None}
+    # Sent lists replace the masks; an empty list clears them. Unsent ones
+    # leave the masks the sector builder carries over from the current record.
+    sections = fields.get("sections")
+    pgs = fields.get("pgs")
     return SimpleNamespace(
         command=command,
         user_id=user_id,
@@ -280,10 +357,10 @@ def build_user_args(
         field0_raw=None,
         access_raw=fields.get("access_raw"),
         permissions_raw=None,
-        sections_mask=None,
-        sections=",".join(str(item) for item in fields.get("sections", [])) or None,
-        pg_masks=None,
-        pgs=",".join(str(item) for item in fields.get("pgs", [])) or None,
+        sections_mask=0 if sections == [] else None,
+        sections=",".join(str(item) for item in sections) if sections else None,
+        pg_masks="0,0,0,0" if pgs == [] else None,
+        pgs=",".join(str(item) for item in pgs) if pgs else None,
         pg_num_if_ring_raw=None,
         field8_raw=None,
         time_limited_group_raw=fields.get("time_limited_group_raw"),
@@ -320,6 +397,13 @@ def user_first_card(user: UserModel) -> str:
     return user.cards[0] if user.cards else ""
 
 
+def same_ids(decoded: list[int], requested: list[int]) -> bool:
+    """Compare sections or PGs as the panel stores them: a bitmask has no
+    order and no duplicates, and the export decodes it in ascending order."""
+
+    return set(decoded) == set(requested)
+
+
 def verify_added_user(user: UserModel, payload: UserCreateModel) -> None:
     requested_fields = set(payload.model_fields_set) | {"name"}
     checks = {
@@ -330,8 +414,8 @@ def verify_added_user(user: UserModel, payload: UserCreateModel) -> None:
         "comment": user.comment == payload.comment,
         "flags_raw": user.flags_raw == payload.flags_raw,
         "access_raw": user.access_raw == payload.access_raw,
-        "sections": user.section_ids == payload.sections,
-        "pgs": user.pg_ids == payload.pgs,
+        "sections": same_ids(user.section_ids, payload.sections),
+        "pgs": same_ids(user.pg_ids, payload.pgs),
         "time_limited_group_raw": user.time_limited_group_raw == payload.time_limited_group_raw,
     }
     mismatches = [field for field, ok in checks.items() if field in requested_fields and not ok]
@@ -342,13 +426,14 @@ def verify_added_user(user: UserModel, payload: UserCreateModel) -> None:
 
 
 def verify_edited_user(user: UserModel, payload: UserPatchModel) -> None:
-    expected = payload.model_dump(exclude_unset=True)
+    # An explicit null was not written (build_user_args), so it is not checked.
+    expected = {key: value for key, value in payload.model_dump(exclude_unset=True).items() if value is not None}
     checks: dict[str, bool] = {}
     for field, value in expected.items():
         if field == "sections":
-            checks[field] = user.section_ids == value
+            checks[field] = same_ids(user.section_ids, value)
         elif field == "pgs":
-            checks[field] = user.pg_ids == value
+            checks[field] = same_ids(user.pg_ids, value)
         elif field == "card1":
             checks[field] = user_first_card(user) == value
         else:
@@ -358,38 +443,6 @@ def verify_edited_user(user: UserModel, payload: UserPatchModel) -> None:
         raise RuntimeError(
             f"User {user.id} post-edit verification failed for: {', '.join(mismatches)}."
         )
-
-
-def user_to_record(user: UserModel) -> UserRecord:
-    """Adapt the API `UserModel` back into the RE-tools `UserRecord` shape.
-
-    The RE tools require a current `UserRecord` when building an upsert sector
-    for an edit. Only fields used by `build_upsert_sector` need to be populated;
-    the rest are left at neutral defaults.
-    """
-
-    return UserRecord(
-        offset=0,
-        user_id=user.id,
-        raw_id_bytes="",
-        flags_raw=user.flags_raw,
-        flags=[],
-        access_raw=user.access_raw,
-        rights=user.rights,
-        enabled=user.enabled,
-        section_access_mask_raw=None,
-        section_ids=user.section_ids,
-        pg_access_masks_raw=[],
-        pg_ids=user.pg_ids,
-        name=user.name,
-        phone=user.phone,
-        code=user.code,
-        cards=user.cards,
-        comment=user.comment,
-        pg_num_if_ring_raw=None,
-        time_limited_group_raw=user.time_limited_group_raw,
-        parent_user_no_raw=None,
-    )
 
 
 def target_entry_from_summary(summary: dict, *, user_id: int) -> UserTableEntry:
@@ -457,6 +510,29 @@ def apply_upsert(
     finally:
         if cleanup_sector and sector_path.exists():
             sector_path.unlink()
+
+
+def upsert_is_noop(
+    config: UserManagerConfig,
+    *,
+    user_id: int,
+    payload: UserPatchModel,
+    current: UserRecord,
+) -> bool:
+    """True when the record an edit would write is, byte for byte, the
+    current record re-encoded with nothing sent: the write would change
+    nothing on the panel, so no configuration event is needed."""
+
+    def encoded(patch: UserPatchModel | None) -> bytes:
+        args = build_user_args(config, command="edit", user_id=user_id, payload=patch)
+        return pack_msgpack(build_upsert_payload(args, current=current))
+
+    try:
+        return encoded(payload) == encoded(None)
+    except SystemExit:
+        # The builder refuses a section or PG outside the panel's range with
+        # SystemExit; the write path reports that as it always has.
+        return False
 
 
 def apply_delete(

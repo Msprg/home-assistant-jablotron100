@@ -27,6 +27,9 @@ services:
       # Max age (s, from pull start) of the cached user table a write may be
       # validated against; 0 = always pull before a write.
       JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS: "${JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS:-60}"
+      # Most user records one POST /v1/users/batch may carry (one panel
+      # configuration event); at least 1.
+      JABLOTRON_PANEL_BATCH_MAX_RECORDS: "${JABLOTRON_PANEL_BATCH_MAX_RECORDS:-3}"
       JABLOTRON_PANEL_PORT: "${JABLOTRON_PANEL_PORT:-auto}"
       JABLOTRON_PANEL_FLEXI_CFG_DEVICE: "${JABLOTRON_PANEL_FLEXI_CFG_DEVICE:-auto}"
       JABLOTRON_PANEL_FLEXI_LOG_DEVICE: "${JABLOTRON_PANEL_FLEXI_LOG_DEVICE:-auto}"

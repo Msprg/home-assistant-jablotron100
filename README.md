@@ -18,7 +18,7 @@ The `/v1` REST and WebSocket surface is being locked for the public alpha. Withi
 - Response shapes (the Pydantic models in `src/jablotron_api/domain/models.py`) will only be extended in backward-compatible ways: new optional fields, never removed or retyped existing ones.
 - The token scope vocabulary (the `Scope` enum) is fixed. Scope names will not be renamed; new scopes can be added. The legacy `status:read` and `sections:control` names are auto-migrated to the v1 names on TokenStore startup for the duration of the v1 alpha window.
 - WebSocket topic names (`status`, `events`, `users`, `catalog`, `system`) and the envelope shape (`{sequence, topic, event, timestamp, payload}`) are fixed.
-- Error responses use a consistent shape: HTTP status code plus a JSON body with `detail` containing either a string, `{error, missing|missing_any_of}` for scope denials, or `{error: "user_write_rejected", reason, message, violations, conflicting_user_ids}` when a user record breaks a panel rule (see [docs/user-code-rules.md](docs/user-code-rules.md)).
+- Error responses use a consistent shape: HTTP status code plus a JSON body with `detail` containing either a string, `{error, missing|missing_any_of}` for scope denials, `{error: "user_write_rejected", reason, message, violations, conflicting_user_ids}` when a user record breaks a panel rule (see [docs/user-code-rules.md](docs/user-code-rules.md); a batch adds `user_id`), or `{error: "batch_rejected", reason, message}` when `POST /v1/users/batch` is refused as a whole.
 
 The authoritative description is `docs/openapi.v1.json`, generated from the running FastAPI app. To regenerate it after changes:
 
@@ -161,6 +161,31 @@ section/PG control, and WebSocket subscriptions.
    close the status session and use separate logins.
    Records longer than one 64-byte HID report go out in the panel's chunk
    framing, as F-Link sends them; the size limit per write is 1024 bytes.
+   `POST /v1/users/batch` (scope `users:write`) writes several creates and
+   updates in one configuration event, the way F-Link saves several users:
+   `{"writes": [{"op": "create", "replace": false, "user": {...}},
+   {"op": "update", "id": 4, "patch": {...}}]}`, where `user` is the
+   `POST /v1/users` body and `patch` the `PATCH` body. It costs one preflight,
+   one write and one catalog read for the whole batch, and answers
+   `{"results": [{"id", "op", "verified", "user", "detail"}], "as_of",
+   "pull_started_after_request"}` in request order. The batch is judged as a
+   whole first: every record against the user table with the other records
+   at their new values, so a refusal (`400` or `409`, same shapes as the
+   single routes) writes nothing. A user the panel holds differently after
+   the write comes back with `verified: false` and the reason in `detail`.
+   `JABLOTRON_PANEL_BATCH_MAX_RECORDS` (default 3, at least 1) caps the
+   writes per batch. With the `storage` or `auto` transport (`auto` is the
+   default) the encoded batch must fit one IMPORT.CFG sector, 508 bytes of
+   msgpack; with `hid` the bound is 1024 bytes. A larger batch is refused with
+   `400 batch_rejected` `payload_too_large` and nothing is written, so a
+   client must expect that answer and split the batch. Measured with the
+   server's record builder: a user with only a short name encodes to about
+   45 bytes, one with a 20-character name, a code, a card and one section to
+   about 73, and one with every field at its maximum (60-byte name and
+   comment, phone, 8-digit code, card, every section and PG) to about 217.
+   Three of the largest come to 645 bytes, so the default of three fits the
+   sector only for shorter records; two of the largest always fit. Deletes
+   stay single. The batch route has not yet been run against a panel.
 
 ### Home Assistant alpha path
 

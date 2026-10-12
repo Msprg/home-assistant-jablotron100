@@ -427,7 +427,8 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
     runtime = _runtime()
 
     async def fake_pull(prefix: str, *, after_write: bool = False):
-        return _snapshot([])
+        # User 7 is on the panel, so its delete reaches the write.
+        return _snapshot([_Record(7, "1483", name="Seven")])
 
     def refused(config, **kwargs):
         raise SystemExit("IMPORT.CFG staging failed: [Errno 5] Input/output error")
@@ -445,11 +446,11 @@ def test_a_refused_panel_write_is_a_runtime_error_not_a_process_exit(monkeypatch
         with pytest.raises(RuntimeError, match="Panel write failed: IMPORT.CFG staging failed"):
             await runtime.add_user(UserCreateModel(id=4, name="New"))
         with pytest.raises(RuntimeError, match="Panel write failed"):
-            await runtime.delete_user(4)
+            await runtime.delete_user(7)
 
     asyncio.run(run())
     # A refused write gets no post-write refresh; it marks the cache dirty.
-    assert refreshes == [("api-preflight-add-user4", False)]
+    assert refreshes == [("api-preflight-add-user4", False), ("api-preflight-delete-user7", False)]
     assert runtime._catalog_dirty is True
 
 
@@ -465,7 +466,7 @@ def test_runtime_hands_the_status_session_to_the_write(monkeypatch) -> None:
         closes.append(True)
 
     async def fake_pull(prefix: str, *, after_write: bool = False):
-        return _snapshot([])
+        return _snapshot([_Record(4, "1486", name="Four")])
 
     monkeypatch.setattr(runtime, "_close_status_session_locked", fake_close)
     monkeypatch.setattr(runtime, "_pull_catalog_snapshot_locked", fake_pull)
@@ -517,27 +518,35 @@ def test_the_post_write_refresh_is_flagged_after_write(monkeypatch) -> None:
 
     refreshes.clear()
     asyncio.run(runtime.delete_user(4))
-    assert refreshes == [("api-after-delete-user4", True)]
+    assert refreshes == [("api-preflight-delete-user4", False), ("api-after-delete-user4", True)]
 
 
 def _full_record(user_id: int, code: str, *, name: str):
-    """A fresh-read row with every field user_to_model reads: the edit path
-    re-derives the carried-over fields from the row it has just pulled."""
+    """A fresh-read row with every field the export parser fills: the edit
+    path builds the record it writes, and decides whether the edit changes
+    anything, from the row it has just pulled."""
 
-    return SimpleNamespace(
+    return re_tools.UserRecord(
+        offset=0,
         user_id=user_id,
-        code=code,
-        cards=[],
-        time_limited_group_raw=None,
+        raw_id_bytes="",
+        flags_raw=None,
+        flags=[],
+        access_raw=None,
+        rights="",
+        enabled=None,
+        section_access_mask_raw=0,
+        section_ids=[],
+        pg_access_masks_raw=[0, 0, 0, 0],
+        pg_ids=[],
         name=name,
         phone="",
+        code=code,
+        cards=[],
         comment="",
-        flags_raw=None,
-        access_raw=None,
-        section_ids=[],
-        pg_ids=[],
-        enabled=None,
-        rights="",
+        pg_num_if_ring_raw=0,
+        time_limited_group_raw=None,
+        parent_user_no_raw=-1,
     )
 
 

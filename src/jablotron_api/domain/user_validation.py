@@ -96,6 +96,9 @@ __all__ = [
     "REASON_NAME_TOO_LONG",
     "REASON_PANIC_CODE_COLLISION",
     "REASON_TIME_LIMITED_GROUP_REQUIRES_CODE",
+    "BATCH_REJECTION_REASONS",
+    "UserBatchRecordRejected",
+    "UserBatchRejected",
     "UserSlotOccupied",
     "UserTableEntry",
     "UserWriteRejected",
@@ -179,6 +182,38 @@ class UserWriteRejected(ValueError):
         }
 
 
+class UserBatchRecordRejected(UserWriteRejected):
+    """A record of POST /v1/users/batch breaks a user-table rule, judged
+    against the panel's table with the batch's other records at their new
+    values. ``user_id`` is that record's slot; ``conflicting_user_ids`` may
+    name other records of the same batch."""
+
+    def __init__(self, violations: Sequence[UserWriteViolation], *, user_id: int) -> None:
+        self.user_id = user_id
+        super().__init__(violations)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {**super().to_payload(), "user_id": self.user_id}
+
+
+BATCH_REJECTION_REASONS = ("empty", "too_many", "duplicate_id", "payload_too_large")
+
+
+class UserBatchRejected(ValueError):
+    """POST /v1/users/batch refused as a whole before any panel traffic: no
+    writes, too many, one slot named twice, or a payload the transport
+    cannot carry in one configuration event."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        if reason not in BATCH_REJECTION_REASONS:
+            raise ValueError(f"Unknown batch rejection reason {reason!r}.")
+        self.reason = reason
+        super().__init__(message)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"error": "batch_rejected", "reason": self.reason, "message": str(self)}
+
+
 class UserSlotOccupied(Exception):
     """A create was aimed at a slot that already holds a named user.
 
@@ -190,12 +225,14 @@ class UserSlotOccupied(Exception):
     another slot or repeats the request with ``replace=1``.
     """
 
-    def __init__(self, user_id: int) -> None:
+    def __init__(self, user_id: int, *, batch: bool = False) -> None:
         self.user_id = user_id
-        super().__init__(
-            f"User slot {user_id} already holds a named user; pass replace=1 to "
-            "overwrite it, or edit it with PATCH."
+        hint = (
+            'set "replace": true on its create to overwrite it, or send an update'
+            if batch
+            else "pass replace=1 to overwrite it, or edit it with PATCH"
         )
+        super().__init__(f"User slot {user_id} already holds a named user; {hint}.")
 
     def to_payload(self) -> dict[str, Any]:
         return {

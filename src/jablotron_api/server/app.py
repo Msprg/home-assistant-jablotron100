@@ -24,10 +24,14 @@ from jablotron_api import __version__
 from jablotron_api.domain.models import (
     ArmMode,
     AuthenticatedToken,
+    ExportCatalogModel,
     Scope,
     ServerSystemModel,
     TokenCreateRequest,
     TokenCreateResponse,
+    UserBatchCreate,
+    UserBatchRequest,
+    UserBatchResponse,
     UserCreateModel,
     UserPatchModel,
 )
@@ -36,13 +40,14 @@ from jablotron_api.domain.serialization import (
     serialize_users,
     serialize_ws_payload,
 )
-from jablotron_api.domain.user_validation import UserSlotOccupied, UserWriteRejected
+from jablotron_api.domain.user_validation import UserBatchRejected, UserSlotOccupied, UserWriteRejected
 from jablotron_api.panel.demo import DemoPanelRuntime
 from jablotron_api.server.config import ServerSettings
 from jablotron_api.server.tls import TLS_EXTENSION_KEY
 from jablotron_api.server.ws import ConnectionManager
 from jablotron_api.services.auth import require_scopes
 from jablotron_api.services.storage import TokenStore
+from jablotron_api.services.user_batch import check_batch_shape, write_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -176,6 +181,22 @@ _RUNTIME_ERROR_MAP: tuple[tuple[type[Exception], int], ...] = (
 )
 
 
+_CATALOG_READ_FAILED = "Panel catalog read failed"
+
+
+def _catalog_read_failure(exc: Exception, secrets: tuple[str, ...]) -> str:
+    """The 503 detail for a GET whose catalog pull failed: the runtime's
+    message, labelled as a catalog read, with any panel code blanked."""
+
+    message = str(exc)
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "<redacted>")
+    if not message.startswith(_CATALOG_READ_FAILED):
+        message = f"{_CATALOG_READ_FAILED}: {message}"
+    return message
+
+
 def _http_status_for(exc: Exception) -> int | None:
     for exception_type, http_status in _RUNTIME_ERROR_MAP:
         if isinstance(exc, exception_type):
@@ -191,8 +212,13 @@ def create_app(
 ) -> FastAPI:
     settings = settings or ServerSettings()
     if runtime is None:
+        if not settings.panel.batch_max_records >= 1:
+            raise RuntimeError(
+                "JABLOTRON_PANEL_BATCH_MAX_RECORDS must be >= 1 (the most user records one "
+                f"POST /v1/users/batch may carry), not {settings.panel.batch_max_records!r}."
+            )
         if settings.runtime_mode == "demo":
-            runtime = DemoPanelRuntime()
+            runtime = DemoPanelRuntime(batch_max_records=settings.panel.batch_max_records)
         else:
             if not settings.panel.auth_code:
                 raise RuntimeError(
@@ -360,6 +386,18 @@ def create_app(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=exc.to_payload()
             ) from exc
+        except UserBatchRejected as exc:
+            LOGGER.warning(
+                "%s rejected: token=%s resource=%s reason=%s detail=%s",
+                op,
+                token_label,
+                resource,
+                exc.reason,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=exc.to_payload()
+            ) from exc
         except UserSlotOccupied as exc:
             LOGGER.warning(
                 "%s refused: token=%s resource=%s reason=user_slot_occupied",
@@ -392,6 +430,25 @@ def create_app(
         summary = log_summary(result) if log_summary is not None else "ok"
         LOGGER.info("%s completed: token=%s resource=%s %s", op, token_label, resource, summary)
         return result
+
+    async def _read_catalog(call: Awaitable[Any]) -> Any:
+        """Await a read that may pull the panel's catalog. A failed pull is
+        a 503 with a string detail, not an unmapped 500; nothing was changed
+        on the panel. A failed pull is a RuntimeError from the runtime (a
+        stalled export refresh, a refused trigger, a missing device), an
+        OSError from a device, or a ValueError from parsing what the panel
+        sent; any other exception is a bug and stays a 500."""
+
+        try:
+            return await call
+        except (RuntimeError, OSError, ValueError) as exc:
+            detail = _catalog_read_failure(
+                exc, (settings.panel.auth_code, settings.panel.write_auth_code)
+            )
+            LOGGER.warning("Catalog read for a GET failed: %s", detail)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail
+            ) from exc
 
     def _validate_user_code(code: str | None) -> None:
         from jablotron_api.domain.codes import validate_user_code
@@ -584,7 +641,7 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.USERS_READ.value)
-        return serialize_users(await runtime.get_users(max_age_seconds), token)
+        return serialize_users(await _read_catalog(runtime.get_users(max_age_seconds)), token)
 
     @app.get("/v1/users/{user_id}")
     async def user(
@@ -601,7 +658,7 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.USERS_READ.value)
-        result = await runtime.get_user(user_id, max_age_seconds)
+        result = await _read_catalog(runtime.get_user(user_id, max_age_seconds))
         if result is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
         return serialize_users([result], token)[0]
@@ -661,6 +718,52 @@ def create_app(
         )
         return {"status": "deleted", "user_id": user_id}
 
+    @app.post("/v1/users/batch", responses={200: {"model": UserBatchResponse}})
+    async def batch_users(
+        payload: UserBatchRequest,
+        token: AuthenticatedToken = Depends(require_token),
+    ):
+        """Several creates and updates in one panel configuration event.
+
+        Refused as a whole, with nothing written, when the batch is empty,
+        too long (JABLOTRON_PANEL_BATCH_MAX_RECORDS), names a slot twice, or
+        does not fit the write transport (400 batch_rejected); when a record
+        breaks a user-table rule against the panel's table and the batch's
+        other records (400 user_write_rejected with user_id); and on an
+        occupied slot without replace or an update of a missing user (409).
+        A record the panel holds differently after the write is
+        verified: false, not an error.
+        """
+
+        require_scopes(token, Scope.USERS_WRITE.value)
+        writes = payload.writes
+
+        async def run():
+            check_batch_shape(writes, max_records=settings.panel.batch_max_records)
+            return await runtime.batch_users(writes)
+
+        audit_writes = [
+            {"op": "create", **write.user.model_dump(mode="json"), "replace": write.replace}
+            if isinstance(write, UserBatchCreate)
+            else {"op": "update", "id": write.id, **write.patch.model_dump(exclude_unset=True, mode="json")}
+            for write in writes
+        ]
+        outcome = await _execute_runtime_call(
+            token=token,
+            op="batch_users",
+            resource="users:" + ",".join(str(write_id(write)) for write in writes),
+            audit_details={"writes": audit_writes},
+            runtime_callable=run,
+            log_summary=lambda result: "verified={}/{}".format(
+                sum(1 for item in result.results if item.verified), len(result.results)
+            ),
+        )
+        body = outcome.model_dump(mode="json")
+        for item, result in zip(body["results"], outcome.results):
+            # Same redaction as POST /v1/users.
+            item["user"] = None if result.user is None else serialize_users([result.user], token)[0]
+        return body
+
     @app.get("/v1/events")
     async def events(
         limit: int = Query(default=20, ge=1, le=200),
@@ -702,9 +805,9 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.USERS_READ.value)
-        return serialize_users(await runtime.get_export_users(max_age_seconds), token)
+        return serialize_users(await _read_catalog(runtime.get_export_users(max_age_seconds)), token)
 
-    @app.get("/v1/export/catalog")
+    @app.get("/v1/export/catalog", responses={200: {"model": ExportCatalogModel}})
     async def export_catalog(
         max_age_seconds: float | None = Query(
             default=None,
@@ -718,17 +821,17 @@ def create_app(
         token: AuthenticatedToken = Depends(require_token),
     ):
         require_scopes(token, Scope.CATALOG_READ.value)
-        return serialize_catalog(await runtime.get_catalog(max_age_seconds), token)
+        return serialize_catalog(await _read_catalog(runtime.get_catalog(max_age_seconds)), token)
 
     @app.get("/v1/export/time-limits")
     async def export_time_limits(token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.CONFIG_READ.value)
-        return {"time_limits": await runtime.get_export_time_limits()}
+        return {"time_limits": await _read_catalog(runtime.get_export_time_limits())}
 
     @app.get("/v1/export/communications")
     async def export_communications(token: AuthenticatedToken = Depends(require_token)):
         require_scopes(token, Scope.CONFIG_READ.value)
-        return await runtime.get_export_communications()
+        return await _read_catalog(runtime.get_export_communications())
 
     @app.post("/v1/tokens")
     async def create_token(

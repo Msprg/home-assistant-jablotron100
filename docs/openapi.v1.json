@@ -10,6 +10,406 @@
         "title": "ArmMode",
         "type": "string"
       },
+      "DeviceStatusModel": {
+        "properties": {
+          "battery_level": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Battery Level"
+          },
+          "battery_load_voltage": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Battery Load Voltage"
+          },
+          "battery_problem": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Battery Problem"
+          },
+          "battery_standby_voltage": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Battery Standby Voltage"
+          },
+          "comment": {
+            "default": "",
+            "title": "Comment",
+            "type": "string"
+          },
+          "connection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection"
+          },
+          "hardware_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hardware Model"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "inferred_device_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inferred Device Type"
+          },
+          "inferred_entity_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inferred Entity Type"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "problem": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": false,
+            "title": "Problem"
+          },
+          "pulses": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Pulses",
+            "type": "array"
+          },
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "signal_strength": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Signal Strength"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "subtype_raw": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtype Raw"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "type_raw": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type Raw"
+          },
+          "wireless": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wireless"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "DeviceStatusModel",
+        "type": "object"
+      },
+      "ExportCatalogModel": {
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/DeviceStatusModel"
+            },
+            "title": "Devices",
+            "type": "array"
+          },
+          "initial_setup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialSetupModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "pgs": {
+            "items": {
+              "$ref": "#/components/schemas/ExportPGModel"
+            },
+            "title": "Pgs",
+            "type": "array"
+          },
+          "pull_started_after_request": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pull Started After Request"
+          },
+          "raw_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RawCatalogCountsModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/ExportSectionModel"
+            },
+            "title": "Sections",
+            "type": "array"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "source": {
+            "default": "cache",
+            "title": "Source",
+            "type": "string"
+          },
+          "trigger_used": {
+            "default": false,
+            "title": "Trigger Used",
+            "type": "boolean"
+          },
+          "users": {
+            "items": {
+              "$ref": "#/components/schemas/UserModel"
+            },
+            "title": "Users",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sections",
+          "pgs",
+          "devices",
+          "users"
+        ],
+        "title": "ExportCatalogModel",
+        "type": "object"
+      },
+      "ExportPGModel": {
+        "properties": {
+          "comment": {
+            "default": "",
+            "title": "Comment",
+            "type": "string"
+          },
+          "display_id": {
+            "title": "Display Id",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          }
+        },
+        "required": [
+          "id",
+          "display_id",
+          "name"
+        ],
+        "title": "ExportPGModel",
+        "type": "object"
+      },
+      "ExportSectionModel": {
+        "properties": {
+          "comment": {
+            "default": "",
+            "title": "Comment",
+            "type": "string"
+          },
+          "display_id": {
+            "title": "Display Id",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_id",
+          "name"
+        ],
+        "title": "ExportSectionModel",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -21,6 +421,177 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "InitialSetupModel": {
+        "properties": {
+          "code_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Length"
+          },
+          "code_prefix": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Prefix"
+          },
+          "devices": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialSetupRangeModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "em_unique_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Em Unique Enabled"
+          },
+          "exact": {
+            "default": false,
+            "title": "Exact",
+            "type": "boolean"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Notes",
+            "type": "array"
+          },
+          "pgs": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialSetupRangeModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sections": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialSetupRangeModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "system_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "System Name"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialSetupRangeModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "InitialSetupModel",
+        "type": "object"
+      },
+      "InitialSetupRangeModel": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "first_id": {
+            "title": "First Id",
+            "type": "integer"
+          },
+          "last_id": {
+            "title": "Last Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "first_id",
+          "last_id",
+          "count"
+        ],
+        "title": "InitialSetupRangeModel",
+        "type": "object"
+      },
+      "RawCatalogCountsModel": {
+        "properties": {
+          "devices": {
+            "title": "Devices",
+            "type": "integer"
+          },
+          "pgs": {
+            "title": "Pgs",
+            "type": "integer"
+          },
+          "sections": {
+            "title": "Sections",
+            "type": "integer"
+          },
+          "users": {
+            "title": "Users",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sections",
+          "devices",
+          "users",
+          "pgs"
+        ],
+        "title": "RawCatalogCountsModel",
         "type": "object"
       },
       "ServerSystemModel": {
@@ -212,6 +783,173 @@
         "title": "TokenInfoModel",
         "type": "object"
       },
+      "UserBatchCreate": {
+        "description": "One create in POST /v1/users/batch. ``replace`` is the single route's\n``?replace=1``: without it a create on a slot holding a named user is\nrefused.",
+        "properties": {
+          "op": {
+            "const": "create",
+            "title": "Op",
+            "type": "string"
+          },
+          "replace": {
+            "default": false,
+            "title": "Replace",
+            "type": "boolean"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserCreateModel"
+          }
+        },
+        "required": [
+          "op",
+          "user"
+        ],
+        "title": "UserBatchCreate",
+        "type": "object"
+      },
+      "UserBatchRequest": {
+        "properties": {
+          "writes": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "create": "#/components/schemas/UserBatchCreate",
+                  "update": "#/components/schemas/UserBatchUpdate"
+                },
+                "propertyName": "op"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/UserBatchCreate"
+                },
+                {
+                  "$ref": "#/components/schemas/UserBatchUpdate"
+                }
+              ]
+            },
+            "title": "Writes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "writes"
+        ],
+        "title": "UserBatchRequest",
+        "type": "object"
+      },
+      "UserBatchResponse": {
+        "description": "Results in request order, and the freshness of the catalog read the\nresults come from (as in GET /v1/export/catalog).",
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "pull_started_after_request": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pull Started After Request"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/UserBatchResult"
+            },
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "UserBatchResponse",
+        "type": "object"
+      },
+      "UserBatchResult": {
+        "description": "The outcome for one write of a batch. ``verified`` is False with a\n``detail`` when the panel, read back after the write, does not hold what\nwas sent; ``user`` is None when the user is not there at all.",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "op": {
+            "enum": [
+              "create",
+              "update"
+            ],
+            "title": "Op",
+            "type": "string"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verified": {
+            "title": "Verified",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "op",
+          "verified"
+        ],
+        "title": "UserBatchResult",
+        "type": "object"
+      },
+      "UserBatchUpdate": {
+        "description": "One update in POST /v1/users/batch: a PATCH of user ``id``.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "op": {
+            "const": "update",
+            "title": "Op",
+            "type": "string"
+          },
+          "patch": {
+            "$ref": "#/components/schemas/UserPatchModel"
+          }
+        },
+        "required": [
+          "op",
+          "id",
+          "patch"
+        ],
+        "title": "UserBatchUpdate",
+        "type": "object"
+      },
       "UserCreateModel": {
         "properties": {
           "access_raw": {
@@ -295,6 +1033,109 @@
           "name"
         ],
         "title": "UserCreateModel",
+        "type": "object"
+      },
+      "UserModel": {
+        "properties": {
+          "access_raw": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Access Raw"
+          },
+          "cards": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cards",
+            "type": "array"
+          },
+          "code": {
+            "default": "",
+            "title": "Code",
+            "type": "string"
+          },
+          "comment": {
+            "default": "",
+            "title": "Comment",
+            "type": "string"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "flags_raw": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flags Raw"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "pg_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Pg Ids",
+            "type": "array"
+          },
+          "phone": {
+            "default": "",
+            "title": "Phone",
+            "type": "string"
+          },
+          "rights": {
+            "default": "",
+            "title": "Rights",
+            "type": "string"
+          },
+          "section_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Section Ids",
+            "type": "array"
+          },
+          "time_limited_group_raw": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Limited Group Raw"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "UserModel",
         "type": "object"
       },
       "UserPatchModel": {
@@ -752,7 +1593,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ExportCatalogModel"
+                }
               }
             },
             "description": "Successful Response"
@@ -1683,6 +2526,63 @@
           }
         },
         "summary": "Add User"
+      }
+    },
+    "/v1/users/batch": {
+      "post": {
+        "description": "Several creates and updates in one panel configuration event.\n\nRefused as a whole, with nothing written, when the batch is empty,\ntoo long (JABLOTRON_PANEL_BATCH_MAX_RECORDS), names a slot twice, or\ndoes not fit the write transport (400 batch_rejected); when a record\nbreaks a user-table rule against the panel's table and the batch's\nother records (400 user_write_rejected with user_id); and on an\noccupied slot without replace or an update of a missing user (409).\nA record the panel holds differently after the write is\nverified: false, not an error.",
+        "operationId": "batch_users_v1_users_batch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserBatchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Batch Users"
       }
     },
     "/v1/users/{user_id}": {

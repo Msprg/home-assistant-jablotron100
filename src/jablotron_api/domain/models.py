@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -184,6 +184,52 @@ class UserPatchModel(BaseModel):
     sections: list[int] | None = None
     pgs: list[int] | None = None
     time_limited_group_raw: int | None = None
+
+
+class UserBatchCreate(BaseModel):
+    """One create in POST /v1/users/batch. ``replace`` is the single route's
+    ``?replace=1``: without it a create on a slot holding a named user is
+    refused."""
+
+    op: Literal["create"]
+    replace: bool = False
+    user: UserCreateModel
+
+
+class UserBatchUpdate(BaseModel):
+    """One update in POST /v1/users/batch: a PATCH of user ``id``."""
+
+    op: Literal["update"]
+    id: int
+    patch: UserPatchModel
+
+
+UserBatchWrite = Annotated[Union[UserBatchCreate, UserBatchUpdate], Field(discriminator="op")]
+
+
+class UserBatchRequest(BaseModel):
+    writes: list[UserBatchWrite]
+
+
+class UserBatchResult(BaseModel):
+    """The outcome for one write of a batch. ``verified`` is False with a
+    ``detail`` when the panel, read back after the write, does not hold what
+    was sent; ``user`` is None when the user is not there at all."""
+
+    id: int
+    op: Literal["create", "update"]
+    verified: bool
+    user: UserModel | None = None
+    detail: str | None = None
+
+
+class UserBatchResponse(BaseModel):
+    """Results in request order, and the freshness of the catalog read the
+    results come from (as in GET /v1/export/catalog)."""
+
+    results: list[UserBatchResult]
+    as_of: datetime | None = None
+    pull_started_after_request: bool | None = None
 
 
 class EventRecordModel(BaseModel):

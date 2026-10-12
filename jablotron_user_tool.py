@@ -204,7 +204,10 @@ def find_user(snapshot: ExportSnapshot, user_id: int) -> UserRecord:
     return record
 
 
-def build_upsert_sector(args: argparse.Namespace, *, current: UserRecord | None) -> tuple[Path, dict[str, object], bool]:
+def build_upsert_payload(args: argparse.Namespace, *, current: UserRecord | None) -> Any:
+    """The collection-7 upsert command for one user: the current record (or
+    the default one) with the fields ``args`` sets laid over it."""
+
     name = args.name if args.name is not None else (current.name if current else None)
     phone = args.phone if args.phone is not None else (current.phone if current else None)
     pin = args.pin if args.pin is not None else (current.code if current else None)
@@ -259,7 +262,11 @@ def build_upsert_sector(args: argparse.Namespace, *, current: UserRecord | None)
         parent_user_no_raw=args.parent_user_no_raw,
         field11_raw=args.field11_raw,
     )
-    payload = build_user_upsert_payload(payload_args)
+    return build_user_upsert_payload(payload_args)
+
+
+def build_upsert_sector(args: argparse.Namespace, *, current: UserRecord | None) -> tuple[Path, dict[str, object], bool]:
+    payload = build_upsert_payload(args, current=current)
     sector = encode_sector(payload)
 
     sector_path = Path(args.sector_output) if args.sector_output else default_sector_output(f"{args.command}-user{args.user_id}")

@@ -113,6 +113,13 @@ class JablotronApiClient:
     async def delete_user(self, user_id: int) -> dict:
         return await self.request("DELETE", f"/v1/users/{user_id}")
 
+    async def batch_users(self, writes: list[dict[str, Any]]) -> dict:
+        """POST /v1/users/batch: ``writes`` holds ``{"op": "create", "replace":
+        bool, "user": {...}}`` and ``{"op": "update", "id": N, "patch": {...}}``
+        items, written in one panel configuration event."""
+
+        return await self.request("POST", "/v1/users/batch", json={"writes": writes})
+
     async def list_events(
         self,
         *,

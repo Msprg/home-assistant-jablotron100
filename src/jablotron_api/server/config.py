@@ -51,6 +51,9 @@ class PanelSettings:
     # panel read under the write lock. 0 means every write pulls first. A
     # failed write marks the cache dirty, so the next write pulls regardless.
     write_preflight_max_age_seconds: float = 60.0
+    # Most user records one POST /v1/users/batch may carry; they go to the
+    # panel in one configuration event. Must be >= 1.
+    batch_max_records: int = 3
 
 
 @dataclass
@@ -93,5 +96,6 @@ class ServerSettings:
             write_preflight_max_age_seconds=float(
                 os.getenv("JABLOTRON_PANEL_WRITE_PREFLIGHT_MAX_AGE_SECONDS", "60")
             ),
+            batch_max_records=int(os.getenv("JABLOTRON_PANEL_BATCH_MAX_RECORDS", "3")),
         )
     )

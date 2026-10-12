@@ -22,7 +22,7 @@ import logging
 import math
 from pathlib import Path
 import time
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Sequence
 
 from jablotron_re_tools import (
     DEFAULT_IMPORT_PATH,
@@ -38,6 +38,8 @@ from jablotron_api.domain.models import (
     ExportCatalogModel,
     InitialSetupModel,
     PanelStatusModel,
+    UserBatchResponse,
+    UserBatchWrite,
     UserCreateModel,
     UserModel,
     UserPatchModel,
@@ -62,15 +64,17 @@ from jablotron_api.services.catalog_io import (
 from jablotron_api.services.device_inference import infer_device_type as _infer_device_type
 from jablotron_api.services.event_reader import EventReaderConfig, read_recent_events
 from jablotron_api.domain.user_validation import UserSlotOccupied, UserWriteRejected
+from jablotron_api.services.user_batch import check_batch_shape, judge_write, plan_batch, write_id
 from jablotron_api.services.user_manager import (
     UserManagerConfig,
     UserWritePreflight,
     apply_delete as _apply_delete_user,
     apply_upsert as _apply_upsert_user,
     resolve_write_transport,
-    user_to_record,
+    upsert_is_noop as _upsert_is_noop,
     verify_added_user as _verify_added_user_fn,
     verify_edited_user as _verify_edited_user_fn,
+    write_payload_to_panel as _write_batch_payload,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -172,6 +176,9 @@ class PanelRuntimeConfig:
     # write validates against the cached user table when its pull started at
     # most this many seconds ago and no write has dirtied it; 0 = always pull.
     write_preflight_max_age_seconds: float = 60.0
+    # Mirrors ServerSettings.panel.batch_max_records: the most records one
+    # POST /v1/users/batch may carry.
+    batch_max_records: int = 3
 
 
 class PanelRuntime:
@@ -942,6 +949,29 @@ class PanelRuntime:
             server_auth_code=self._config.auth_code or None,
         )
 
+    def _guard_cached_preflight(self, snapshot: ExportCatalogSnapshot, served_from_cache: bool) -> None:
+        """Refuse a cached table that may no longer be what the panel holds.
+
+        Structural guard, not a style rule. The duplicate, code-format and
+        duress-adjacency rules only mean anything against the table the
+        panel holds: a preflight that passes against a stale table can assign
+        a code that is another user's silent-panic twin, and a delete decided
+        on one can skip a user that is there. A cached table is acceptable
+        only while it is the current cache, inside the configured window and
+        not dirtied by a write.
+        """
+
+        if served_from_cache and (
+            snapshot is not self._catalog_snapshot
+            or self._catalog_dirty
+            or self._catalog_age_seconds() > self._config.write_preflight_max_age_seconds
+        ):
+            raise RuntimeError(
+                "User-write preflight was handed a cached catalog older than the "
+                "configured limit (or dirtied by a write); it must validate against "
+                "a fresh panel read."
+            )
+
     def _user_write_preflight(
         self,
         snapshot: ExportCatalogSnapshot,
@@ -962,23 +992,7 @@ class PanelRuntime:
         model of the catalog.
         """
 
-        if served_from_cache:
-            # Structural guard, not a style rule. The duplicate, code-format
-            # and duress-adjacency rules only mean anything against the table
-            # the panel holds: a preflight that passes against a stale table
-            # can assign a code that is another user's silent-panic twin. A
-            # cached table is acceptable only while it is the current cache,
-            # inside the configured window and not dirtied by a write.
-            if (
-                snapshot is not self._catalog_snapshot
-                or self._catalog_dirty
-                or self._catalog_age_seconds() > self._config.write_preflight_max_age_seconds
-            ):
-                raise RuntimeError(
-                    "User-write preflight was handed a cached catalog older than the "
-                    "configured limit (or dirtied by a write); it must validate against "
-                    "a fresh panel read."
-                )
+        self._guard_cached_preflight(snapshot, served_from_cache)
         return UserWritePreflight.from_records(
             snapshot.users,
             user_id=user_id,
@@ -1162,26 +1176,42 @@ class PanelRuntime:
                 )
                 # Carry unsupplied fields over from the preflight table, so an
                 # edit cannot silently rewrite a field with a value the panel
-                # has since changed.
-                current_record = user_to_record(_user_to_model(fresh_record))
-                session = await self._prepare_panel_config_op_locked()
-                await self._write_then_refresh_locked(
-                    _apply_upsert_user,
-                    self._user_manager_config(),
-                    failure_hint=self._write_failure_hint(),
-                    refresh_prefix=f"api-after-edit-user{user_id}",
-                    what=f"User {user_id}",
-                    user_id=user_id,
-                    payload=payload,
-                    current=current_record,
-                    preflight=preflight,
-                    verify_prefix=f"api-edit-user{user_id}",
-                    session=session,
-                )
+                # has since changed. The raw record, not its API model: the
+                # model has no section or PG masks, pg_num or parent, and
+                # drops an empty first card, so a round trip through it wrote
+                # those fields as zero and moved a lone second card to slot 1.
+                current_record = fresh_record
+                unchanged: UserModel | None = None
+                if _upsert_is_noop(
+                    self._user_manager_config(), user_id=user_id, payload=payload, current=current_record
+                ):
+                    # The edit would write the record the panel already
+                    # holds: no configuration event, no refresh.
+                    LOGGER.info("User %s edit changes nothing on the panel; no write.", user_id)
+                    unchanged = _user_to_model(current_record)
+                else:
+                    session = await self._prepare_panel_config_op_locked()
+                    await self._write_then_refresh_locked(
+                        _apply_upsert_user,
+                        self._user_manager_config(),
+                        failure_hint=self._write_failure_hint(),
+                        refresh_prefix=f"api-after-edit-user{user_id}",
+                        what=f"User {user_id}",
+                        user_id=user_id,
+                        payload=payload,
+                        current=current_record,
+                        preflight=preflight,
+                        verify_prefix=f"api-edit-user{user_id}",
+                        session=session,
+                    )
         except BaseException:
             if preflight_pulled:
                 await self._announce_preflight_catalog()
             raise
+        if unchanged is not None:
+            if preflight_pulled:
+                await self._emit("catalog", self._catalog.model_dump(mode="json"))
+            return unchanged
         await self._emit("catalog", self._catalog.model_dump(mode="json"))
         # Served by the refresh the write just made.
         user = await self.get_user(user_id, max_age_seconds=math.inf)
@@ -1193,23 +1223,112 @@ class PanelRuntime:
 
     async def delete_user(self, user_id: int) -> None:
         self._ensure_usable_user_id(user_id)
-        async with self._lock:
-            session = await self._prepare_panel_config_op_locked()
-            await self._write_then_refresh_locked(
-                _apply_delete_user,
-                self._user_manager_config(),
-                failure_hint=self._write_failure_hint(),
-                refresh_prefix=f"api-after-delete-user{user_id}",
-                what=f"User {user_id}",
-                user_id=user_id,
-                verify_prefix=f"api-delete-user{user_id}",
-                session=session,
-            )
+        preflight_pulled = False
+        try:
+            async with self._lock:
+                snapshot, from_cache = await self._preflight_snapshot_locked(
+                    f"api-preflight-delete-user{user_id}"
+                )
+                preflight_pulled = not from_cache
+                self._guard_cached_preflight(snapshot, from_cache)
+                occupant = next(
+                    (record for record in snapshot.users if record.user_id == user_id), None
+                )
+                if occupant is None or not (occupant.name or "").strip():
+                    # Nothing to delete on the preflight table (a nameless
+                    # slot counts as free, as in add_user): answer as a
+                    # delete would, without a configuration event.
+                    LOGGER.info("User %s is not on the panel; delete skipped without a write.", user_id)
+                    deleted = False
+                else:
+                    deleted = True
+                    session = await self._prepare_panel_config_op_locked()
+                    await self._write_then_refresh_locked(
+                        _apply_delete_user,
+                        self._user_manager_config(),
+                        failure_hint=self._write_failure_hint(),
+                        refresh_prefix=f"api-after-delete-user{user_id}",
+                        what=f"User {user_id}",
+                        user_id=user_id,
+                        verify_prefix=f"api-delete-user{user_id}",
+                        session=session,
+                    )
+        except BaseException:
+            if preflight_pulled:
+                await self._announce_preflight_catalog()
+            raise
+        if not deleted:
+            if preflight_pulled:
+                await self._emit("catalog", self._catalog.model_dump(mode="json"))
+            return
         await self._emit("catalog", self._catalog.model_dump(mode="json"))
         # Served by the refresh the write just made.
         if await self.get_user(user_id, max_age_seconds=math.inf) is not None:
             raise RuntimeError(f"User {user_id} was still present after delete.")
         await self._emit("users", {"action": "deleted", "user_id": user_id})
+
+    async def batch_users(self, writes: Sequence[UserBatchWrite]) -> UserBatchResponse:
+        """Several creates and updates in one configuration event.
+
+        One preflight table (the single routes' 60 s rule), every record
+        decided and judged against it with its peers at their new values
+        (services/user_batch.py), one write of the multi-record map, one
+        post-write refresh, then each user judged against the read-back.
+        Every refusal comes before the panel is written. Updates that would
+        write the record the panel holds are left out of the map; when every
+        write is one, no configuration event runs.
+        """
+
+        check_batch_shape(writes, max_records=self._config.batch_max_records)
+        for write in writes:
+            self._ensure_usable_user_id(write_id(write))
+        requested_at = time.monotonic()
+        preflight_pulled = False
+        try:
+            async with self._lock:
+                snapshot, from_cache = await self._preflight_snapshot_locked("api-preflight-batch-users")
+                preflight_pulled = not from_cache
+                preflight = self._user_write_preflight(
+                    snapshot, write_id(writes[0]), include_current=False, served_from_cache=from_cache
+                )
+                plan = plan_batch(self._user_manager_config(), writes, rows=snapshot.users, preflight=preflight)
+                written = plan.written_ids
+                if written:
+                    session = await self._prepare_panel_config_op_locked()
+                    await self._write_then_refresh_locked(
+                        _write_batch_payload,
+                        self._user_manager_config(),
+                        failure_hint=self._write_failure_hint(),
+                        refresh_prefix="api-after-batch-users",
+                        what="The batch for users " + ", ".join(str(item) for item in written),
+                        payload=plan.payload,
+                        verify_prefix="api-batch-users",
+                        session=session,
+                    )
+                else:
+                    LOGGER.info("User batch changes nothing on the panel; no write.")
+        except BaseException:
+            if preflight_pulled:
+                await self._announce_preflight_catalog()
+            raise
+        if written or preflight_pulled:
+            await self._emit("catalog", self._catalog.model_dump(mode="json"))
+        results = []
+        for planned in plan.writes:
+            if written:
+                # Served by the refresh the write just made.
+                user = await self.get_user(planned.user_id, max_age_seconds=math.inf)
+            else:
+                user = _user_to_model(planned.current)
+            results.append(judge_write(planned, user))
+            if not planned.noop and user is not None:
+                action = "added" if planned.op == "create" else "edited"
+                await self._emit("users", {"action": action, "user": user.model_dump(mode="json")})
+        return UserBatchResponse(
+            results=results,
+            as_of=None if self._catalog is None else self._catalog.as_of,
+            pull_started_after_request=self._catalog_started_monotonic_for_cache >= requested_at,
+        )
 
     # ---------------------------------------------------------------- system
 

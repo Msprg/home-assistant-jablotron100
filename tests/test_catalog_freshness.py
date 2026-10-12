@@ -709,10 +709,12 @@ def test_a_write_costs_two_pulls_with_a_cold_cache(monkeypatch, tmp_path):
 
 
 def test_edit_and_delete_also_refresh_once_after_the_write(monkeypatch, tmp_path):
+    # The cached row has another name, so the edit changes the record; an
+    # edit that changes nothing would not write at all.
     h, applied = _write_harness(
         monkeypatch,
         tmp_path,
-        cached_users=[_full_record(4, "1486", name="User 4")],
+        cached_users=[_full_record(4, "1486", name="Old 4")],
         fresh_users=[_full_record(4, "1486", name="User 4")],
         preflight_max_age=60.0,
     )
@@ -954,7 +956,7 @@ def test_an_edit_on_a_dirty_cache_lets_the_preflight_pull_decide(monkeypatch, tm
         monkeypatch,
         tmp_path,
         cached_users=[],
-        fresh_users=[_full_record(4, "1486", name="User 4")],
+        fresh_users=[_full_record(4, "1486", name="Old 4")],
         preflight_max_age=60.0,
     )
     h.runtime._catalog_dirty = True

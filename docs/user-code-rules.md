@@ -155,6 +155,16 @@ below).
 
 The demo runtime (`JABLOTRON_API_RUNTIME_MODE=demo`) applies the same check.
 
+## What a PATCH carries over
+
+A `PATCH` writes the whole record. Every field it does not send is taken from
+the preflight row, including the fields the API does not expose: the section
+mask, the PG masks, `pg_num_if_ring_raw`, `parent_user_no_raw` and both card
+slots. A sent `sections` or `pgs` list replaces its mask, and an empty list
+clears it. A field sent as `null` counts as not sent. When the record to write
+is byte for byte the record the panel holds, nothing is written: the response
+is the current user and no configuration event runs.
+
 ## What comes back from a write
 
 `POST /v1/users` and `PATCH /v1/users/{id}` return the user as the panel now
@@ -162,6 +172,24 @@ holds it, through the same redaction as `GET /v1/users`: `code` is empty
 unless the token holds `users:codes:read`, even for the caller that just
 wrote it, and even for the code carried over by a `PATCH` that sent none.
 The `users` WebSocket topic redacts write events the same way.
+
+## Several users in one write: `POST /v1/users/batch`
+
+A batch is judged as a whole before anything reaches the panel. Each record
+goes through the rules above against the preflight table, with the batch's
+other records taken as already present at their new values. Two creates
+with the same code or card are refused, a create may not take the panic
+twin of a code another record of the batch sets, and two updates may swap
+their codes. The first record that breaks a rule, in request order, answers
+the usual `400 user_write_rejected` body with one more field, `user_id`, the
+slot of that record; `conflicting_user_ids` can name other records of the
+same batch. A create on an occupied slot without `"replace": true` is the
+`409 user_slot_occupied` above, and an update of a missing user is
+`409 "User N not found."`. Either way nothing is written.
+
+Updates carry over what they do not send exactly as a `PATCH` does, and an
+update that would write the record the panel holds is left out of the
+write.
 
 ## How a refusal is reported
 

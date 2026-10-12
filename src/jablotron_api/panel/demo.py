@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Sequence
 
 from jablotron_api.domain.codes import CodeFormat, resolve_code_format
 from jablotron_api.domain.models import (
@@ -22,6 +22,10 @@ from jablotron_api.domain.models import (
     PGStatusModel,
     RawCatalogCountsModel,
     SectionStatusModel,
+    UserBatchCreate,
+    UserBatchResponse,
+    UserBatchResult,
+    UserBatchWrite,
     UserCreateModel,
     UserModel,
     UserPatchModel,
@@ -33,6 +37,7 @@ from jablotron_api.domain.user_validation import (
     validate_user_write,
 )
 from jablotron_api.services.catalog_io import ensure_id_in_range
+from jablotron_api.services.user_batch import BatchTarget, check_batch_shape, validate_batch, write_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,10 +53,20 @@ def _utc_now_dt() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _comparable(user: UserModel) -> dict:
+    """A user as the panel would compare it: section and PG ids as sets."""
+
+    dumped = user.model_dump()
+    dumped["section_ids"] = sorted(dumped["section_ids"])
+    dumped["pg_ids"] = sorted(dumped["pg_ids"])
+    return dumped
+
+
 class DemoPanelRuntime:
     """In-memory runtime that mirrors the live runtime surface."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, batch_max_records: int = 3) -> None:
+        self._batch_max_records = batch_max_records
         self._listeners: list[StatusListener] = []
         self._system_info: dict[str, str | None] = {
             "panel_model": "JA-107K Demo",
@@ -418,20 +433,7 @@ class DemoPanelRuntime:
         )
         if occupant is not None:
             self._catalog.users = [user for user in self._catalog.users if user.id != payload.id]
-        user = UserModel(
-            id=payload.id,
-            name=payload.name,
-            phone=payload.phone,
-            code=payload.code,
-            cards=[payload.card1] if payload.card1 else [],
-            comment=payload.comment,
-            flags_raw=payload.flags_raw,
-            access_raw=payload.access_raw,
-            section_ids=list(payload.sections),
-            pg_ids=list(payload.pgs),
-            rights="coUserNoSelfedit",
-            time_limited_group_raw=payload.time_limited_group_raw,
-        )
+        user = self._created_user(payload)
         self._catalog.users.append(user)
         await self._emit("users", {"action": "added", "user": user.model_dump(mode="json")})
         return user
@@ -457,6 +459,7 @@ class DemoPanelRuntime:
             name=requested.get("name", user.name) or "",
             comment=requested.get("comment", user.comment) or "",
         )
+        before = user.model_dump()
         for field, value in requested.items():
             if field == "card1":
                 user.cards = [value] if value else []
@@ -466,13 +469,107 @@ class DemoPanelRuntime:
                 user.pg_ids = list(value or [])
             else:
                 setattr(user, field, value)
+        if user.model_dump() == before:
+            # As on the panel: an edit that changes nothing is no write.
+            return user
         await self._emit("users", {"action": "edited", "user": user.model_dump(mode="json")})
         return user
 
     async def delete_user(self, user_id: int) -> None:
         self._ensure_usable_user_id(user_id)
+        occupant = await self.get_user(user_id)
+        if occupant is None or not occupant.name.strip():
+            # As on the panel: nothing to delete is no write and no event.
+            return
         self._catalog.users = [user for user in self._catalog.users if user.id != user_id]
         await self._emit("users", {"action": "deleted", "user_id": user_id})
+
+    async def batch_users(self, writes: Sequence[UserBatchWrite]) -> UserBatchResponse:
+        """The live runtime's batch on the in-memory table: the same shape
+        checks, slot refusals and joint rules, then every record applied at
+        once. A create is stored as add_user stores it and an update applied
+        as edit_user applies it; an update that changes nothing gets no
+        event. The demo encodes no records, so it never answers
+        payload_too_large."""
+
+        check_batch_shape(writes, max_records=self._batch_max_records)
+        for write in writes:
+            self._ensure_usable_user_id(write_id(write))
+        currents: dict[int, UserModel | None] = {}
+        for write in writes:
+            user_id = write_id(write)
+            currents[user_id] = occupant = await self.get_user(user_id)
+            if isinstance(write, UserBatchCreate):
+                if occupant is not None and occupant.name.strip() and not write.replace:
+                    raise UserSlotOccupied(user_id, batch=True)
+            elif occupant is None or not occupant.name.strip():
+                raise RuntimeError(f"User {user_id} not found.")
+
+        planned: list[tuple[str, int, UserModel, bool]] = []
+        targets: list[BatchTarget] = []
+        for write in writes:
+            user_id = write_id(write)
+            current = currents[user_id]
+            if isinstance(write, UserBatchCreate):
+                op, updated, current_entry = "create", self._created_user(write.user), None
+            else:
+                op = "update"
+                updated = current.model_copy(deep=True)
+                # As on the panel: a null is not sent, and the decoded section
+                # and PG ids come back sorted.
+                for field, value in write.patch.model_dump(exclude_unset=True).items():
+                    if value is None:
+                        continue
+                    if field == "card1":
+                        updated.cards = [value] if value else []
+                    elif field == "sections":
+                        updated.section_ids = sorted(value)
+                    elif field == "pgs":
+                        updated.pg_ids = sorted(value)
+                    else:
+                        setattr(updated, field, value)
+                current_entry = entry_from_record(current)
+                if _comparable(updated) == _comparable(current):
+                    planned.append((op, user_id, current, True))
+                    continue
+            targets.append(BatchTarget(user_id, current_entry, entry_from_record(updated)))
+            planned.append((op, user_id, updated, False))
+        validate_batch(
+            [entry_from_record(user) for user in self._catalog.users], targets, self.code_format()
+        )
+
+        slots = {user.id: index for index, user in enumerate(self._catalog.users)}
+        for _, user_id, user, noop in planned:
+            if noop:
+                continue
+            if user_id in slots:
+                self._catalog.users[slots[user_id]] = user
+            else:
+                self._catalog.users.append(user)
+        results = []
+        for op, user_id, user, noop in planned:
+            if not noop:
+                action = "added" if op == "create" else "edited"
+                await self._emit("users", {"action": action, "user": user.model_dump(mode="json")})
+            results.append(UserBatchResult(id=user_id, op=op, verified=True, user=user))
+        return UserBatchResponse(results=results, as_of=_utc_now_dt(), pull_started_after_request=None)
+
+    @staticmethod
+    def _created_user(payload: UserCreateModel) -> UserModel:
+        return UserModel(
+            id=payload.id,
+            name=payload.name,
+            phone=payload.phone,
+            code=payload.code,
+            cards=[payload.card1] if payload.card1 else [],
+            comment=payload.comment,
+            flags_raw=payload.flags_raw,
+            access_raw=payload.access_raw,
+            section_ids=list(payload.sections),
+            pg_ids=list(payload.pgs),
+            rights="coUserNoSelfedit",
+            time_limited_group_raw=payload.time_limited_group_raw,
+        )
 
     @property
     def system_info(self) -> dict[str, str | None]:
