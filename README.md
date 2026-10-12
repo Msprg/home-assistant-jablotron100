@@ -185,7 +185,9 @@ section/PG control, and WebSocket subscriptions.
    comment, phone, 8-digit code, card, every section and PG) to about 217.
    Three of the largest come to 645 bytes, so the default of three fits the
    sector only for shorter records; two of the largest always fit. Deletes
-   stay single. The batch route has not yet been run against a panel.
+   stay single. Two updates in one batch were written to the live panel on
+   2026-10-12; a batch of three and a create in a batch have not been run
+   there yet.
 
 ### Home Assistant alpha path
 
